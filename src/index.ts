@@ -1,5 +1,7 @@
 import { TwitterClientInterface } from './client';
 
+export { TwitterClientInterface };
+
 const twitterPlugin = {
   name: 'twitter',
   description: 'Twitter client',
