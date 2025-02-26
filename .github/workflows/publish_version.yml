@@ -10,6 +10,17 @@ jobs:
     runs-on: ubuntu-latest 
     steps:
       - uses: actions/checkout@v3
+      
+      - name: Install PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9.15.4
+      
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+          cache: 'pnpm'
+      
       - run: pnpm install
       - run: pnpm lint
 
@@ -25,7 +36,7 @@ jobs:
       - name: Install PNPM
         uses: pnpm/action-setup@v2
         with:
-            version: 9.15.4  # This is the pnpm version I've set it to the one used locally as I think its the latest
+          version: 9.15.4
             
       # Setup .npmrc file to publish to GitHub Packages
       - uses: actions/setup-node@v3
@@ -35,6 +46,7 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
           # Defaults to the user or organization that owns the workflow file
           scope: '@flooz-link'
+      
       - run: pnpm install
       - run: pnpm build
       - run: pnpm publish
