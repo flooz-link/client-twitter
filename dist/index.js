@@ -4011,14 +4011,15 @@ var TwitterClientInterface = {
 };
 
 // src/index.ts
+var TwitterClientInterface2 = TwitterClientInterface;
 var twitterPlugin = {
   name: "twitter",
   description: "Twitter client",
-  clients: [TwitterClientInterface]
+  clients: [TwitterClientInterface2]
 };
 var index_default = twitterPlugin;
 export {
-  TwitterClientInterface,
+  TwitterClientInterface2 as TwitterClientInterface,
   index_default as default
 };
 //# sourceMappingURL=index.js.map

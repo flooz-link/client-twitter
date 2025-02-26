@@ -52,7 +52,12 @@ class TwitterManager {
   }
 }
 
-export const TwitterClientInterface: Client = {
+// Define a Twitter-specific interface that extends Client
+export interface TwitterClient extends Client {
+  start(runtime: IAgentRuntime): Promise<any>; // Adjust return type if known, e.g., TwitterManager
+}
+
+export const TwitterClientInterface: TwitterClient = {
   name: 'twitter',
   async start(runtime: IAgentRuntime) {
     const twitterConfig: TwitterConfig = await validateTwitterConfig(runtime);
