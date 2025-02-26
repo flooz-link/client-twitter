@@ -25,6 +25,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@elizaos/core": "^0.25.8",
     "@eslint/eslintrc": "3.1.0",
     "@typescript-eslint/eslint-plugin": "^6.7.0",
     "@typescript-eslint/parser": "^6.7.0",

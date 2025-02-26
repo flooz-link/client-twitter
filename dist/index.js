@@ -4018,6 +4018,7 @@ var twitterPlugin = {
 };
 var index_default = twitterPlugin;
 export {
+  TwitterClientInterface,
   index_default as default
 };
 //# sourceMappingURL=index.js.map
