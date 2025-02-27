@@ -2,7 +2,7 @@ import { TwitterClientInterface } from './client';
 import { TwitterClient } from './types';
 
 export {
-  TwitterClient,
+  type TwitterClient,
   TwitterClientInterface,
   TwitterClientInterface as default,
 };
