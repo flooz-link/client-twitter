@@ -142,6 +142,7 @@ export class TwitterSpaceClient {
     this.client = client;
     this.scraper = client.twitterClient;
     this.runtime = runtime;
+    this.spaceId = '1vOxwXwlOkNKB';
 
     const charSpaces = runtime.character.twitterSpaces || {};
     this.decisionOptions = {
