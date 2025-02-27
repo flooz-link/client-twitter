@@ -1,5 +1,7 @@
 // src/client.ts
-import { elizaLogger as elizaLogger8 } from "@elizaos/core";
+import {
+  elizaLogger as elizaLogger8
+} from "@elizaos/core";
 
 // src/base.ts
 import {
@@ -4009,17 +4011,8 @@ var TwitterClientInterface = {
     return manager;
   }
 };
-
-// src/index.ts
-var TwitterClientInterface2 = TwitterClientInterface;
-var twitterPlugin = {
-  name: "twitter",
-  description: "Twitter client",
-  clients: [TwitterClientInterface2]
-};
-var index_default = twitterPlugin;
 export {
-  TwitterClientInterface2 as TwitterClientInterface,
-  index_default as default
+  TwitterClientInterface,
+  TwitterClientInterface as default
 };
 //# sourceMappingURL=index.js.map

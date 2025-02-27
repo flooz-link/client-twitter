@@ -1,13 +1,5 @@
-import { Client, IAgentRuntime } from '@elizaos/core';
+import { Client } from '@elizaos/core';
 
-interface TwitterClient extends Client {
-    start(runtime: IAgentRuntime): Promise<any>;
-}
-declare const TwitterClientInterface: TwitterClient;
-declare const twitterPlugin: {
-    name: string;
-    description: string;
-    clients: TwitterClient[];
-};
+declare const TwitterClientInterface: Client;
 
-export { type TwitterClient, TwitterClientInterface, twitterPlugin as default };
+export { TwitterClientInterface, TwitterClientInterface as default };
