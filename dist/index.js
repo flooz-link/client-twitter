@@ -3004,23 +3004,23 @@ var SttTtsPlugin = class {
     );
     this.space = params.space;
     this.janus = (_a = this.space) == null ? void 0 : _a.janusClient;
-    const config2 = params.pluginConfig;
-    this.runtime = config2 == null ? void 0 : config2.runtime;
-    this.client = config2 == null ? void 0 : config2.client;
-    this.spaceId = config2 == null ? void 0 : config2.spaceId;
-    this.elevenLabsApiKey = config2 == null ? void 0 : config2.elevenLabsApiKey;
-    this.transcriptionService = config2.transcriptionService;
-    if (typeof (config2 == null ? void 0 : config2.silenceThreshold) === "number") {
-      this.silenceThreshold = config2.silenceThreshold;
+    const config = params.pluginConfig;
+    this.runtime = config == null ? void 0 : config.runtime;
+    this.client = config == null ? void 0 : config.client;
+    this.spaceId = config == null ? void 0 : config.spaceId;
+    this.elevenLabsApiKey = config == null ? void 0 : config.elevenLabsApiKey;
+    this.transcriptionService = config.transcriptionService;
+    if (typeof (config == null ? void 0 : config.silenceThreshold) === "number") {
+      this.silenceThreshold = config.silenceThreshold;
     }
-    if (config2 == null ? void 0 : config2.voiceId) {
-      this.voiceId = config2.voiceId;
+    if (config == null ? void 0 : config.voiceId) {
+      this.voiceId = config.voiceId;
     }
-    if (config2 == null ? void 0 : config2.elevenLabsModel) {
-      this.elevenLabsModel = config2.elevenLabsModel;
+    if (config == null ? void 0 : config.elevenLabsModel) {
+      this.elevenLabsModel = config.elevenLabsModel;
     }
-    if (config2 == null ? void 0 : config2.chatContext) {
-      this.chatContext = config2.chatContext;
+    if (config == null ? void 0 : config.chatContext) {
+      this.chatContext = config.chatContext;
     }
     this.volumeBuffers = /* @__PURE__ */ new Map();
   }
@@ -3599,6 +3599,13 @@ var TwitterSpaceClient = class {
       this.activeSpeakers = [];
       this.speakerQueue = [];
       const elevenLabsKey = this.runtime.getSetting("ELEVENLABS_XI_API_KEY") || "";
+      const bla = await this.scraper.getAudioSpaceById(this.spaceId);
+      const config = {
+        mode: "INTERACTIVE",
+        title: "TESTING",
+        description: `Discussion about`,
+        languages: ["en"]
+      };
       const broadcastInfo = await this.currentSpace.initialize(config);
       this.spaceId = broadcastInfo.room_id;
       if (this.decisionOptions.enableRecording) {
@@ -3683,8 +3690,8 @@ var TwitterSpaceClient = class {
         if (!this.isSpaceRunning) {
           const launch = await this.shouldLaunchSpace();
           if (launch) {
-            const config2 = await this.generateSpaceConfig();
-            await this.startSpace(config2);
+            const config = await this.generateSpaceConfig();
+            await this.startSpace(config);
           }
           this.checkInterval = setTimeout(
             routine,
@@ -3747,7 +3754,7 @@ var TwitterSpaceClient = class {
       languages: ["en"]
     };
   }
-  async startSpace(config2) {
+  async startSpace(config) {
     elizaLogger7.log("[Space] Starting a new Twitter Space...");
     try {
       this.currentSpace = new Space(this.scraper);
@@ -3757,7 +3764,7 @@ var TwitterSpaceClient = class {
       this.activeSpeakers = [];
       this.speakerQueue = [];
       const elevenLabsKey = this.runtime.getSetting("ELEVENLABS_XI_API_KEY") || "";
-      const broadcastInfo = await this.currentSpace.initialize(config2);
+      const broadcastInfo = await this.currentSpace.initialize(config);
       this.spaceId = broadcastInfo.room_id;
       if (this.decisionOptions.enableRecording) {
         elizaLogger7.log("[Space] Using RecordToDiskPlugin");
