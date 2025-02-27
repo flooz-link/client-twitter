@@ -1,4 +1,9 @@
-import { type Client, elizaLogger, type IAgentRuntime } from '@elizaos/core';
+import {
+  type Client,
+  elizaLogger,
+  type IAgentRuntime,
+  type Plugin,
+} from '@elizaos/core';
 import { ClientBase } from './base.ts';
 import { validateTwitterConfig, type TwitterConfig } from './environment.ts';
 import { TwitterInteractionClient } from './interactions.ts';
@@ -52,12 +57,7 @@ class TwitterManager {
   }
 }
 
-// Define a Twitter-specific interface that extends Client
-export interface TwitterClient extends Client {
-  start(runtime: IAgentRuntime): Promise<any>; // Adjust return type if known, e.g., TwitterManager
-}
-
-export const TwitterClientInterface: TwitterClient = {
+export const TwitterClientInterface: Client = {
   name: 'twitter',
   async start(runtime: IAgentRuntime) {
     const twitterConfig: TwitterConfig = await validateTwitterConfig(runtime);
