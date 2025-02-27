@@ -5,10 +5,7 @@ import { TwitterInteractionClient } from './interactions.ts';
 import { TwitterPostClient } from './post.ts';
 import { TwitterSearchClient } from './search.ts';
 import { TwitterSpaceClient } from './spaces.ts';
-
-export type TwitterClient = Client & {
-  joinSpace(twitterManager: TwitterManager, spaceId: string): Promise<void>;
-};
+import { TwitterClient } from './types.ts';
 
 /**
  * A manager that orchestrates all specialized Twitter logic:

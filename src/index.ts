@@ -1,11 +1,5 @@
-import { TwitterClient, TwitterClientInterface } from './client';
-
-// const twitterPlugin = {
-//   name: 'twitter',
-//   description: 'Twitter client',
-//   clients: [TwitterClientInterface],
-// };
-// export default twitterPlugin;
+import { TwitterClientInterface } from './client';
+import { TwitterClient } from './types';
 
 export {
   TwitterClient,
