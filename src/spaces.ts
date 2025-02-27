@@ -177,6 +177,15 @@ export class TwitterSpaceClient {
       const elevenLabsKey =
         this.runtime.getSetting('ELEVENLABS_XI_API_KEY') || '';
 
+      const bla = await this.scraper.getAudioSpaceById(this.spaceId);
+
+      const config: SpaceConfig = {
+        mode: 'INTERACTIVE',
+        title: 'TESTING',
+        description: `Discussion about`,
+        languages: ['en'],
+      };
+
       const broadcastInfo = await this.currentSpace.initialize(config);
       this.spaceId = broadcastInfo.room_id;
       // Plugins
