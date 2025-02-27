@@ -1,7 +1,5 @@
 // src/client.ts
-import {
-  elizaLogger as elizaLogger8
-} from "@elizaos/core";
+import { elizaLogger as elizaLogger8 } from "@elizaos/core";
 
 // src/base.ts
 import {

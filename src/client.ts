@@ -1,9 +1,4 @@
-import {
-  type Client,
-  elizaLogger,
-  type IAgentRuntime,
-  type Plugin,
-} from '@elizaos/core';
+import { type Client, elizaLogger, type IAgentRuntime } from '@elizaos/core';
 import { ClientBase } from './base.ts';
 import { validateTwitterConfig, type TwitterConfig } from './environment.ts';
 import { TwitterInteractionClient } from './interactions.ts';
@@ -57,7 +52,11 @@ class TwitterManager {
   }
 }
 
-export const TwitterClientInterface: Client = {
+export type TwitterClient = Client & {
+  joinSpace(twitterManager: TwitterManager, spaceId: string): Promise<void>;
+};
+
+export const TwitterClientInterface: TwitterClient = {
   name: 'twitter',
   async start(runtime: IAgentRuntime) {
     const twitterConfig: TwitterConfig = await validateTwitterConfig(runtime);
