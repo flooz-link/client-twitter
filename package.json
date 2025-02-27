@@ -8,6 +8,7 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
+       "types": "./dist/index.d.ts",
       "import": {
         "@elizaos/source": "./src/index.ts",
         "types": "./dist/index.d.ts",
