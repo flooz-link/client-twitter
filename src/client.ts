@@ -55,7 +55,7 @@ class TwitterManager {
 
 export const TwitterClientInterface: TwitterClient = {
   name: 'twitter',
-  async start(runtime: IAgentRuntime) {
+  async start(runtime: IAgentRuntime): Promise<TwitterManager> {
     const twitterConfig: TwitterConfig = await validateTwitterConfig(runtime);
 
     elizaLogger.log('Twitter client started');

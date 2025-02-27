@@ -160,77 +160,106 @@ export class TwitterSpaceClient {
 
   async joinSpace(spaceId: string) {
     this.spaceId = spaceId;
-    const config = await this.generateSpaceConfig();
-    await this.startSpace(config);
-  }
+    this.isSpaceRunning = true;
+    elizaLogger.log('[Space] Joining a new Twitter Space...');
 
-  /**
-   * Check if bot is in a Space, and update spaceId if found
-   */
-  private async checkBotInSpace(): Promise<boolean> {
     try {
-      // Check if we have a known spaceId
-      if (this.spaceId) {
-        const audioSpace: AudioSpace = await this.scraper.getAudioSpaceById(
-          this.spaceId,
-        );
-        const botUser = await this.client.twitterClient.me();
-        const status = await this.scraper.getAudioSpaceStatus(this.spaceId);
-        const isLive = status?.source?.status?.toLowerCase() === 'running'; // Assuming LiveVideoStreamStatus has a 'state' field
-
-        if (!isLive) {
-          elizaLogger.log(
-            '[Space] Tracked Space ID ' + this.spaceId + ' is not live',
-          );
-          this.spaceId = undefined;
-          this.isSpaceRunning = false;
-          return false;
-        }
-
-        const participants: Participants = audioSpace?.participants;
-        const admins = participants?.admins || [];
-        const speakers = participants?.speakers || [];
-        const listeners = participants?.listeners || [];
-
-        const isAdmin = admins.some(
-          (admin) => admin?.display_name === botUser.username,
-        );
-        const isSpeaker = speakers.some(
-          (sp) => sp?.display_name === botUser.username,
-        );
-        const isListener = listeners.some(
-          (li) => li?.display_name === botUser.username,
-        );
-
-        if (isAdmin || isSpeaker || isListener) {
-          elizaLogger.log(
-            `[Space] Bot is ${isAdmin ? 'admin' : isSpeaker ? 'speaker' : 'listener'} in Space ID: ${this.spaceId}`,
-          );
-          this.isSpaceRunning = true;
-          return true;
-        }
-        elizaLogger.log('[Space] Bot not in tracked Space ID: ' + this.spaceId);
-        this.spaceId = undefined;
-        this.isSpaceRunning = false;
-      }
-
-      // Fallback: If no spaceId, we need to find it
-      // Since agent-twitter-client lacks a direct method, assume it’s set externally
-      // If you can get the Space ID from UI (e.g., URL), set it via a method like setSpaceIdFromUI
-      if (!this.spaceId) {
-        elizaLogger.log(
-          '[Space] No Space ID known; cannot check without external input',
-        );
-        this.isSpaceRunning = false;
-        return false;
-      }
-
-      return false; // Fallback case
-    } catch (error) {
-      elizaLogger.error('[Space] Error checking bot in Space =>', error);
+      this.currentSpace = new Space(this.scraper);
       this.isSpaceRunning = false;
       this.spaceId = undefined;
-      return false;
+      this.startedAt = Date.now();
+
+      // Reset states
+      this.activeSpeakers = [];
+      this.speakerQueue = [];
+
+      // Retrieve keys
+      const elevenLabsKey =
+        this.runtime.getSetting('ELEVENLABS_XI_API_KEY') || '';
+
+      const broadcastInfo = await this.currentSpace.initialize(config);
+      this.spaceId = broadcastInfo.room_id;
+      // Plugins
+      if (this.decisionOptions.enableRecording) {
+        elizaLogger.log('[Space] Using RecordToDiskPlugin');
+        this.currentSpace.use(new RecordToDiskPlugin());
+      }
+
+      if (this.decisionOptions.enableSttTts) {
+        elizaLogger.log('[Space] Using SttTtsPlugin');
+        const sttTts = new SttTtsPlugin();
+        this.sttTtsPlugin = sttTts;
+        this.currentSpace.use(sttTts, {
+          runtime: this.runtime,
+          client: this.client,
+          spaceId: this.spaceId,
+          elevenLabsApiKey: elevenLabsKey,
+          voiceId: this.decisionOptions.voiceId,
+          sttLanguage: this.decisionOptions.sttLanguage,
+          transcriptionService:
+            this.client.runtime.getService<ITranscriptionService>(
+              ServiceType.TRANSCRIPTION,
+            ),
+        });
+      }
+
+      if (this.decisionOptions.enableIdleMonitor) {
+        elizaLogger.log('[Space] Using IdleMonitorPlugin');
+        this.currentSpace.use(
+          new IdleMonitorPlugin(
+            this.decisionOptions.idleKickTimeoutMs ?? 60_000,
+            10_000,
+          ),
+        );
+      }
+
+      this.isSpaceRunning = true;
+      await this.scraper.sendTweet(
+        broadcastInfo.share_url.replace('broadcasts', 'spaces'),
+      );
+
+      const spaceUrl = broadcastInfo.share_url.replace('broadcasts', 'spaces');
+      elizaLogger.log(`[Space] Space started => ${spaceUrl}`);
+
+      // Greet
+      await speakFiller(this.client.runtime, this.sttTtsPlugin, 'WELCOME');
+
+      // Events
+      this.currentSpace.on('occupancyUpdate', (update) => {
+        elizaLogger.log(
+          `[Space] Occupancy => ${update.occupancy} participant(s).`,
+        );
+      });
+
+      this.currentSpace.on('speakerRequest', async (req: SpeakerRequest) => {
+        elizaLogger.log(
+          `[Space] Speaker request from @${req.username} (${req.userId}).`,
+        );
+        await this.handleSpeakerRequest(req);
+      });
+
+      this.currentSpace.on('idleTimeout', async (info) => {
+        elizaLogger.log(
+          `[Space] idleTimeout => no audio for ${info.idleMs} ms.`,
+        );
+        await speakFiller(
+          this.client.runtime,
+          this.sttTtsPlugin,
+          'IDLE_ENDING',
+        );
+        await this.stopSpace();
+      });
+
+      process.on('SIGINT', async () => {
+        elizaLogger.log('[Space] SIGINT => stopping space');
+        await speakFiller(this.client.runtime, this.sttTtsPlugin, 'CLOSING');
+        await this.stopSpace();
+        process.exit(0);
+      });
+    } catch (error) {
+      elizaLogger.error('[Space] Error launching Space =>', error);
+      this.isSpaceRunning = false;
+      throw error;
     }
   }
 
@@ -246,19 +275,7 @@ export class TwitterSpaceClient {
 
     const routine = async () => {
       try {
-        const botInSpace = await this.checkBotInSpace();
-
         if (!this.isSpaceRunning) {
-          if (botInSpace) {
-            elizaLogger.log(
-              '[Space] Bot is in a Space but not hosting, monitoring...',
-            );
-            // Optional: Add logic here, e.g., speak a filler if speaker
-            if (this.sttTtsPlugin) {
-              await speakFiller(this.runtime, this.sttTtsPlugin, 'JOINED');
-            }
-          }
-          // Space not running => check if we should launch
           const launch = await this.shouldLaunchSpace();
           if (launch) {
             const config = await this.generateSpaceConfig();

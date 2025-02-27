@@ -3004,23 +3004,23 @@ var SttTtsPlugin = class {
     );
     this.space = params.space;
     this.janus = (_a = this.space) == null ? void 0 : _a.janusClient;
-    const config = params.pluginConfig;
-    this.runtime = config == null ? void 0 : config.runtime;
-    this.client = config == null ? void 0 : config.client;
-    this.spaceId = config == null ? void 0 : config.spaceId;
-    this.elevenLabsApiKey = config == null ? void 0 : config.elevenLabsApiKey;
-    this.transcriptionService = config.transcriptionService;
-    if (typeof (config == null ? void 0 : config.silenceThreshold) === "number") {
-      this.silenceThreshold = config.silenceThreshold;
+    const config2 = params.pluginConfig;
+    this.runtime = config2 == null ? void 0 : config2.runtime;
+    this.client = config2 == null ? void 0 : config2.client;
+    this.spaceId = config2 == null ? void 0 : config2.spaceId;
+    this.elevenLabsApiKey = config2 == null ? void 0 : config2.elevenLabsApiKey;
+    this.transcriptionService = config2.transcriptionService;
+    if (typeof (config2 == null ? void 0 : config2.silenceThreshold) === "number") {
+      this.silenceThreshold = config2.silenceThreshold;
     }
-    if (config == null ? void 0 : config.voiceId) {
-      this.voiceId = config.voiceId;
+    if (config2 == null ? void 0 : config2.voiceId) {
+      this.voiceId = config2.voiceId;
     }
-    if (config == null ? void 0 : config.elevenLabsModel) {
-      this.elevenLabsModel = config.elevenLabsModel;
+    if (config2 == null ? void 0 : config2.elevenLabsModel) {
+      this.elevenLabsModel = config2.elevenLabsModel;
     }
-    if (config == null ? void 0 : config.chatContext) {
-      this.chatContext = config.chatContext;
+    if (config2 == null ? void 0 : config2.chatContext) {
+      this.chatContext = config2.chatContext;
     }
     this.volumeBuffers = /* @__PURE__ */ new Map();
   }
@@ -3589,67 +3589,86 @@ var TwitterSpaceClient = class {
   }
   async joinSpace(spaceId) {
     this.spaceId = spaceId;
-    const config = await this.generateSpaceConfig();
-    await this.startSpace(config);
-  }
-  /**
-   * Check if bot is in a Space, and update spaceId if found
-   */
-  async checkBotInSpace() {
-    var _a, _b;
+    this.isSpaceRunning = true;
+    elizaLogger7.log("[Space] Joining a new Twitter Space...");
     try {
-      if (this.spaceId) {
-        const audioSpace = await this.scraper.getAudioSpaceById(
-          this.spaceId
-        );
-        const botUser = await this.client.twitterClient.me();
-        const status = await this.scraper.getAudioSpaceStatus(this.spaceId);
-        const isLive = ((_b = (_a = status == null ? void 0 : status.source) == null ? void 0 : _a.status) == null ? void 0 : _b.toLowerCase()) === "running";
-        if (!isLive) {
-          elizaLogger7.log(
-            "[Space] Tracked Space ID " + this.spaceId + " is not live"
-          );
-          this.spaceId = void 0;
-          this.isSpaceRunning = false;
-          return false;
-        }
-        const participants = audioSpace == null ? void 0 : audioSpace.participants;
-        const admins = (participants == null ? void 0 : participants.admins) || [];
-        const speakers = (participants == null ? void 0 : participants.speakers) || [];
-        const listeners = (participants == null ? void 0 : participants.listeners) || [];
-        const isAdmin = admins.some(
-          (admin) => (admin == null ? void 0 : admin.display_name) === botUser.username
-        );
-        const isSpeaker = speakers.some(
-          (sp) => (sp == null ? void 0 : sp.display_name) === botUser.username
-        );
-        const isListener = listeners.some(
-          (li) => (li == null ? void 0 : li.display_name) === botUser.username
-        );
-        if (isAdmin || isSpeaker || isListener) {
-          elizaLogger7.log(
-            `[Space] Bot is ${isAdmin ? "admin" : isSpeaker ? "speaker" : "listener"} in Space ID: ${this.spaceId}`
-          );
-          this.isSpaceRunning = true;
-          return true;
-        }
-        elizaLogger7.log("[Space] Bot not in tracked Space ID: " + this.spaceId);
-        this.spaceId = void 0;
-        this.isSpaceRunning = false;
-      }
-      if (!this.spaceId) {
-        elizaLogger7.log(
-          "[Space] No Space ID known; cannot check without external input"
-        );
-        this.isSpaceRunning = false;
-        return false;
-      }
-      return false;
-    } catch (error) {
-      elizaLogger7.error("[Space] Error checking bot in Space =>", error);
+      this.currentSpace = new Space(this.scraper);
       this.isSpaceRunning = false;
       this.spaceId = void 0;
-      return false;
+      this.startedAt = Date.now();
+      this.activeSpeakers = [];
+      this.speakerQueue = [];
+      const elevenLabsKey = this.runtime.getSetting("ELEVENLABS_XI_API_KEY") || "";
+      const broadcastInfo = await this.currentSpace.initialize(config);
+      this.spaceId = broadcastInfo.room_id;
+      if (this.decisionOptions.enableRecording) {
+        elizaLogger7.log("[Space] Using RecordToDiskPlugin");
+        this.currentSpace.use(new RecordToDiskPlugin());
+      }
+      if (this.decisionOptions.enableSttTts) {
+        elizaLogger7.log("[Space] Using SttTtsPlugin");
+        const sttTts = new SttTtsPlugin();
+        this.sttTtsPlugin = sttTts;
+        this.currentSpace.use(sttTts, {
+          runtime: this.runtime,
+          client: this.client,
+          spaceId: this.spaceId,
+          elevenLabsApiKey: elevenLabsKey,
+          voiceId: this.decisionOptions.voiceId,
+          sttLanguage: this.decisionOptions.sttLanguage,
+          transcriptionService: this.client.runtime.getService(
+            ServiceType4.TRANSCRIPTION
+          )
+        });
+      }
+      if (this.decisionOptions.enableIdleMonitor) {
+        elizaLogger7.log("[Space] Using IdleMonitorPlugin");
+        this.currentSpace.use(
+          new IdleMonitorPlugin(
+            this.decisionOptions.idleKickTimeoutMs ?? 6e4,
+            1e4
+          )
+        );
+      }
+      this.isSpaceRunning = true;
+      await this.scraper.sendTweet(
+        broadcastInfo.share_url.replace("broadcasts", "spaces")
+      );
+      const spaceUrl = broadcastInfo.share_url.replace("broadcasts", "spaces");
+      elizaLogger7.log(`[Space] Space started => ${spaceUrl}`);
+      await speakFiller(this.client.runtime, this.sttTtsPlugin, "WELCOME");
+      this.currentSpace.on("occupancyUpdate", (update) => {
+        elizaLogger7.log(
+          `[Space] Occupancy => ${update.occupancy} participant(s).`
+        );
+      });
+      this.currentSpace.on("speakerRequest", async (req) => {
+        elizaLogger7.log(
+          `[Space] Speaker request from @${req.username} (${req.userId}).`
+        );
+        await this.handleSpeakerRequest(req);
+      });
+      this.currentSpace.on("idleTimeout", async (info) => {
+        elizaLogger7.log(
+          `[Space] idleTimeout => no audio for ${info.idleMs} ms.`
+        );
+        await speakFiller(
+          this.client.runtime,
+          this.sttTtsPlugin,
+          "IDLE_ENDING"
+        );
+        await this.stopSpace();
+      });
+      process.on("SIGINT", async () => {
+        elizaLogger7.log("[Space] SIGINT => stopping space");
+        await speakFiller(this.client.runtime, this.sttTtsPlugin, "CLOSING");
+        await this.stopSpace();
+        process.exit(0);
+      });
+    } catch (error) {
+      elizaLogger7.error("[Space] Error launching Space =>", error);
+      this.isSpaceRunning = false;
+      throw error;
     }
   }
   /**
@@ -3661,20 +3680,11 @@ var TwitterSpaceClient = class {
     const intervalMsWhenRunning = 5e3;
     const routine = async () => {
       try {
-        const botInSpace = await this.checkBotInSpace();
         if (!this.isSpaceRunning) {
-          if (botInSpace) {
-            elizaLogger7.log(
-              "[Space] Bot is in a Space but not hosting, monitoring..."
-            );
-            if (this.sttTtsPlugin) {
-              await speakFiller(this.runtime, this.sttTtsPlugin, "JOINED");
-            }
-          }
           const launch = await this.shouldLaunchSpace();
           if (launch) {
-            const config = await this.generateSpaceConfig();
-            await this.startSpace(config);
+            const config2 = await this.generateSpaceConfig();
+            await this.startSpace(config2);
           }
           this.checkInterval = setTimeout(
             routine,
@@ -3737,7 +3747,7 @@ var TwitterSpaceClient = class {
       languages: ["en"]
     };
   }
-  async startSpace(config) {
+  async startSpace(config2) {
     elizaLogger7.log("[Space] Starting a new Twitter Space...");
     try {
       this.currentSpace = new Space(this.scraper);
@@ -3747,7 +3757,7 @@ var TwitterSpaceClient = class {
       this.activeSpeakers = [];
       this.speakerQueue = [];
       const elevenLabsKey = this.runtime.getSetting("ELEVENLABS_XI_API_KEY") || "";
-      const broadcastInfo = await this.currentSpace.initialize(config);
+      const broadcastInfo = await this.currentSpace.initialize(config2);
       this.spaceId = broadcastInfo.room_id;
       if (this.decisionOptions.enableRecording) {
         elizaLogger7.log("[Space] Using RecordToDiskPlugin");
