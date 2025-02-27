@@ -12,9 +12,11 @@ import type { ClientBase } from './base';
 import {
   type Scraper,
   Space,
+  // @ts-ignore
   type SpaceConfig,
   RecordToDiskPlugin,
   IdleMonitorPlugin,
+  // @ts-ignore
   type SpeakerRequest,
   AudioSpace,
   Participants,
@@ -36,17 +38,13 @@ async function generateFiller(
   fillerType: string,
 ): Promise<string> {
   try {
-    const context = composeContext({
-      state: { fillerType },
-      template: `
-# INSTRUCTIONS:
-You are generating a short filler message for a Twitter Space. The filler type is "{{fillerType}}".
-Keep it brief, friendly, and relevant. No more than two sentences.
-Only return the text, no additional formatting.
+    const context = `
+    # INSTRUCTIONS:
+  You are generating a short filler message for a Twitter Space. The filler type is "${fillerType}".
+  Keep it brief, friendly, and relevant. No more than two sentences.
+  Only return the text, no additional formatting.
 
----
-`,
-    });
+  ---`;
     const output = await generateText({
       runtime,
       context,
@@ -87,18 +85,14 @@ async function generateTopicsIfEmpty(
   runtime: IAgentRuntime,
 ): Promise<string[]> {
   try {
-    const context = composeContext({
-      state: {},
-      template: `
-# INSTRUCTIONS:
+    const context = `# INSTRUCTIONS:
 Please generate 5 short topic ideas for a Twitter Space about technology or random interesting subjects.
 Return them as a comma-separated list, no additional formatting or numbering.
 
 Example:
 "AI Advances, Futuristic Gadgets, Space Exploration, Quantum Computing, Digital Ethics"
 ---
-`,
-    });
+`;
     const response = await generateText({
       runtime,
       context,

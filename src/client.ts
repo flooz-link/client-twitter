@@ -6,6 +6,10 @@ import { TwitterPostClient } from './post.ts';
 import { TwitterSearchClient } from './search.ts';
 import { TwitterSpaceClient } from './spaces.ts';
 
+type TwitterClient = Client & {
+  joinSpace(twitterManager: TwitterManager, spaceId: string): Promise<void>;
+};
+
 /**
  * A manager that orchestrates all specialized Twitter logic:
  * - client: base operations (login, timeline caching, etc.)
@@ -51,10 +55,6 @@ class TwitterManager {
     elizaLogger.warn('Twitter client does not support stopping yet');
   }
 }
-
-export type TwitterClient = Client & {
-  joinSpace(twitterManager: TwitterManager, spaceId: string): Promise<void>;
-};
 
 export const TwitterClientInterface: TwitterClient = {
   name: 'twitter',

@@ -120,6 +120,7 @@ var ClientBase = class _ClientBase extends EventEmitter {
       isReply: raw.isReply,
       isRetweet: ((_i = raw.legacy) == null ? void 0 : _i.retweeted) === true,
       isSelfThread: raw.isSelfThread,
+      // @ts-ignore
       language: (_j = raw.legacy) == null ? void 0 : _j.lang,
       likes: ((_k = raw.legacy) == null ? void 0 : _k.favorite_count) ?? 0,
       name: raw.name ?? ((_n = (_m = (_l = raw == null ? void 0 : raw.user_results) == null ? void 0 : _l.result) == null ? void 0 : _m.legacy) == null ? void 0 : _n.name) ?? ((_r = (_q = (_p = (_o = raw.core) == null ? void 0 : _o.user_results) == null ? void 0 : _p.result) == null ? void 0 : _q.legacy) == null ? void 0 : _r.name),
@@ -2850,7 +2851,6 @@ ${response.text}`;
 // src/spaces.ts
 import {
   elizaLogger as elizaLogger7,
-  composeContext as composeContext5,
   generateText as generateText3,
   ModelClass as ModelClass5,
   ServiceType as ServiceType4
@@ -3499,17 +3499,13 @@ var SttTtsPlugin = class {
 // src/spaces.ts
 async function generateFiller(runtime, fillerType) {
   try {
-    const context = composeContext5({
-      state: { fillerType },
-      template: `
-# INSTRUCTIONS:
-You are generating a short filler message for a Twitter Space. The filler type is "{{fillerType}}".
-Keep it brief, friendly, and relevant. No more than two sentences.
-Only return the text, no additional formatting.
+    const context = `
+    # INSTRUCTIONS:
+  You are generating a short filler message for a Twitter Space. The filler type is "${fillerType}".
+  Keep it brief, friendly, and relevant. No more than two sentences.
+  Only return the text, no additional formatting.
 
----
-`
-    });
+  ---`;
     const output = await generateText3({
       runtime,
       context,
@@ -3533,18 +3529,14 @@ async function speakFiller(runtime, sttTtsPlugin, fillerType, sleepAfterMs = 3e3
 }
 async function generateTopicsIfEmpty(runtime) {
   try {
-    const context = composeContext5({
-      state: {},
-      template: `
-# INSTRUCTIONS:
+    const context = `# INSTRUCTIONS:
 Please generate 5 short topic ideas for a Twitter Space about technology or random interesting subjects.
 Return them as a comma-separated list, no additional formatting or numbering.
 
 Example:
 "AI Advances, Futuristic Gadgets, Space Exploration, Quantum Computing, Digital Ethics"
 ---
-`
-    });
+`;
     const response = await generateText3({
       runtime,
       context,

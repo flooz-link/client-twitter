@@ -173,6 +173,7 @@ export class ClientBase extends EventEmitter {
       isReply: raw.isReply,
       isRetweet: raw.legacy?.retweeted === true,
       isSelfThread: raw.isSelfThread,
+      // @ts-ignore
       language: raw.legacy?.lang,
       likes: raw.legacy?.favorite_count ?? 0,
       name:
