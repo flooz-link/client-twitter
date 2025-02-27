@@ -1,4 +1,4 @@
-import { TwitterClientInterface } from './client';
+import { TwitterClient, TwitterClientInterface } from './client';
 
 // const twitterPlugin = {
 //   name: 'twitter',
@@ -7,4 +7,8 @@ import { TwitterClientInterface } from './client';
 // };
 // export default twitterPlugin;
 
-export { TwitterClientInterface, TwitterClientInterface as default };
+export {
+  TwitterClient,
+  TwitterClientInterface,
+  TwitterClientInterface as default,
+};

@@ -6,7 +6,7 @@ import { TwitterPostClient } from './post.ts';
 import { TwitterSearchClient } from './search.ts';
 import { TwitterSpaceClient } from './spaces.ts';
 
-type TwitterClient = Client & {
+export type TwitterClient = Client & {
   joinSpace(twitterManager: TwitterManager, spaceId: string): Promise<void>;
 };
 

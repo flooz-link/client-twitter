@@ -283,4 +283,4 @@ declare class TwitterManager {
 }
 declare const TwitterClientInterface: TwitterClient;
 
-export { TwitterClientInterface, TwitterClientInterface as default };
+export { type TwitterClient, TwitterClientInterface, TwitterClientInterface as default };
