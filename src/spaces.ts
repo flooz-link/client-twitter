@@ -165,8 +165,6 @@ export class TwitterSpaceClient {
 
     try {
       this.currentSpace = new Space(this.scraper);
-      this.isSpaceRunning = false;
-      this.spaceId = undefined;
       this.startedAt = Date.now();
 
       // Reset states

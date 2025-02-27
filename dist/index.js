@@ -3593,8 +3593,6 @@ var TwitterSpaceClient = class {
     elizaLogger7.log("[Space] Joining a new Twitter Space...");
     try {
       this.currentSpace = new Space(this.scraper);
-      this.isSpaceRunning = false;
-      this.spaceId = void 0;
       this.startedAt = Date.now();
       this.activeSpeakers = [];
       this.speakerQueue = [];
