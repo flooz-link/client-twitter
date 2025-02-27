@@ -1,7 +1,6 @@
 import {
   elizaLogger,
   type IAgentRuntime,
-  composeContext,
   generateText,
   ModelClass,
   ServiceType,
