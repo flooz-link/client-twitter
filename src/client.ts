@@ -87,4 +87,10 @@ export const TwitterClientInterface: Client = {
 
     return manager;
   },
+  async joinSpace(manager: TwitterManager, spaceId: string) {
+    if (manager.space) {
+      return manager.space.joinSpace(spaceId);
+    }
+    return;
+  },
 };

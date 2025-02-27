@@ -142,7 +142,6 @@ export class TwitterSpaceClient {
     this.client = client;
     this.scraper = client.twitterClient;
     this.runtime = runtime;
-    this.spaceId = '1vOxwXwlOkNKB';
 
     const charSpaces = runtime.character.twitterSpaces || {};
     this.decisionOptions = {
@@ -164,6 +163,12 @@ export class TwitterSpaceClient {
       sttLanguage: charSpaces.sttLanguage || 'en',
       speakerMaxDurationMs: charSpaces.speakerMaxDurationMs ?? 4 * 60_000,
     };
+  }
+
+  async joinSpace(spaceId: string) {
+    this.spaceId = spaceId;
+    const config = await this.generateSpaceConfig();
+    await this.startSpace(config);
   }
 
   /**
@@ -248,7 +253,6 @@ export class TwitterSpaceClient {
 
     const routine = async () => {
       try {
-        // Check if the bot is in any Space
         const botInSpace = await this.checkBotInSpace();
 
         if (!this.isSpaceRunning) {
