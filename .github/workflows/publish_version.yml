@@ -20,6 +20,11 @@ jobs:
         with:
           node-version: '20.18.1'
           cache: 'pnpm'
+
+      - name: Setup .npmrc file
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
+          echo "@flooz-link:registry=https://npm.pkg.github.com" >> .npmrc
       
       - run: pnpm install
       - run: pnpm lint
