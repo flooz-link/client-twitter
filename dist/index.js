@@ -3615,6 +3615,17 @@ var TwitterSpaceClient = class {
         if (this.decisionOptions.enableSttTts) {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
           const sttTts = new SttTtsPlugin();
+          sttTts.init({
+            runtime: this.runtime,
+            client: this.client,
+            spaceId: this.spaceId,
+            elevenLabsApiKey: elevenLabsKey,
+            voiceId: this.decisionOptions.voiceId,
+            sttLanguage: this.decisionOptions.sttLanguage,
+            transcriptionService: this.client.runtime.getService(
+              ServiceType4.TRANSCRIPTION
+            )
+          });
           this.sttTtsPlugin = sttTts;
           participant.use(sttTts, {
             runtime: this.runtime,

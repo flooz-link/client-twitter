@@ -200,6 +200,18 @@ export class TwitterSpaceClient {
         if (this.decisionOptions.enableSttTts) {
           elizaLogger.log('[Space] Using SttTtsPlugin');
           const sttTts = new SttTtsPlugin();
+          sttTts.init({
+            runtime: this.runtime,
+            client: this.client,
+            spaceId: this.spaceId,
+            elevenLabsApiKey: elevenLabsKey,
+            voiceId: this.decisionOptions.voiceId,
+            sttLanguage: this.decisionOptions.sttLanguage,
+            transcriptionService:
+              this.client.runtime.getService<ITranscriptionService>(
+                ServiceType.TRANSCRIPTION,
+              ),
+          });
           this.sttTtsPlugin = sttTts;
           // this.currentSpace.use(sttTts, {
           //   runtime: this.runtime,
