@@ -24,6 +24,7 @@ This package provides Twitter/X integration for the Eliza AI agent.
 
 Create or edit `.env` file in your project root:
 
+
 ```bash
 # Twitter API Credentials
 TWITTER_USERNAME=           # Your Twitter/X username
