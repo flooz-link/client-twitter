@@ -228,7 +228,13 @@ export class TwitterSpaceClient {
 
         if (this.decisionOptions.enableIdleMonitor) {
           elizaLogger.log('[Space] Using IdleMonitorPlugin');
-          this.currentSpace.use(
+          // this.currentSpace.use(
+          //   new IdleMonitorPlugin(
+          //     this.decisionOptions.idleKickTimeoutMs ?? 60_000,
+          //     10_000,
+          //   ),
+          // );
+          participant.use(
             new IdleMonitorPlugin(
               this.decisionOptions.idleKickTimeoutMs ?? 60_000,
               10_000,

@@ -3630,7 +3630,7 @@ var TwitterSpaceClient = class {
         }
         if (this.decisionOptions.enableIdleMonitor) {
           elizaLogger7.log("[Space] Using IdleMonitorPlugin");
-          this.currentSpace.use(
+          participant.use(
             new IdleMonitorPlugin(
               this.decisionOptions.idleKickTimeoutMs ?? 6e4,
               1e4
