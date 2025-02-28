@@ -1,4 +1,4 @@
-import { type Client, elizaLogger, type IAgentRuntime } from '@elizaos/core';
+import { elizaLogger, type IAgentRuntime } from '@elizaos/core';
 import { ClientBase } from './base.ts';
 import { validateTwitterConfig, type TwitterConfig } from './environment.ts';
 import { TwitterInteractionClient } from './interactions.ts';
