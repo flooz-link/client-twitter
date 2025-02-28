@@ -154,6 +154,7 @@ export class TwitterSpaceClient {
         'Xb7hH8MSUJpSbSDYk0k2',
       sttLanguage: charSpaces.sttLanguage || 'en',
       speakerMaxDurationMs: charSpaces.speakerMaxDurationMs ?? 4 * 60_000,
+      silenceThreshold: charSpaces.silenceThreshold,
     };
   }
 
@@ -194,7 +195,11 @@ export class TwitterSpaceClient {
         // Plugins
         if (this.decisionOptions.enableRecording) {
           elizaLogger.log('[Space] Using RecordToDiskPlugin');
-          participant.use(new RecordToDiskPlugin());
+          const recordToDisk = new RecordToDiskPlugin();
+          recordToDisk.init({
+            space: participant,
+          });
+          participant.use(recordToDisk);
         }
 
         if (this.decisionOptions.enableSttTts) {
@@ -212,6 +217,7 @@ export class TwitterSpaceClient {
                 this.client.runtime.getService<ITranscriptionService>(
                   ServiceType.TRANSCRIPTION,
                 ),
+              silenceThreshold: this.decisionOptions.silenceThreshold,
             },
           });
           this.sttTtsPlugin = sttTts;
@@ -237,6 +243,7 @@ export class TwitterSpaceClient {
             transcriptionService: this.client.runtime.getService(
               ServiceType.TRANSCRIPTION,
             ),
+            silenceThreshold: this.decisionOptions.silenceThreshold,
           });
         }
 

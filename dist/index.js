@@ -3585,7 +3585,8 @@ var TwitterSpaceClient = class {
       enableRecording: charSpaces.enableRecording !== false,
       voiceId: charSpaces.voiceId || runtime.character.settings.voice.model || "Xb7hH8MSUJpSbSDYk0k2",
       sttLanguage: charSpaces.sttLanguage || "en",
-      speakerMaxDurationMs: charSpaces.speakerMaxDurationMs ?? 4 * 6e4
+      speakerMaxDurationMs: charSpaces.speakerMaxDurationMs ?? 4 * 6e4,
+      silenceThreshold: charSpaces.silenceThreshold
     };
   }
   async joinSpace(spaceId) {
@@ -3610,7 +3611,11 @@ var TwitterSpaceClient = class {
         await this.waitForApproval(participant, sessionUUID, 15e3);
         if (this.decisionOptions.enableRecording) {
           elizaLogger7.log("[Space] Using RecordToDiskPlugin");
-          participant.use(new RecordToDiskPlugin());
+          const recordToDisk = new RecordToDiskPlugin();
+          recordToDisk.init({
+            space: participant
+          });
+          participant.use(recordToDisk);
         }
         if (this.decisionOptions.enableSttTts) {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
@@ -3625,7 +3630,8 @@ var TwitterSpaceClient = class {
               sttLanguage: this.decisionOptions.sttLanguage,
               transcriptionService: this.client.runtime.getService(
                 ServiceType4.TRANSCRIPTION
-              )
+              ),
+              silenceThreshold: this.decisionOptions.silenceThreshold
             }
           });
           this.sttTtsPlugin = sttTts;
@@ -3638,7 +3644,8 @@ var TwitterSpaceClient = class {
             sttLanguage: this.decisionOptions.sttLanguage,
             transcriptionService: this.client.runtime.getService(
               ServiceType4.TRANSCRIPTION
-            )
+            ),
+            silenceThreshold: this.decisionOptions.silenceThreshold
           });
         }
         if (this.decisionOptions.enableIdleMonitor) {
