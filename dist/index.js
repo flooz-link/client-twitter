@@ -3610,21 +3610,23 @@ var TwitterSpaceClient = class {
         await this.waitForApproval(participant, sessionUUID, 15e3);
         if (this.decisionOptions.enableRecording) {
           elizaLogger7.log("[Space] Using RecordToDiskPlugin");
-          this.currentSpace.use(new RecordToDiskPlugin());
+          participant.use(new RecordToDiskPlugin());
         }
         if (this.decisionOptions.enableSttTts) {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
           const sttTts = new SttTtsPlugin();
           sttTts.init({
-            runtime: this.runtime,
-            client: this.client,
-            spaceId: this.spaceId,
-            elevenLabsApiKey: elevenLabsKey,
-            voiceId: this.decisionOptions.voiceId,
-            sttLanguage: this.decisionOptions.sttLanguage,
-            transcriptionService: this.client.runtime.getService(
-              ServiceType4.TRANSCRIPTION
-            )
+            pluginConfig: {
+              runtime: this.runtime,
+              client: this.client,
+              spaceId: this.spaceId,
+              elevenLabsApiKey: elevenLabsKey,
+              voiceId: this.decisionOptions.voiceId,
+              sttLanguage: this.decisionOptions.sttLanguage,
+              transcriptionService: this.client.runtime.getService(
+                ServiceType4.TRANSCRIPTION
+              )
+            }
           });
           this.sttTtsPlugin = sttTts;
           participant.use(sttTts, {
