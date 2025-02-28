@@ -179,21 +179,6 @@ export class TwitterSpaceClient {
         debug: false,
       });
 
-      // const sttTts = new SttTtsPlugin();
-      // this.sttTtsPlugin = sttTts;
-      // this.currentSpace.use(sttTts, {
-      //   runtime: this.runtime,
-      //   client: this.client,
-      //   spaceId: this.spaceId,
-      //   elevenLabsApiKey: elevenLabsKey,
-      //   voiceId: this.decisionOptions.voiceId,
-      //   sttLanguage: this.decisionOptions.sttLanguage,
-      //   transcriptionService:
-      //     this.client.runtime.getService<ITranscriptionService>(
-      //       ServiceType.TRANSCRIPTION,
-      //     ),
-      // });
-
       // 3) Join the Space in listener mode
       await participant.joinAsListener();
       console.log('[TestParticipant] HLS URL =>', participant.getHlsUrl());
@@ -216,17 +201,28 @@ export class TwitterSpaceClient {
           elizaLogger.log('[Space] Using SttTtsPlugin');
           const sttTts = new SttTtsPlugin();
           this.sttTtsPlugin = sttTts;
-          this.currentSpace.use(sttTts, {
+          // this.currentSpace.use(sttTts, {
+          //   runtime: this.runtime,
+          //   client: this.client,
+          //   spaceId: this.spaceId,
+          //   elevenLabsApiKey: elevenLabsKey,
+          //   voiceId: this.decisionOptions.voiceId,
+          //   sttLanguage: this.decisionOptions.sttLanguage,
+          //   transcriptionService:
+          //     this.client.runtime.getService<ITranscriptionService>(
+          //       ServiceType.TRANSCRIPTION,
+          //     ),
+          // });
+          participant.use(sttTts, {
             runtime: this.runtime,
             client: this.client,
             spaceId: this.spaceId,
             elevenLabsApiKey: elevenLabsKey,
             voiceId: this.decisionOptions.voiceId,
             sttLanguage: this.decisionOptions.sttLanguage,
-            transcriptionService:
-              this.client.runtime.getService<ITranscriptionService>(
-                ServiceType.TRANSCRIPTION,
-              ),
+            transcriptionService: this.client.runtime.getService(
+              ServiceType.TRANSCRIPTION,
+            ),
           });
         }
 
@@ -255,20 +251,20 @@ export class TwitterSpaceClient {
         await speakFiller(this.client.runtime, this.sttTtsPlugin, 'WELCOME');
 
         // Events
-        this.currentSpace.on('occupancyUpdate', (update) => {
-          elizaLogger.log(
-            `[Space] Occupancy => ${update.occupancy} participant(s).`,
-          );
-        });
+        // this.currentSpace.on('occupancyUpdate', (update) => {
+        //   elizaLogger.log(
+        //     `[Space] Occupancy => ${update.occupancy} participant(s).`,
+        //   );
+        // });
 
-        this.currentSpace.on('speakerRequest', async (req: SpeakerRequest) => {
-          elizaLogger.log(
-            `[Space] Speaker request from @${req.username} (${req.userId}).`,
-          );
-          await this.handleSpeakerRequest(req);
-        });
+        // this.currentSpace.on('speakerRequest', async (req: SpeakerRequest) => {
+        //   elizaLogger.log(
+        //     `[Space] Speaker request from @${req.username} (${req.userId}).`,
+        //   );
+        //   await this.handleSpeakerRequest(req);
+        // });
 
-        this.currentSpace.on('idleTimeout', async (info) => {
+        participant.on('idleTimeout', async (info) => {
           elizaLogger.log(
             `[Space] idleTimeout => no audio for ${info.idleMs} ms.`,
           );

@@ -3616,7 +3616,7 @@ var TwitterSpaceClient = class {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
           const sttTts = new SttTtsPlugin();
           this.sttTtsPlugin = sttTts;
-          this.currentSpace.use(sttTts, {
+          participant.use(sttTts, {
             runtime: this.runtime,
             client: this.client,
             spaceId: this.spaceId,
@@ -3639,18 +3639,7 @@ var TwitterSpaceClient = class {
         }
         this.isSpaceRunning = true;
         await speakFiller(this.client.runtime, this.sttTtsPlugin, "WELCOME");
-        this.currentSpace.on("occupancyUpdate", (update) => {
-          elizaLogger7.log(
-            `[Space] Occupancy => ${update.occupancy} participant(s).`
-          );
-        });
-        this.currentSpace.on("speakerRequest", async (req) => {
-          elizaLogger7.log(
-            `[Space] Speaker request from @${req.username} (${req.userId}).`
-          );
-          await this.handleSpeakerRequest(req);
-        });
-        this.currentSpace.on("idleTimeout", async (info) => {
+        participant.on("idleTimeout", async (info) => {
           elizaLogger7.log(
             `[Space] idleTimeout => no audio for ${info.idleMs} ms.`
           );
