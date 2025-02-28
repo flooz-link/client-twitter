@@ -1,4 +1,4 @@
-import type { Tweet } from 'agent-twitter-client';
+import type { Tweet } from '@flooz-link/agent-twitter-client';
 import {
   composeContext,
   generateText,

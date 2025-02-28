@@ -15,7 +15,7 @@ import {
   Scraper,
   SearchMode,
   type Tweet,
-} from 'agent-twitter-client';
+} from '@flooz-link/agent-twitter-client';
 import { EventEmitter } from 'events';
 import type { TwitterConfig } from './environment.ts';
 

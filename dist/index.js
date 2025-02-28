@@ -11,7 +11,7 @@ import {
 import {
   Scraper,
   SearchMode
-} from "agent-twitter-client";
+} from "@flooz-link/agent-twitter-client";
 import { EventEmitter } from "events";
 var RequestQueue = class {
   queue = [];
@@ -710,7 +710,7 @@ ${errorMessages}`
 }
 
 // src/interactions.ts
-import { SearchMode as SearchMode2 } from "agent-twitter-client";
+import { SearchMode as SearchMode2 } from "@flooz-link/agent-twitter-client";
 import {
   composeContext,
   generateMessageResponse,
@@ -2587,7 +2587,7 @@ ${replyText}`
 };
 
 // src/search.ts
-import { SearchMode as SearchMode3 } from "agent-twitter-client";
+import { SearchMode as SearchMode3 } from "@flooz-link/agent-twitter-client";
 import { composeContext as composeContext3, elizaLogger as elizaLogger5 } from "@elizaos/core";
 import { generateMessageResponse as generateMessageResponse2, generateText as generateText2 } from "@elizaos/core";
 import { messageCompletionFooter as messageCompletionFooter2 } from "@elizaos/core";
@@ -2859,7 +2859,7 @@ import {
   Space,
   RecordToDiskPlugin,
   IdleMonitorPlugin
-} from "agent-twitter-client";
+} from "@flooz-link/agent-twitter-client";
 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { spawn } from "child_process";
@@ -3497,6 +3497,7 @@ var SttTtsPlugin = class {
 };
 
 // src/spaces.ts
+import { SpaceParticipant } from "@flooz-link/agent-twitter-client";
 async function generateFiller(runtime, fillerType) {
   try {
     const context = `
@@ -3597,84 +3598,116 @@ var TwitterSpaceClient = class {
       this.activeSpeakers = [];
       this.speakerQueue = [];
       const elevenLabsKey = this.runtime.getSetting("ELEVENLABS_XI_API_KEY") || "";
-      const bla = await this.scraper.getAudioSpaceById(this.spaceId);
-      const config = {
-        mode: "INTERACTIVE",
-        title: "TESTING",
-        description: `Discussion about`,
-        languages: ["en"]
-      };
-      const broadcastInfo = await this.currentSpace.initialize(config);
-      this.spaceId = broadcastInfo.room_id;
-      if (this.decisionOptions.enableRecording) {
-        elizaLogger7.log("[Space] Using RecordToDiskPlugin");
-        this.currentSpace.use(new RecordToDiskPlugin());
-      }
-      if (this.decisionOptions.enableSttTts) {
-        elizaLogger7.log("[Space] Using SttTtsPlugin");
-        const sttTts = new SttTtsPlugin();
-        this.sttTtsPlugin = sttTts;
-        this.currentSpace.use(sttTts, {
-          runtime: this.runtime,
-          client: this.client,
-          spaceId: this.spaceId,
-          elevenLabsApiKey: elevenLabsKey,
-          voiceId: this.decisionOptions.voiceId,
-          sttLanguage: this.decisionOptions.sttLanguage,
-          transcriptionService: this.client.runtime.getService(
-            ServiceType4.TRANSCRIPTION
-          )
+      const participant = new SpaceParticipant(this.scraper, {
+        spaceId: this.spaceId,
+        debug: false
+      });
+      await participant.joinAsListener();
+      console.log("[TestParticipant] HLS URL =>", participant.getHlsUrl());
+      const { sessionUUID } = await participant.requestSpeaker();
+      console.log("[TestParticipant] Requested speaker =>", sessionUUID);
+      try {
+        await this.waitForApproval(participant, sessionUUID, 15e3);
+        if (this.decisionOptions.enableRecording) {
+          elizaLogger7.log("[Space] Using RecordToDiskPlugin");
+          this.currentSpace.use(new RecordToDiskPlugin());
+        }
+        if (this.decisionOptions.enableSttTts) {
+          elizaLogger7.log("[Space] Using SttTtsPlugin");
+          const sttTts = new SttTtsPlugin();
+          this.sttTtsPlugin = sttTts;
+          this.currentSpace.use(sttTts, {
+            runtime: this.runtime,
+            client: this.client,
+            spaceId: this.spaceId,
+            elevenLabsApiKey: elevenLabsKey,
+            voiceId: this.decisionOptions.voiceId,
+            sttLanguage: this.decisionOptions.sttLanguage,
+            transcriptionService: this.client.runtime.getService(
+              ServiceType4.TRANSCRIPTION
+            )
+          });
+        }
+        if (this.decisionOptions.enableIdleMonitor) {
+          elizaLogger7.log("[Space] Using IdleMonitorPlugin");
+          this.currentSpace.use(
+            new IdleMonitorPlugin(
+              this.decisionOptions.idleKickTimeoutMs ?? 6e4,
+              1e4
+            )
+          );
+        }
+        this.isSpaceRunning = true;
+        await speakFiller(this.client.runtime, this.sttTtsPlugin, "WELCOME");
+        this.currentSpace.on("occupancyUpdate", (update) => {
+          elizaLogger7.log(
+            `[Space] Occupancy => ${update.occupancy} participant(s).`
+          );
         });
+        this.currentSpace.on("speakerRequest", async (req) => {
+          elizaLogger7.log(
+            `[Space] Speaker request from @${req.username} (${req.userId}).`
+          );
+          await this.handleSpeakerRequest(req);
+        });
+        this.currentSpace.on("idleTimeout", async (info) => {
+          elizaLogger7.log(
+            `[Space] idleTimeout => no audio for ${info.idleMs} ms.`
+          );
+          await speakFiller(
+            this.client.runtime,
+            this.sttTtsPlugin,
+            "IDLE_ENDING"
+          );
+          await this.stopSpace();
+        });
+        process.on("SIGINT", async () => {
+          elizaLogger7.log("[Space] SIGINT => stopping space");
+          await speakFiller(this.client.runtime, this.sttTtsPlugin, "CLOSING");
+          await this.stopSpace();
+          process.exit(0);
+        });
+      } catch (error) {
+        elizaLogger7.error("[Space] Error launching Space =>", error);
+        this.isSpaceRunning = false;
+        throw error;
       }
-      if (this.decisionOptions.enableIdleMonitor) {
-        elizaLogger7.log("[Space] Using IdleMonitorPlugin");
-        this.currentSpace.use(
-          new IdleMonitorPlugin(
-            this.decisionOptions.idleKickTimeoutMs ?? 6e4,
-            1e4
-          )
-        );
-      }
-      this.isSpaceRunning = true;
-      await this.scraper.sendTweet(
-        broadcastInfo.share_url.replace("broadcasts", "spaces")
-      );
-      const spaceUrl = broadcastInfo.share_url.replace("broadcasts", "spaces");
-      elizaLogger7.log(`[Space] Space started => ${spaceUrl}`);
-      await speakFiller(this.client.runtime, this.sttTtsPlugin, "WELCOME");
-      this.currentSpace.on("occupancyUpdate", (update) => {
-        elizaLogger7.log(
-          `[Space] Occupancy => ${update.occupancy} participant(s).`
-        );
-      });
-      this.currentSpace.on("speakerRequest", async (req) => {
-        elizaLogger7.log(
-          `[Space] Speaker request from @${req.username} (${req.userId}).`
-        );
-        await this.handleSpeakerRequest(req);
-      });
-      this.currentSpace.on("idleTimeout", async (info) => {
-        elizaLogger7.log(
-          `[Space] idleTimeout => no audio for ${info.idleMs} ms.`
-        );
-        await speakFiller(
-          this.client.runtime,
-          this.sttTtsPlugin,
-          "IDLE_ENDING"
-        );
-        await this.stopSpace();
-      });
-      process.on("SIGINT", async () => {
-        elizaLogger7.log("[Space] SIGINT => stopping space");
-        await speakFiller(this.client.runtime, this.sttTtsPlugin, "CLOSING");
-        await this.stopSpace();
-        process.exit(0);
-      });
     } catch (error) {
-      elizaLogger7.error("[Space] Error launching Space =>", error);
-      this.isSpaceRunning = false;
       throw error;
     }
+  }
+  /**
+   * waitForApproval waits until "newSpeakerAccepted" matches our sessionUUID,
+   * then calls becomeSpeaker() or rejects after a given timeout.
+   */
+  async waitForApproval(participant, sessionUUID, timeoutMs = 1e4) {
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      const handler = async (evt) => {
+        if (evt.sessionUUID === sessionUUID) {
+          resolved = true;
+          participant.off("newSpeakerAccepted", handler);
+          try {
+            await participant.becomeSpeaker();
+            console.log("[TestParticipant] Successfully became speaker!");
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        }
+      };
+      participant.on("newSpeakerAccepted", handler);
+      setTimeout(() => {
+        if (!resolved) {
+          participant.off("newSpeakerAccepted", handler);
+          reject(
+            new Error(
+              `[TestParticipant] Timed out waiting for speaker approval after ${timeoutMs}ms.`
+            )
+          );
+        }
+      }, timeoutMs);
+    });
   }
   /**
    * Periodic check to launch or manage space

@@ -21,7 +21,7 @@ import type {
   Space,
   JanusClient,
   AudioDataWithUser,
-} from 'agent-twitter-client';
+} from '@flooz-link/agent-twitter-client';
 import type { ClientBase } from '../base';
 import {
   twitterVoiceHandlerTemplate,
