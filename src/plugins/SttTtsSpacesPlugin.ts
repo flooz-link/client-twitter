@@ -624,8 +624,10 @@ export class SttTtsPlugin implements Plugin {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    // Set chunk size for streaming
+    // Set chunk size for streaming - CORRECTED to 480 samples (10ms at 48kHz)
     const SAMPLE_RATE = 48000;
+    const PCM_CHUNK_SAMPLES = 480; // FIXED: Janus expects exactly 480 samples per frame
+    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2; // 2 bytes per sample for Int16
 
     // Create a PassThrough stream for the MP3 data
     const mp3Stream = new PassThrough();
@@ -675,8 +677,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Buffer for accumulating audio chunks for streaming
     let pcmBuffer = Buffer.alloc(0);
-    const PCM_CHUNK_SAMPLES = 960; // Number of samples to send at once (20ms at 48kHz)
-    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2; // 2 bytes per sample for Int16
 
     // Process FFmpeg output in chunks and stream to Janus
     const processingPromise = new Promise<void>((resolve, reject) => {
@@ -702,8 +702,14 @@ export class SttTtsPlugin implements Plugin {
               chunkToSend.byteLength / 2,
             );
 
-            // Stream this chunk to Janus
-            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            // Stream this chunk to Janus - confirm it has exactly 480 samples
+            if (samples.length === PCM_CHUNK_SAMPLES) {
+              await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            } else {
+              console.warn(
+                `[SttTtsPlugin] Invalid chunk size: ${samples.length}, expected ${PCM_CHUNK_SAMPLES}`,
+              );
+            }
 
             // Allow other events to process
             await new Promise((resolve) => setImmediate(resolve));
@@ -736,13 +742,34 @@ export class SttTtsPlugin implements Plugin {
 
           // Process any remaining audio in the buffer
           if (pcmBuffer.length > 0 && !signal.aborted) {
-            const samples = new Int16Array(
-              pcmBuffer.buffer,
-              pcmBuffer.byteOffset,
-              pcmBuffer.byteLength / 2,
-            );
+            // Handle partial frame if needed
+            if (pcmBuffer.length < PCM_CHUNK_BYTES) {
+              // Option 1: Pad with silence to get a full frame
+              const paddedBuffer = Buffer.alloc(PCM_CHUNK_BYTES);
+              pcmBuffer.copy(paddedBuffer);
 
-            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+              const samples = new Int16Array(
+                paddedBuffer.buffer,
+                paddedBuffer.byteOffset,
+                PCM_CHUNK_SAMPLES,
+              );
+
+              await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            } else {
+              // Handle complete frames in the remaining buffer
+              while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
+                const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
+                pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+
+                const samples = new Int16Array(
+                  chunkToSend.buffer,
+                  chunkToSend.byteOffset,
+                  PCM_CHUNK_SAMPLES,
+                );
+
+                await this.streamChunkToJanus(samples, SAMPLE_RATE);
+              }
+            }
           }
 
           resolve();
@@ -769,9 +796,15 @@ export class SttTtsPlugin implements Plugin {
     samples: Int16Array,
     sampleRate: number,
   ): Promise<void> {
-    // Replace with your actual implementation
+    // Make sure we're sending exactly the frame size Janus expects
+    if (samples.length !== 480) {
+      console.warn(
+        `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`,
+      );
+    }
+
     return new Promise<void>((resolve) => {
-      // Example implementation:
+      // Send the audio chunk to Janus
       this.janus?.pushLocalAudio(samples, sampleRate);
       resolve();
     });
@@ -1232,14 +1265,14 @@ export class SttTtsPlugin implements Plugin {
 
   /**
    * Push PCM back to Janus in small frames
-   * We'll do 10ms @48k => 960 samples per frame
+   * We'll do 10ms @48k => 480 samples per frame (not 960)
    */
   private async streamToJanus(
     samples: Int16Array,
     sampleRate: number,
   ): Promise<void> {
-    // TODO: Check if better than 480 fixed
-    const FRAME_SIZE = Math.floor(sampleRate * 0.01); // 10ms frames => 480 @48kHz
+    // FIXED: Use 480 samples per frame as required by Janus
+    const FRAME_SIZE = 480; // 10ms frames @ 48kHz
 
     for (
       let offset = 0;

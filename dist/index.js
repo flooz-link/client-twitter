@@ -3398,6 +3398,8 @@ var SttTtsPlugin = class {
    */
   async streamTtsToJanus(text, signal) {
     const SAMPLE_RATE = 48e3;
+    const PCM_CHUNK_SAMPLES = 480;
+    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2;
     const mp3Stream = new PassThrough();
     const ffmpeg = spawn("ffmpeg", [
       // Input stream settings
@@ -3435,8 +3437,6 @@ var SttTtsPlugin = class {
       signal
     );
     let pcmBuffer = Buffer.alloc(0);
-    const PCM_CHUNK_SAMPLES = 960;
-    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2;
     const processingPromise = new Promise((resolve, reject) => {
       ffmpeg.stdout.on("data", async (chunk) => {
         try {
@@ -3452,7 +3452,13 @@ var SttTtsPlugin = class {
               chunkToSend.byteOffset,
               chunkToSend.byteLength / 2
             );
-            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            if (samples.length === PCM_CHUNK_SAMPLES) {
+              await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            } else {
+              console.warn(
+                `[SttTtsPlugin] Invalid chunk size: ${samples.length}, expected ${PCM_CHUNK_SAMPLES}`
+              );
+            }
             await new Promise((resolve2) => setImmediate(resolve2));
             if (signal.aborted) {
               console.log("[SttTtsPlugin] TTS streaming interrupted");
@@ -3477,12 +3483,27 @@ var SttTtsPlugin = class {
             return;
           }
           if (pcmBuffer.length > 0 && !signal.aborted) {
-            const samples = new Int16Array(
-              pcmBuffer.buffer,
-              pcmBuffer.byteOffset,
-              pcmBuffer.byteLength / 2
-            );
-            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            if (pcmBuffer.length < PCM_CHUNK_BYTES) {
+              const paddedBuffer = Buffer.alloc(PCM_CHUNK_BYTES);
+              pcmBuffer.copy(paddedBuffer);
+              const samples = new Int16Array(
+                paddedBuffer.buffer,
+                paddedBuffer.byteOffset,
+                PCM_CHUNK_SAMPLES
+              );
+              await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            } else {
+              while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
+                const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
+                pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+                const samples = new Int16Array(
+                  chunkToSend.buffer,
+                  chunkToSend.byteOffset,
+                  PCM_CHUNK_SAMPLES
+                );
+                await this.streamChunkToJanus(samples, SAMPLE_RATE);
+              }
+            }
           }
           resolve();
         } catch (error) {
@@ -3500,6 +3521,11 @@ var SttTtsPlugin = class {
    * This method should be adapted to match your Janus implementation
    */
   async streamChunkToJanus(samples, sampleRate) {
+    if (samples.length !== 480) {
+      console.warn(
+        `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`
+      );
+    }
     return new Promise((resolve) => {
       var _a;
       (_a = this.janus) == null ? void 0 : _a.pushLocalAudio(samples, sampleRate);
@@ -3868,11 +3894,11 @@ var SttTtsPlugin = class {
   }
   /**
    * Push PCM back to Janus in small frames
-   * We'll do 10ms @48k => 960 samples per frame
+   * We'll do 10ms @48k => 480 samples per frame (not 960)
    */
   async streamToJanus(samples, sampleRate) {
     var _a, _b;
-    const FRAME_SIZE = Math.floor(sampleRate * 0.01);
+    const FRAME_SIZE = 480;
     for (let offset = 0; offset + FRAME_SIZE <= samples.length; offset += FRAME_SIZE) {
       if ((_a = this.ttsAbortController) == null ? void 0 : _a.signal.aborted) {
         elizaLogger6.log("[SttTtsPlugin] streamToJanus interrupted");
