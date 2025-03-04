@@ -136,7 +136,8 @@ export class TwitterSpaceClient {
     this.scraper = client.twitterClient;
     this.runtime = runtime;
 
-    const charSpaces = runtime.character.twitterSpaces || {};
+    const charSpaces: FloozTwitterSpaceDecisionOptions =
+      runtime.character.twitterSpaces || {};
     this.decisionOptions = {
       maxSpeakers: charSpaces.maxSpeakers ?? 1,
       topics: charSpaces.topics ?? [],
@@ -156,6 +157,7 @@ export class TwitterSpaceClient {
       sttLanguage: charSpaces.sttLanguage || 'en',
       speakerMaxDurationMs: charSpaces.speakerMaxDurationMs ?? 4 * 60_000,
       silenceThreshold: charSpaces.silenceThreshold,
+      silenceDetectionWindow: charSpaces.silenceDetectionWindow,
     };
   }
 
@@ -232,6 +234,7 @@ export class TwitterSpaceClient {
                   ServiceType.TRANSCRIPTION,
                 ),
               silenceThreshold: this.decisionOptions.silenceThreshold,
+              silence,
             },
           });
           this.sttTtsPlugin = sttTts;
@@ -427,20 +430,16 @@ export class TwitterSpaceClient {
   }
 
   private async generateSpaceConfig(): Promise<SpaceConfig> {
-    if (
-      !this.decisionOptions.topics ||
-      this.decisionOptions.topics.length === 0
-    ) {
-      const newTopics = await generateTopicsIfEmpty(this.client.runtime);
+    const topicsLen = this.decisionOptions?.topics?.length ?? 0;
+    if (topicsLen === 0) {
+      const newTopics = await generateTopicsIfEmpty(this.client?.runtime);
       this.decisionOptions.topics = newTopics;
     }
 
     let chosenTopic = 'Random Tech Chat';
-    if (this.decisionOptions.topics && this.decisionOptions.topics.length > 0) {
+    if (topicsLen > 0) {
       chosenTopic =
-        this.decisionOptions.topics[
-          Math.floor(Math.random() * this.decisionOptions.topics.length)
-        ];
+        this.decisionOptions.topics[Math.floor(Math.random() * topicsLen)];
     }
 
     return {
@@ -632,8 +631,14 @@ export class TwitterSpaceClient {
    */
   private async acceptSpeakersFromQueueIfNeeded() {
     // while queue not empty and activeSpeakers < maxSpeakers, accept next
-    const ms = this.decisionOptions.maxSpeakers ?? 1;
-    while (this.speakerQueue.length > 0 && this.activeSpeakers.length < ms) {
+    const maxNumberOfSpeakersConfigured =
+      this?.decisionOptions?.maxSpeakers ?? 1;
+    const speakerQueueLen = this.speakerQueue?.length ?? 0;
+    const activeSpeakerLen = this.activeSpeakers?.length ?? 0;
+    while (
+      speakerQueueLen > 0 &&
+      activeSpeakerLen < maxNumberOfSpeakersConfigured
+    ) {
       const nextReq = this.speakerQueue.shift();
       if (nextReq) {
         await speakFiller(this.client.runtime, this.sttTtsPlugin, 'PRE_ACCEPT');
@@ -643,13 +648,16 @@ export class TwitterSpaceClient {
   }
 
   private async handleSpeakerRequest(req: SpeakerRequest) {
-    if (!this.spaceId || !this.currentSpace) return;
+    if (isEmpty(this.spaceId) || isEmpty(this.currentSpace)) {
+      return;
+    }
 
     const audioSpace = await this.scraper.getAudioSpaceById(this.spaceId);
     const janusSpeakers = audioSpace?.participants?.speakers || [];
 
+    const maxSpeakersConfiguredLen = this.decisionOptions?.maxSpeakers ?? 1;
     // If we haven't reached maxSpeakers, accept immediately
-    if (janusSpeakers.length < (this.decisionOptions.maxSpeakers ?? 1)) {
+    if (janusSpeakers.length < maxSpeakersConfiguredLen) {
       elizaLogger.log(`[Space] Accepting speaker @${req.username} now`);
       await speakFiller(this.client.runtime, this.sttTtsPlugin, 'PRE_ACCEPT');
       await this.acceptSpeaker(req);
@@ -660,9 +668,11 @@ export class TwitterSpaceClient {
   }
 
   private async acceptSpeaker(req: SpeakerRequest) {
-    if (!this.currentSpace) return;
+    if (isEmpty(this.currentSpace)) {
+      return;
+    }
     try {
-      await this.currentSpace.approveSpeaker(req.userId, req.sessionUUID);
+      await this.currentSpace?.approveSpeaker(req.userId, req.sessionUUID);
       this.activeSpeakers.push({
         userId: req.userId,
         sessionUUID: req.sessionUUID,
@@ -725,10 +735,12 @@ export class TwitterSpaceClient {
   }
 
   public async stopSpace() {
-    if (!this.currentSpace || !this.isSpaceRunning) return;
+    if (isEmpty(this.currentSpace) || isEmpty(this.isSpaceRunning)) {
+      return;
+    }
     try {
       elizaLogger.log('[Space] Stopping the current Space...');
-      await this.currentSpace.stop();
+      await this.currentSpace?.stop();
     } catch (err) {
       elizaLogger.error('[Space] Error stopping Space =>', err);
     } finally {
