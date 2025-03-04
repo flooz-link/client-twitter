@@ -190,7 +190,13 @@ export class TwitterSpaceClient {
 
       // 5) Wait for host acceptance with a maximum wait time (e.g., 15 seconds).
       try {
-        await this.waitForApproval(participant, sessionUUID, 15000);
+        try {
+          await this.waitForApproval(participant, sessionUUID, 15000);
+        } catch (error) {
+          elizaLogger.warn(`Speaker request was not approved, error ${error}`);
+          await participant.cancelSpeakerRequest();
+          throw error;
+        }
 
         // Plugins
         if (this.decisionOptions.enableRecording) {
@@ -206,6 +212,7 @@ export class TwitterSpaceClient {
           elizaLogger.log('[Space] Using SttTtsPlugin');
           const sttTts = new SttTtsPlugin();
           sttTts.init({
+            space: this.currentSpace,
             pluginConfig: {
               runtime: this.runtime,
               client: this.client,

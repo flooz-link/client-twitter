@@ -3608,7 +3608,13 @@ var TwitterSpaceClient = class {
       const { sessionUUID } = await participant.requestSpeaker();
       console.log("[TestParticipant] Requested speaker =>", sessionUUID);
       try {
-        await this.waitForApproval(participant, sessionUUID, 15e3);
+        try {
+          await this.waitForApproval(participant, sessionUUID, 15e3);
+        } catch (error) {
+          elizaLogger7.warn(`Speaker request was not approved, error ${error}`);
+          await participant.cancelSpeakerRequest();
+          throw error;
+        }
         if (this.decisionOptions.enableRecording) {
           elizaLogger7.log("[Space] Using RecordToDiskPlugin");
           const recordToDisk = new RecordToDiskPlugin();
@@ -3621,6 +3627,7 @@ var TwitterSpaceClient = class {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
           const sttTts = new SttTtsPlugin();
           sttTts.init({
+            space: this.currentSpace,
             pluginConfig: {
               runtime: this.runtime,
               client: this.client,
