@@ -616,7 +616,7 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Process TTS text and stream directly to Janus with minimal latency
+   * Stream TTS text to Janus with proper ordering and timing
    * @param text Text to convert to speech
    * @param signal Abort controller signal
    */
@@ -624,10 +624,9 @@ export class SttTtsPlugin implements Plugin {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    // Set chunk size for streaming - CORRECTED to 480 samples (10ms at 48kHz)
     const SAMPLE_RATE = 48000;
-    const PCM_CHUNK_SAMPLES = 480; // FIXED: Janus expects exactly 480 samples per frame
-    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2; // 2 bytes per sample for Int16
+    const FRAME_SIZE = 480; // 10ms at 48kHz
+    const FRAME_DURATION_MS = 10; // Actual playback duration of each frame
 
     // Create a PassThrough stream for the MP3 data
     const mp3Stream = new PassThrough();
@@ -668,6 +667,12 @@ export class SttTtsPlugin implements Plugin {
     // Connect MP3 stream to FFmpeg input
     mp3Stream.pipe(ffmpeg.stdin);
 
+    // Create a buffer to store audio frames
+    const audioBuffer: Int16Array[] = [];
+
+    // Flag to track if processing is complete
+    let processingComplete = false;
+
     // Start the ElevenLabs API call with streaming response
     const elevenLabsPromise = this.elevenLabsTtsStreaming(
       text,
@@ -675,50 +680,37 @@ export class SttTtsPlugin implements Plugin {
       signal,
     );
 
-    // Buffer for accumulating audio chunks for streaming
-    let pcmBuffer = Buffer.alloc(0);
-
-    // Process FFmpeg output in chunks and stream to Janus
+    // Process FFmpeg output and store in buffer
     const processingPromise = new Promise<void>((resolve, reject) => {
-      ffmpeg.stdout.on('data', async (chunk: Buffer) => {
+      let pcmBuffer = Buffer.alloc(0);
+
+      ffmpeg.stdout.on('data', (chunk: Buffer) => {
         try {
-          if (signal.aborted) {
-            return; // Stop processing if aborted
-          }
+          if (signal.aborted) return;
 
           // Append new chunk to our buffer
           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
 
-          // Process complete chunks
-          while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
-            // Extract a complete chunk
-            const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
-            pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+          // Process complete frames
+          while (pcmBuffer.length >= FRAME_SIZE * 2) {
+            // 2 bytes per sample
+            // Extract a complete frame
+            const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
+            pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
 
-            // Convert buffer to Int16Array for Janus
-            const samples = new Int16Array(
-              chunkToSend.buffer,
-              chunkToSend.byteOffset,
-              chunkToSend.byteLength / 2,
+            // Convert to Int16Array and store in audio buffer
+            const frame = new Int16Array(
+              frameBuffer.buffer,
+              frameBuffer.byteOffset,
+              FRAME_SIZE,
             );
 
-            // Stream this chunk to Janus - confirm it has exactly 480 samples
-            if (samples.length === PCM_CHUNK_SAMPLES) {
-              await this.streamChunkToJanus(samples, SAMPLE_RATE);
-            } else {
-              console.warn(
-                `[SttTtsPlugin] Invalid chunk size: ${samples.length}, expected ${PCM_CHUNK_SAMPLES}`,
-              );
-            }
+            // Create a copy of the frame to avoid shared buffer issues
+            const frameCopy = new Int16Array(FRAME_SIZE);
+            frameCopy.set(frame);
 
-            // Allow other events to process
-            await new Promise((resolve) => setImmediate(resolve));
-
-            // Check for abort between chunks
-            if (signal.aborted) {
-              console.log('[SttTtsPlugin] TTS streaming interrupted');
-              break;
-            }
+            // Add to our ordered buffer queue
+            audioBuffer.push(frameCopy);
           }
         } catch (error) {
           reject(error);
@@ -731,7 +723,7 @@ export class SttTtsPlugin implements Plugin {
         }
       });
 
-      ffmpeg.on('close', async (code) => {
+      ffmpeg.on('close', (code) => {
         try {
           if (code !== 0 && !signal.aborted) {
             reject(
@@ -742,50 +734,145 @@ export class SttTtsPlugin implements Plugin {
 
           // Process any remaining audio in the buffer
           if (pcmBuffer.length > 0 && !signal.aborted) {
-            // Handle partial frame if needed
-            if (pcmBuffer.length < PCM_CHUNK_BYTES) {
-              // Option 1: Pad with silence to get a full frame
-              const paddedBuffer = Buffer.alloc(PCM_CHUNK_BYTES);
-              pcmBuffer.copy(paddedBuffer);
+            // Create a proper sized frame for any remaining data
+            const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
+            pcmBuffer.copy(
+              frameBuffer,
+              0,
+              0,
+              Math.min(pcmBuffer.length, FRAME_SIZE * 2),
+            );
 
-              const samples = new Int16Array(
-                paddedBuffer.buffer,
-                paddedBuffer.byteOffset,
-                PCM_CHUNK_SAMPLES,
-              );
+            const frame = new Int16Array(FRAME_SIZE);
 
-              await this.streamChunkToJanus(samples, SAMPLE_RATE);
-            } else {
-              // Handle complete frames in the remaining buffer
-              while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
-                const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
-                pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+            // Copy from the buffer view to our frame
+            const srcView = new Int16Array(
+              frameBuffer.buffer,
+              frameBuffer.byteOffset,
+              FRAME_SIZE,
+            );
 
-                const samples = new Int16Array(
-                  chunkToSend.buffer,
-                  chunkToSend.byteOffset,
-                  PCM_CHUNK_SAMPLES,
-                );
-
-                await this.streamChunkToJanus(samples, SAMPLE_RATE);
-              }
-            }
+            frame.set(srcView);
+            audioBuffer.push(frame);
           }
 
+          processingComplete = true;
           resolve();
         } catch (error) {
           reject(error);
         }
       });
 
-      // Handle errors from FFmpeg
       ffmpeg.on('error', (err) => {
         reject(new Error(`FFmpeg process error: ${err.message}`));
       });
     });
 
-    // Wait for both the ElevenLabs download and processing to complete
-    await Promise.all([elevenLabsPromise, processingPromise]);
+    try {
+      // Wait for audio processing to complete (or at least start building the buffer)
+      await Promise.race([
+        processingPromise.catch((err) => {
+          elizaLogger.error('[SttTtsPlugin] Processing error:', err);
+        }),
+        // Also wait for a minimum buffer to build up before starting playback
+        new Promise<void>((resolve) => {
+          const checkBuffer = () => {
+            if (audioBuffer.length > 10 || signal.aborted) {
+              resolve();
+            } else {
+              setTimeout(checkBuffer, 50);
+            }
+          };
+          checkBuffer();
+        }),
+      ]);
+
+      // Stream the audio frames with proper timing
+      let frameIndex = 0;
+      const startTime = Date.now();
+
+      while (
+        (frameIndex < audioBuffer.length || !processingComplete) &&
+        !signal.aborted
+      ) {
+        // If we've played all available frames but processing isn't complete, wait for more
+        if (frameIndex >= audioBuffer.length && !processingComplete) {
+          await new Promise<void>((resolve) => {
+            const waitForMoreFrames = () => {
+              if (
+                frameIndex < audioBuffer.length ||
+                processingComplete ||
+                signal.aborted
+              ) {
+                resolve();
+              } else {
+                setTimeout(waitForMoreFrames, 20);
+              }
+            };
+            waitForMoreFrames();
+          });
+
+          // If we're still out of frames after waiting, exit the loop
+          if (frameIndex >= audioBuffer.length) {
+            break;
+          }
+        }
+
+        // Calculate the ideal playback time for this frame
+        const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
+        const currentTime = Date.now();
+
+        // Adjust timing if we're behind or ahead
+        if (currentTime < idealPlaybackTime) {
+          // We're ahead of schedule, wait until the right time
+          await new Promise((r) =>
+            setTimeout(r, idealPlaybackTime - currentTime),
+          );
+        } else if (currentTime > idealPlaybackTime + 100) {
+          // We're significantly behind, skip frames to catch up
+          const framesToSkip = Math.floor(
+            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS,
+          );
+          if (framesToSkip > 0) {
+            elizaLogger.log(
+              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`,
+            );
+            frameIndex += framesToSkip;
+            continue;
+          }
+        }
+
+        // Get the next frame
+        const frame = audioBuffer[frameIndex];
+
+        // Send to Janus
+        try {
+          await this.streamChunkToJanus(frame, SAMPLE_RATE);
+        } catch (error) {
+          elizaLogger.error(
+            '[SttTtsPlugin] Error sending frame to Janus:',
+            error,
+          );
+        }
+
+        frameIndex++;
+      }
+
+      // Wait for any remaining processing to complete
+      await processingPromise;
+      await elevenLabsPromise;
+
+      elizaLogger.log(
+        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`,
+      );
+    } catch (error) {
+      if (signal.aborted) {
+        elizaLogger.log('[SttTtsPlugin] Audio streaming aborted');
+      } else {
+        elizaLogger.error('[SttTtsPlugin] Audio streaming error:', error);
+      }
+      throw error;
+    }
   }
 
   /**

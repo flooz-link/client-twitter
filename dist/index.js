@@ -3392,14 +3392,14 @@ var SttTtsPlugin = class {
     this.ttsQueue = [];
   }
   /**
-   * Process TTS text and stream directly to Janus with minimal latency
+   * Stream TTS text to Janus with proper ordering and timing
    * @param text Text to convert to speech
    * @param signal Abort controller signal
    */
   async streamTtsToJanus(text, signal) {
     const SAMPLE_RATE = 48e3;
-    const PCM_CHUNK_SAMPLES = 480;
-    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2;
+    const FRAME_SIZE = 480;
+    const FRAME_DURATION_MS = 10;
     const mp3Stream = new PassThrough();
     const ffmpeg = spawn("ffmpeg", [
       // Input stream settings
@@ -3431,39 +3431,30 @@ var SttTtsPlugin = class {
       "pipe:1"
     ]);
     mp3Stream.pipe(ffmpeg.stdin);
+    const audioBuffer = [];
+    let processingComplete = false;
     const elevenLabsPromise = this.elevenLabsTtsStreaming(
       text,
       mp3Stream,
       signal
     );
-    let pcmBuffer = Buffer.alloc(0);
     const processingPromise = new Promise((resolve, reject) => {
-      ffmpeg.stdout.on("data", async (chunk) => {
+      let pcmBuffer = Buffer.alloc(0);
+      ffmpeg.stdout.on("data", (chunk) => {
         try {
-          if (signal.aborted) {
-            return;
-          }
+          if (signal.aborted) return;
           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
-          while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
-            const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
-            pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
-            const samples = new Int16Array(
-              chunkToSend.buffer,
-              chunkToSend.byteOffset,
-              chunkToSend.byteLength / 2
+          while (pcmBuffer.length >= FRAME_SIZE * 2) {
+            const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
+            pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
+            const frame = new Int16Array(
+              frameBuffer.buffer,
+              frameBuffer.byteOffset,
+              FRAME_SIZE
             );
-            if (samples.length === PCM_CHUNK_SAMPLES) {
-              await this.streamChunkToJanus(samples, SAMPLE_RATE);
-            } else {
-              console.warn(
-                `[SttTtsPlugin] Invalid chunk size: ${samples.length}, expected ${PCM_CHUNK_SAMPLES}`
-              );
-            }
-            await new Promise((resolve2) => setImmediate(resolve2));
-            if (signal.aborted) {
-              console.log("[SttTtsPlugin] TTS streaming interrupted");
-              break;
-            }
+            const frameCopy = new Int16Array(FRAME_SIZE);
+            frameCopy.set(frame);
+            audioBuffer.push(frameCopy);
           }
         } catch (error) {
           reject(error);
@@ -3474,7 +3465,7 @@ var SttTtsPlugin = class {
           console.error("[FFmpeg Streaming Error]", data.toString().trim());
         }
       });
-      ffmpeg.on("close", async (code) => {
+      ffmpeg.on("close", (code) => {
         try {
           if (code !== 0 && !signal.aborted) {
             reject(
@@ -3483,28 +3474,23 @@ var SttTtsPlugin = class {
             return;
           }
           if (pcmBuffer.length > 0 && !signal.aborted) {
-            if (pcmBuffer.length < PCM_CHUNK_BYTES) {
-              const paddedBuffer = Buffer.alloc(PCM_CHUNK_BYTES);
-              pcmBuffer.copy(paddedBuffer);
-              const samples = new Int16Array(
-                paddedBuffer.buffer,
-                paddedBuffer.byteOffset,
-                PCM_CHUNK_SAMPLES
-              );
-              await this.streamChunkToJanus(samples, SAMPLE_RATE);
-            } else {
-              while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
-                const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
-                pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
-                const samples = new Int16Array(
-                  chunkToSend.buffer,
-                  chunkToSend.byteOffset,
-                  PCM_CHUNK_SAMPLES
-                );
-                await this.streamChunkToJanus(samples, SAMPLE_RATE);
-              }
-            }
+            const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
+            pcmBuffer.copy(
+              frameBuffer,
+              0,
+              0,
+              Math.min(pcmBuffer.length, FRAME_SIZE * 2)
+            );
+            const frame = new Int16Array(FRAME_SIZE);
+            const srcView = new Int16Array(
+              frameBuffer.buffer,
+              frameBuffer.byteOffset,
+              FRAME_SIZE
+            );
+            frame.set(srcView);
+            audioBuffer.push(frame);
           }
+          processingComplete = true;
           resolve();
         } catch (error) {
           reject(error);
@@ -3514,7 +3500,83 @@ var SttTtsPlugin = class {
         reject(new Error(`FFmpeg process error: ${err.message}`));
       });
     });
-    await Promise.all([elevenLabsPromise, processingPromise]);
+    try {
+      await Promise.race([
+        processingPromise.catch((err) => {
+          elizaLogger6.error("[SttTtsPlugin] Processing error:", err);
+        }),
+        // Also wait for a minimum buffer to build up before starting playback
+        new Promise((resolve) => {
+          const checkBuffer = () => {
+            if (audioBuffer.length > 10 || signal.aborted) {
+              resolve();
+            } else {
+              setTimeout(checkBuffer, 50);
+            }
+          };
+          checkBuffer();
+        })
+      ]);
+      let frameIndex = 0;
+      const startTime = Date.now();
+      while ((frameIndex < audioBuffer.length || !processingComplete) && !signal.aborted) {
+        if (frameIndex >= audioBuffer.length && !processingComplete) {
+          await new Promise((resolve) => {
+            const waitForMoreFrames = () => {
+              if (frameIndex < audioBuffer.length || processingComplete || signal.aborted) {
+                resolve();
+              } else {
+                setTimeout(waitForMoreFrames, 20);
+              }
+            };
+            waitForMoreFrames();
+          });
+          if (frameIndex >= audioBuffer.length) {
+            break;
+          }
+        }
+        const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
+        const currentTime = Date.now();
+        if (currentTime < idealPlaybackTime) {
+          await new Promise(
+            (r) => setTimeout(r, idealPlaybackTime - currentTime)
+          );
+        } else if (currentTime > idealPlaybackTime + 100) {
+          const framesToSkip = Math.floor(
+            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS
+          );
+          if (framesToSkip > 0) {
+            elizaLogger6.log(
+              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`
+            );
+            frameIndex += framesToSkip;
+            continue;
+          }
+        }
+        const frame = audioBuffer[frameIndex];
+        try {
+          await this.streamChunkToJanus(frame, SAMPLE_RATE);
+        } catch (error) {
+          elizaLogger6.error(
+            "[SttTtsPlugin] Error sending frame to Janus:",
+            error
+          );
+        }
+        frameIndex++;
+      }
+      await processingPromise;
+      await elevenLabsPromise;
+      elizaLogger6.log(
+        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`
+      );
+    } catch (error) {
+      if (signal.aborted) {
+        elizaLogger6.log("[SttTtsPlugin] Audio streaming aborted");
+      } else {
+        elizaLogger6.error("[SttTtsPlugin] Audio streaming error:", error);
+      }
+      throw error;
+    }
   }
   /**
    * Stream a single chunk of audio to Janus
