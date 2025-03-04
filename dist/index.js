@@ -3670,6 +3670,9 @@ var TwitterSpaceClient = class {
           );
           await this.stopSpace();
         });
+        participant.on("error", (error) => {
+          elizaLogger7.error(`Error on client connection ${error}`);
+        });
         process.on("SIGINT", async () => {
           elizaLogger7.log("[Space] SIGINT => stopping space");
           await speakFiller(this.client.runtime, this.sttTtsPlugin, "CLOSING");
