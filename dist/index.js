@@ -734,6 +734,12 @@ var wait = (minTime = 1e3, maxTime = 3e3) => {
   const waitTime = Math.floor(Math.random() * (maxTime - minTime + 1)) + minTime;
   return new Promise((resolve) => setTimeout(resolve, waitTime));
 };
+function isNotEmpty(input) {
+  return !isEmpty(input);
+}
+function isEmpty(input) {
+  return input === void 0 || input === null || input === "";
+}
 async function buildConversationThread(tweet, client, maxReplies = 10) {
   const thread = [];
   const visited = /* @__PURE__ */ new Set();
@@ -3594,7 +3600,6 @@ var TwitterSpaceClient = class {
     this.isSpaceRunning = true;
     elizaLogger7.log("[Space] Joining a new Twitter Space...");
     try {
-      this.currentSpace = new Space(this.scraper);
       this.startedAt = Date.now();
       this.activeSpeakers = [];
       this.speakerQueue = [];
@@ -3627,7 +3632,7 @@ var TwitterSpaceClient = class {
           elizaLogger7.log("[Space] Using SttTtsPlugin");
           const sttTts = new SttTtsPlugin();
           sttTts.init({
-            space: this.currentSpace,
+            space: participant,
             pluginConfig: {
               runtime: this.runtime,
               client: this.client,
@@ -3890,29 +3895,40 @@ var TwitterSpaceClient = class {
    * Periodic management: check durations, remove extras, maybe accept new from queue
    */
   async manageCurrentSpace() {
-    var _a, _b;
-    if (!this.spaceId || !this.currentSpace) return;
+    var _a, _b, _c, _d;
+    if (!this.spaceId || !this.currentSpace) {
+      return;
+    }
     try {
       const audioSpace = await this.scraper.getAudioSpaceById(this.spaceId);
       const { participants } = audioSpace;
       const numSpeakers = ((_a = participants.speakers) == null ? void 0 : _a.length) || 0;
       const totalListeners = ((_b = participants.listeners) == null ? void 0 : _b.length) || 0;
-      const maxDur = this.decisionOptions.speakerMaxDurationMs ?? 24e4;
+      const activeSpeakerLen = ((_c = this == null ? void 0 : this.activeSpeakers) == null ? void 0 : _c.length) ?? 0;
+      if (activeSpeakerLen === 0) {
+        elizaLogger7.log(
+          `No active speakers to manage, hence nothing to manage, returning`
+        );
+        return;
+      }
+      const maxDur = ((_d = this.decisionOptions) == null ? void 0 : _d.speakerMaxDurationMs) ?? 24e4;
       const now = Date.now();
       for (let i = this.activeSpeakers.length - 1; i >= 0; i--) {
         const speaker = this.activeSpeakers[i];
-        const elapsed = now - speaker.startTime;
+        const elapsed = now - ((speaker == null ? void 0 : speaker.startTime) ?? now);
         if (elapsed > maxDur) {
           elizaLogger7.log(
-            `[Space] Speaker @${speaker.username} exceeded max duration => removing`
+            `[Space] Speaker @${speaker == null ? void 0 : speaker.username} exceeded max duration => removing`
           );
-          await this.removeSpeaker(speaker.userId);
-          this.activeSpeakers.splice(i, 1);
-          await speakFiller(
-            this.client.runtime,
-            this.sttTtsPlugin,
-            "SPEAKER_LEFT"
-          );
+          if (isNotEmpty(speaker == null ? void 0 : speaker.userId)) {
+            await this.removeSpeaker(speaker == null ? void 0 : speaker.userId);
+            this.activeSpeakers.splice(i, 1);
+            await speakFiller(
+              this.client.runtime,
+              this.sttTtsPlugin,
+              "SPEAKER_LEFT"
+            );
+          }
         }
       }
       await this.acceptSpeakersFromQueueIfNeeded();
@@ -3981,7 +3997,12 @@ var TwitterSpaceClient = class {
     }
   }
   async removeSpeaker(userId) {
-    if (!this.currentSpace) return;
+    if (!this.currentSpace) {
+      return;
+    }
+    if (isEmpty(userId)) {
+      return;
+    }
     try {
       await this.currentSpace.removeSpeaker(userId);
       elizaLogger7.log(`[Space] Removed speaker userId=${userId}`);
