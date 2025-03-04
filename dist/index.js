@@ -3574,70 +3574,80 @@ var SttTtsPlugin = class {
   //     resolve();
   //   });
   // }
-  // /**
-  //  * Modified ElevenLabs TTS function that streams the response to a writable stream
-  //  * instead of waiting for the full response
-  //  */
-  // private async elevenLabsTtsStreaming(
-  //   text: string,
-  //   outputStream: NodeJS.WritableStream,
-  //   signal: AbortSignal,
-  // ): Promise<void> {
-  //   try {
-  //     // Set up ElevenLabs API request
-  //     const apiKey = this.elevenLabsApiKey;
-  //     const voiceId = this.voiceId;
-  //     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
-  //     // Make the API request
-  //     const response = await fetch(url, {
-  //       method: 'POST',
-  //       headers: {
-  //         Accept: 'audio/mpeg',
-  //         'Content-Type': 'application/json',
-  //         'xi-api-key': apiKey,
-  //       },
-  //       body: JSON.stringify({
-  //         text,
-  //         model_id: 'eleven_monolingual_v1',
-  //         voice_settings: {
-  //           stability: 0.5,
-  //           similarity_boost: 0.75,
-  //         },
-  //       }),
-  //       signal,
-  //     });
-  //     if (!response.ok) {
-  //       throw new Error(
-  //         `ElevenLabs API error: ${response.status} ${response.statusText}`,
-  //       );
-  //     }
-  //     if (!response.body) {
-  //       throw new Error('Response body is null');
-  //     }
-  //     // Stream the response directly to our output stream
-  //     const reader = response.body.getReader();
-  //     let done = false;
-  //     while (!done && !signal.aborted) {
-  //       const { value, done: readerDone } = await reader.read();
-  //       done = readerDone;
-  //       if (value && !signal.aborted) {
-  //         // Write chunk to our stream
-  //         outputStream.write(value);
-  //       }
-  //     }
-  //     // End the stream when done
-  //     outputStream.end();
-  //   } catch (error) {
-  //     if (error.name === 'AbortError') {
-  //       console.log('[SttTtsPlugin] ElevenLabs request aborted');
-  //     } else {
-  //       console.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
-  //     }
-  //     // Make sure to end the stream on error
-  //     outputStream.end();
-  //     throw error;
-  //   }
-  // }
+  /**
+   * Modified ElevenLabs TTS function that streams the response to a writable stream
+   * instead of waiting for the full response
+   */
+  async elevenLabsTtsStreaming(text, outputStream, signal) {
+    try {
+      if (!this.elevenLabsApiKey) {
+        throw new Error("[SttTtsPlugin] No ElevenLabs API key");
+      }
+      const apiKey = this.elevenLabsApiKey;
+      const voiceId = this.voiceId;
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+      elizaLogger6.log(
+        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`
+      );
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "audio/mpeg",
+          "Content-Type": "application/json",
+          "xi-api-key": apiKey
+        },
+        body: JSON.stringify({
+          text,
+          model_id: this.elevenLabsModel,
+          voice_settings: {
+            stability: 0.4,
+            similarity_boost: 0.8
+          }
+        }),
+        signal
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`
+        );
+      }
+      if (!response.body) {
+        throw new Error("Response body is null");
+      }
+      elizaLogger6.log(
+        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`
+      );
+      const reader = response.body.getReader();
+      let done = false;
+      let bytesReceived = 0;
+      while (!done && !signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+        if (value && !signal.aborted) {
+          bytesReceived += value.length;
+          outputStream.write(Buffer.from(value));
+          if (bytesReceived % 1e4 < 1e3) {
+            elizaLogger6.log(
+              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`
+            );
+          }
+        }
+      }
+      outputStream.end();
+      elizaLogger6.log(
+        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`
+      );
+    } catch (error) {
+      if (error.name === "AbortError") {
+        elizaLogger6.log("[SttTtsPlugin] ElevenLabs request aborted");
+      } else {
+        elizaLogger6.error("[SttTtsPlugin] ElevenLabs streaming error:", error);
+      }
+      outputStream.end();
+      throw error;
+    }
+  }
   /**
    * Process the TTS queue with optimized parallelism
    */

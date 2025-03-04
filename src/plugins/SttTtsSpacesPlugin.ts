@@ -868,79 +868,107 @@ export class SttTtsPlugin implements Plugin {
   //     resolve();
   //   });
   // }
+  /**
+   * Modified ElevenLabs TTS function that streams the response to a writable stream
+   * instead of waiting for the full response
+   */
+  private async elevenLabsTtsStreaming(
+    text: string,
+    outputStream: NodeJS.WritableStream,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      if (!this.elevenLabsApiKey) {
+        throw new Error('[SttTtsPlugin] No ElevenLabs API key');
+      }
 
-  // /**
-  //  * Modified ElevenLabs TTS function that streams the response to a writable stream
-  //  * instead of waiting for the full response
-  //  */
-  // private async elevenLabsTtsStreaming(
-  //   text: string,
-  //   outputStream: NodeJS.WritableStream,
-  //   signal: AbortSignal,
-  // ): Promise<void> {
-  //   try {
-  //     // Set up ElevenLabs API request
-  //     const apiKey = this.elevenLabsApiKey;
-  //     const voiceId = this.voiceId;
-  //     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+      // Set up ElevenLabs API request
+      const apiKey = this.elevenLabsApiKey;
+      const voiceId = this.voiceId;
 
-  //     // Make the API request
-  //     const response = await fetch(url, {
-  //       method: 'POST',
-  //       headers: {
-  //         Accept: 'audio/mpeg',
-  //         'Content-Type': 'application/json',
-  //         'xi-api-key': apiKey,
-  //       },
-  //       body: JSON.stringify({
-  //         text,
-  //         model_id: 'eleven_monolingual_v1',
-  //         voice_settings: {
-  //           stability: 0.5,
-  //           similarity_boost: 0.75,
-  //         },
-  //       }),
-  //       signal,
-  //     });
+      // Use the streaming endpoint
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
-  //     if (!response.ok) {
-  //       throw new Error(
-  //         `ElevenLabs API error: ${response.status} ${response.statusText}`,
-  //       );
-  //     }
+      elizaLogger.log(
+        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`,
+      );
 
-  //     if (!response.body) {
-  //       throw new Error('Response body is null');
-  //     }
+      // Make the API request
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          text,
+          model_id: this.elevenLabsModel,
+          voice_settings: {
+            stability: 0.4,
+            similarity_boost: 0.8,
+          },
+        }),
+        signal,
+      });
 
-  //     // Stream the response directly to our output stream
-  //     const reader = response.body.getReader();
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+      }
 
-  //     let done = false;
-  //     while (!done && !signal.aborted) {
-  //       const { value, done: readerDone } = await reader.read();
-  //       done = readerDone;
+      if (!response.body) {
+        throw new Error('Response body is null');
+      }
 
-  //       if (value && !signal.aborted) {
-  //         // Write chunk to our stream
-  //         outputStream.write(value);
-  //       }
-  //     }
+      elizaLogger.log(
+        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`,
+      );
 
-  //     // End the stream when done
-  //     outputStream.end();
-  //   } catch (error) {
-  //     if (error.name === 'AbortError') {
-  //       console.log('[SttTtsPlugin] ElevenLabs request aborted');
-  //     } else {
-  //       console.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
-  //     }
+      // Stream the response directly to our output stream
+      const reader = response.body.getReader();
 
-  //     // Make sure to end the stream on error
-  //     outputStream.end();
-  //     throw error;
-  //   }
-  // }
+      let done = false;
+      let bytesReceived = 0;
+
+      while (!done && !signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+
+        if (value && !signal.aborted) {
+          bytesReceived += value.length;
+
+          // Write chunk to our stream
+          outputStream.write(Buffer.from(value));
+
+          // Log progress periodically
+          if (bytesReceived % 10000 < 1000) {
+            elizaLogger.log(
+              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`,
+            );
+          }
+        }
+      }
+
+      // End the stream when done
+      outputStream.end();
+      elizaLogger.log(
+        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`,
+      );
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        elizaLogger.log('[SttTtsPlugin] ElevenLabs request aborted');
+      } else {
+        elizaLogger.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
+      }
+
+      // Make sure to end the stream on error
+      outputStream.end();
+      throw error;
+    }
+  }
 
   /**
    * Process the TTS queue with optimized parallelism
