@@ -28,6 +28,7 @@ import {
   twitterShouldRespondTemplate,
 } from './templates';
 import { isEmpty } from '../utils';
+import { PassThrough } from 'stream';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -213,6 +214,16 @@ export class SttTtsPlugin implements Plugin {
         }
       }
     }
+  }
+
+  /**
+   * Add audio chunk for a user
+   */
+  public addAudioChunk(userId: string, chunk: Int16Array): void {
+    if (!this.pcmBuffers.has(userId)) {
+      this.pcmBuffers.set(userId, []);
+    }
+    this.pcmBuffers.get(userId)?.push(chunk);
   }
 
   // /src/sttTtsPlugin.ts
@@ -553,37 +564,324 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Process TTS requests one by one
+   * Process the TTS queue with streaming optimizations
    */
   private async processTtsQueue(): Promise<void> {
-    while (this.ttsQueue.length > 0) {
-      const text = this.ttsQueue.shift();
-      if (!text) continue;
+    try {
+      while (this.ttsQueue.length > 0) {
+        const text = this.ttsQueue.shift();
+        if (!text) continue;
 
-      this.ttsAbortController = new AbortController();
-      const { signal } = this.ttsAbortController;
+        // Create a new abort controller for this specific TTS task
+        this.ttsAbortController = new AbortController();
+        const { signal } = this.ttsAbortController;
 
-      try {
-        const ttsAudio = await this.elevenLabsTts(text);
-        const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
-        if (signal.aborted) {
-          elizaLogger.log('[SttTtsPlugin] TTS interrupted before streaming');
-          return;
+        const startTime = Date.now();
+
+        try {
+          // Use the new streaming pipeline instead of the sequential approach
+          await this.streamTtsToJanus(text, signal);
+
+          console.log(
+            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`,
+          );
+
+          // Check for abort after streaming
+          if (signal.aborted) {
+            console.log('[SttTtsPlugin] TTS streaming was interrupted');
+            return;
+          }
+        } catch (err) {
+          console.error('[SttTtsPlugin] TTS streaming error =>', err);
+        } finally {
+          // Clean up the AbortController
+          this.ttsAbortController = null;
         }
-        await this.streamToJanus(pcm, 48000);
-        if (signal.aborted) {
-          elizaLogger.log('[SttTtsPlugin] TTS interrupted after streaming');
-          return;
-        }
-      } catch (err) {
-        elizaLogger.error('[SttTtsPlugin] TTS streaming error =>', err);
-      } finally {
-        // Clean up the AbortController
-        this.ttsAbortController = null;
       }
+    } catch (error) {
+      console.error('[SttTtsPlugin] Queue processing error =>', error);
+    } finally {
+      this.isSpeaking = false;
     }
-    this.isSpeaking = false;
   }
+
+  /**
+   * Stop any ongoing TTS playback
+   */
+  public stopSpeaking(): void {
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+    }
+    this.ttsQueue = [];
+  }
+
+  /**
+   * Process TTS text and stream directly to Janus with minimal latency
+   * @param text Text to convert to speech
+   * @param signal Abort controller signal
+   */
+  private async streamTtsToJanus(
+    text: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    // Set chunk size for streaming
+    const SAMPLE_RATE = 48000;
+
+    // Create a PassThrough stream for the MP3 data
+    const mp3Stream = new PassThrough();
+
+    // Set up FFmpeg process for streaming conversion
+    const ffmpeg = spawn('ffmpeg', [
+      // Input stream settings
+      '-i',
+      'pipe:0',
+      '-f',
+      'mp3',
+
+      // Performance flags
+      '-threads',
+      '4',
+      '-loglevel',
+      'error',
+      '-nostdin',
+      '-fflags',
+      '+nobuffer',
+      '-flags',
+      '+low_delay',
+      '-probesize',
+      '32',
+      '-analyzeduration',
+      '0',
+
+      // Output settings - PCM audio
+      '-f',
+      's16le',
+      '-ar',
+      SAMPLE_RATE.toString(),
+      '-ac',
+      '1',
+      'pipe:1',
+    ]);
+
+    // Connect MP3 stream to FFmpeg input
+    mp3Stream.pipe(ffmpeg.stdin);
+
+    // Start the ElevenLabs API call with streaming response
+    const elevenLabsPromise = this.elevenLabsTtsStreaming(
+      text,
+      mp3Stream,
+      signal,
+    );
+
+    // Buffer for accumulating audio chunks for streaming
+    let pcmBuffer = Buffer.alloc(0);
+    const PCM_CHUNK_SAMPLES = 960; // Number of samples to send at once (20ms at 48kHz)
+    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2; // 2 bytes per sample for Int16
+
+    // Process FFmpeg output in chunks and stream to Janus
+    const processingPromise = new Promise<void>((resolve, reject) => {
+      ffmpeg.stdout.on('data', async (chunk: Buffer) => {
+        try {
+          if (signal.aborted) {
+            return; // Stop processing if aborted
+          }
+
+          // Append new chunk to our buffer
+          pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+
+          // Process complete chunks
+          while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
+            // Extract a complete chunk
+            const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
+            pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+
+            // Convert buffer to Int16Array for Janus
+            const samples = new Int16Array(
+              chunkToSend.buffer,
+              chunkToSend.byteOffset,
+              chunkToSend.byteLength / 2,
+            );
+
+            // Stream this chunk to Janus
+            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+
+            // Allow other events to process
+            await new Promise((resolve) => setImmediate(resolve));
+
+            // Check for abort between chunks
+            if (signal.aborted) {
+              console.log('[SttTtsPlugin] TTS streaming interrupted');
+              break;
+            }
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      ffmpeg.stderr.on('data', (data) => {
+        if (data.toString().includes('Error')) {
+          console.error('[FFmpeg Streaming Error]', data.toString().trim());
+        }
+      });
+
+      ffmpeg.on('close', async (code) => {
+        try {
+          if (code !== 0 && !signal.aborted) {
+            reject(
+              new Error(`ffmpeg streaming process exited with code ${code}`),
+            );
+            return;
+          }
+
+          // Process any remaining audio in the buffer
+          if (pcmBuffer.length > 0 && !signal.aborted) {
+            const samples = new Int16Array(
+              pcmBuffer.buffer,
+              pcmBuffer.byteOffset,
+              pcmBuffer.byteLength / 2,
+            );
+
+            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+          }
+
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      // Handle errors from FFmpeg
+      ffmpeg.on('error', (err) => {
+        reject(new Error(`FFmpeg process error: ${err.message}`));
+      });
+    });
+
+    // Wait for both the ElevenLabs download and processing to complete
+    await Promise.all([elevenLabsPromise, processingPromise]);
+  }
+
+  /**
+   * Stream a single chunk of audio to Janus
+   * This method should be adapted to match your Janus implementation
+   */
+  private async streamChunkToJanus(
+    samples: Int16Array,
+    sampleRate: number,
+  ): Promise<void> {
+    // Replace with your actual implementation
+    return new Promise<void>((resolve) => {
+      // Example implementation:
+      this.janus?.pushLocalAudio(samples, sampleRate);
+      resolve();
+    });
+  }
+
+  /**
+   * Modified ElevenLabs TTS function that streams the response to a writable stream
+   * instead of waiting for the full response
+   */
+  private async elevenLabsTtsStreaming(
+    text: string,
+    outputStream: NodeJS.WritableStream,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      // Set up ElevenLabs API request
+      const apiKey = this.elevenLabsApiKey;
+      const voiceId = this.voiceId;
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+
+      // Make the API request
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_monolingual_v1',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+          },
+        }),
+        signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `ElevenLabs API error: ${response.status} ${response.statusText}`,
+        );
+      }
+
+      if (!response.body) {
+        throw new Error('Response body is null');
+      }
+
+      // Stream the response directly to our output stream
+      const reader = response.body.getReader();
+
+      let done = false;
+      while (!done && !signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+
+        if (value && !signal.aborted) {
+          // Write chunk to our stream
+          outputStream.write(value);
+        }
+      }
+
+      // End the stream when done
+      outputStream.end();
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        console.log('[SttTtsPlugin] ElevenLabs request aborted');
+      } else {
+        console.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
+      }
+
+      // Make sure to end the stream on error
+      outputStream.end();
+      throw error;
+    }
+  }
+
+  /**
+   * Process the TTS queue with optimized parallelism
+   */
+  // private async processTtsQueue(): Promise<void> {
+  //   while (this.ttsQueue.length > 0) {
+  //     const text = this.ttsQueue.shift();
+  //     if (!text) continue;
+
+  //     this.ttsAbortController = new AbortController();
+  //     const { signal } = this.ttsAbortController;
+
+  //     try {
+  //       const ttsAudio = await this.elevenLabsTts(text);
+  //       const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
+  //       if (signal.aborted) {
+  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted before streaming');
+  //         return;
+  //       }
+  //       await this.streamToJanus(pcm, 48000);
+  //       if (signal.aborted) {
+  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted after streaming');
+  //         return;
+  //       }
+  //     } catch (err) {
+  //       elizaLogger.error('[SttTtsPlugin] TTS streaming error =>', err);
+  //     } finally {
+  //       // Clean up the AbortController
+  //       this.ttsAbortController = null;
+  //     }
+  //   }
+  //   this.isSpeaking = false;
+  // }
 
   /**
    * Handle User Message
@@ -851,47 +1149,84 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Convert MP3 => PCM via ffmpeg
+   * Convert MP3 => PCM via ffmpeg with optimizations
    */
   private convertMp3ToPcm(
     mp3Buf: Buffer,
     outRate: number,
   ): Promise<Int16Array> {
     return new Promise((resolve, reject) => {
+      // Optimize ffmpeg parameters for speed
       const ff = spawn('ffmpeg', [
+        // Input buffer settings
         '-i',
         'pipe:0',
+
+        // Performance optimizations
+        '-threads',
+        '4', // Use multiple threads (adjust based on your CPU)
+        '-loglevel',
+        'error', // Reduce logging overhead
+        '-nostdin', // Don't wait for console input
+
+        // Optimization flags
+        '-fflags',
+        '+nobuffer', // Reduce buffering
+        '-flags',
+        '+low_delay', // Prioritize low delay processing
+        '-probesize',
+        '32', // Use minimal probing (we know it's an MP3)
+        '-analyzeduration',
+        '0', // Skip lengthy analysis
+
+        // Output format settings (unchanged but grouped)
         '-f',
-        's16le',
+        's16le', // Output format
         '-ar',
-        outRate.toString(),
+        outRate.toString(), // Sample rate
         '-ac',
-        '1',
-        'pipe:1',
+        '1', // Mono audio
+        'pipe:1', // Output to stdout
       ]);
-      let raw = Buffer.alloc(0);
+
+      // Pre-allocate larger chunks to reduce Buffer.concat operations
+      const chunks: Buffer[] = [];
+      let totalLength = 0;
 
       ff.stdout.on('data', (chunk: Buffer) => {
-        raw = Buffer.concat([raw, chunk]);
+        chunks.push(chunk);
+        totalLength += chunk.length;
       });
-      ff.stderr.on('data', () => {
-        // ignoring ffmpeg logs
+
+      ff.stderr.on('data', (data) => {
+        // Only log actual errors
+        if (data.toString().includes('Error')) {
+          console.error('[FFmpeg Error]', data.toString().trim());
+        }
       });
+
       ff.on('close', (code) => {
         if (code !== 0) {
           reject(new Error(`ffmpeg error code=${code}`));
           return;
         }
+
+        // Efficient buffer concatenation
+        const raw = Buffer.concat(chunks, totalLength);
+
+        // Directly create the Int16Array from buffer
+        // This avoids an extra copy operation
         const samples = new Int16Array(
           raw.buffer,
           raw.byteOffset,
           raw.byteLength / 2,
         );
+
         resolve(samples);
       });
 
-      ff.stdin.write(mp3Buf);
-      ff.stdin.end();
+      // Write the input buffer and end the stream in one operation
+      ff.stdin.end(mp3Buf);
     });
   }
 

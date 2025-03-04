@@ -2969,6 +2969,7 @@ var twitterVoiceHandlerTemplate = `# Task: Generate conversational voice dialog 
     ` + messageCompletionFooter3;
 
 // src/plugins/SttTtsSpacesPlugin.ts
+import { PassThrough } from "stream";
 var VOLUME_WINDOW_SIZE = 100;
 var SPEAKING_THRESHOLD = 0.05;
 var SttTtsPlugin = class {
@@ -3106,6 +3107,16 @@ var SttTtsPlugin = class {
         }
       }
     }
+  }
+  /**
+   * Add audio chunk for a user
+   */
+  addAudioChunk(userId, chunk) {
+    var _a;
+    if (!this.pcmBuffers.has(userId)) {
+      this.pcmBuffers.set(userId, []);
+    }
+    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(chunk);
   }
   // /src/sttTtsPlugin.ts
   async convertPcmToWavInMemory(pcmData, sampleRate) {
@@ -3340,34 +3351,245 @@ var SttTtsPlugin = class {
     }
   }
   /**
-   * Process TTS requests one by one
+   * Process the TTS queue with streaming optimizations
    */
   async processTtsQueue() {
-    while (this.ttsQueue.length > 0) {
-      const text = this.ttsQueue.shift();
-      if (!text) continue;
-      this.ttsAbortController = new AbortController();
-      const { signal } = this.ttsAbortController;
-      try {
-        const ttsAudio = await this.elevenLabsTts(text);
-        const pcm = await this.convertMp3ToPcm(ttsAudio, 48e3);
-        if (signal.aborted) {
-          elizaLogger6.log("[SttTtsPlugin] TTS interrupted before streaming");
-          return;
+    try {
+      while (this.ttsQueue.length > 0) {
+        const text = this.ttsQueue.shift();
+        if (!text) continue;
+        this.ttsAbortController = new AbortController();
+        const { signal } = this.ttsAbortController;
+        const startTime = Date.now();
+        try {
+          await this.streamTtsToJanus(text, signal);
+          console.log(
+            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`
+          );
+          if (signal.aborted) {
+            console.log("[SttTtsPlugin] TTS streaming was interrupted");
+            return;
+          }
+        } catch (err) {
+          console.error("[SttTtsPlugin] TTS streaming error =>", err);
+        } finally {
+          this.ttsAbortController = null;
         }
-        await this.streamToJanus(pcm, 48e3);
-        if (signal.aborted) {
-          elizaLogger6.log("[SttTtsPlugin] TTS interrupted after streaming");
-          return;
-        }
-      } catch (err) {
-        elizaLogger6.error("[SttTtsPlugin] TTS streaming error =>", err);
-      } finally {
-        this.ttsAbortController = null;
       }
+    } catch (error) {
+      console.error("[SttTtsPlugin] Queue processing error =>", error);
+    } finally {
+      this.isSpeaking = false;
     }
-    this.isSpeaking = false;
   }
+  /**
+   * Stop any ongoing TTS playback
+   */
+  stopSpeaking() {
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+    }
+    this.ttsQueue = [];
+  }
+  /**
+   * Process TTS text and stream directly to Janus with minimal latency
+   * @param text Text to convert to speech
+   * @param signal Abort controller signal
+   */
+  async streamTtsToJanus(text, signal) {
+    const SAMPLE_RATE = 48e3;
+    const mp3Stream = new PassThrough();
+    const ffmpeg = spawn("ffmpeg", [
+      // Input stream settings
+      "-i",
+      "pipe:0",
+      "-f",
+      "mp3",
+      // Performance flags
+      "-threads",
+      "4",
+      "-loglevel",
+      "error",
+      "-nostdin",
+      "-fflags",
+      "+nobuffer",
+      "-flags",
+      "+low_delay",
+      "-probesize",
+      "32",
+      "-analyzeduration",
+      "0",
+      // Output settings - PCM audio
+      "-f",
+      "s16le",
+      "-ar",
+      SAMPLE_RATE.toString(),
+      "-ac",
+      "1",
+      "pipe:1"
+    ]);
+    mp3Stream.pipe(ffmpeg.stdin);
+    const elevenLabsPromise = this.elevenLabsTtsStreaming(
+      text,
+      mp3Stream,
+      signal
+    );
+    let pcmBuffer = Buffer.alloc(0);
+    const PCM_CHUNK_SAMPLES = 960;
+    const PCM_CHUNK_BYTES = PCM_CHUNK_SAMPLES * 2;
+    const processingPromise = new Promise((resolve, reject) => {
+      ffmpeg.stdout.on("data", async (chunk) => {
+        try {
+          if (signal.aborted) {
+            return;
+          }
+          pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+          while (pcmBuffer.length >= PCM_CHUNK_BYTES) {
+            const chunkToSend = pcmBuffer.slice(0, PCM_CHUNK_BYTES);
+            pcmBuffer = pcmBuffer.slice(PCM_CHUNK_BYTES);
+            const samples = new Int16Array(
+              chunkToSend.buffer,
+              chunkToSend.byteOffset,
+              chunkToSend.byteLength / 2
+            );
+            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+            await new Promise((resolve2) => setImmediate(resolve2));
+            if (signal.aborted) {
+              console.log("[SttTtsPlugin] TTS streaming interrupted");
+              break;
+            }
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+      ffmpeg.stderr.on("data", (data) => {
+        if (data.toString().includes("Error")) {
+          console.error("[FFmpeg Streaming Error]", data.toString().trim());
+        }
+      });
+      ffmpeg.on("close", async (code) => {
+        try {
+          if (code !== 0 && !signal.aborted) {
+            reject(
+              new Error(`ffmpeg streaming process exited with code ${code}`)
+            );
+            return;
+          }
+          if (pcmBuffer.length > 0 && !signal.aborted) {
+            const samples = new Int16Array(
+              pcmBuffer.buffer,
+              pcmBuffer.byteOffset,
+              pcmBuffer.byteLength / 2
+            );
+            await this.streamChunkToJanus(samples, SAMPLE_RATE);
+          }
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+      ffmpeg.on("error", (err) => {
+        reject(new Error(`FFmpeg process error: ${err.message}`));
+      });
+    });
+    await Promise.all([elevenLabsPromise, processingPromise]);
+  }
+  /**
+   * Stream a single chunk of audio to Janus
+   * This method should be adapted to match your Janus implementation
+   */
+  async streamChunkToJanus(samples, sampleRate) {
+    return new Promise((resolve) => {
+      var _a;
+      (_a = this.janus) == null ? void 0 : _a.pushLocalAudio(samples, sampleRate);
+      resolve();
+    });
+  }
+  /**
+   * Modified ElevenLabs TTS function that streams the response to a writable stream
+   * instead of waiting for the full response
+   */
+  async elevenLabsTtsStreaming(text, outputStream, signal) {
+    try {
+      const apiKey = this.elevenLabsApiKey;
+      const voiceId = this.voiceId;
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "audio/mpeg",
+          "Content-Type": "application/json",
+          "xi-api-key": apiKey
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_monolingual_v1",
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75
+          }
+        }),
+        signal
+      });
+      if (!response.ok) {
+        throw new Error(
+          `ElevenLabs API error: ${response.status} ${response.statusText}`
+        );
+      }
+      if (!response.body) {
+        throw new Error("Response body is null");
+      }
+      const reader = response.body.getReader();
+      let done = false;
+      while (!done && !signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+        if (value && !signal.aborted) {
+          outputStream.write(value);
+        }
+      }
+      outputStream.end();
+    } catch (error) {
+      if (error.name === "AbortError") {
+        console.log("[SttTtsPlugin] ElevenLabs request aborted");
+      } else {
+        console.error("[SttTtsPlugin] ElevenLabs streaming error:", error);
+      }
+      outputStream.end();
+      throw error;
+    }
+  }
+  /**
+   * Process the TTS queue with optimized parallelism
+   */
+  // private async processTtsQueue(): Promise<void> {
+  //   while (this.ttsQueue.length > 0) {
+  //     const text = this.ttsQueue.shift();
+  //     if (!text) continue;
+  //     this.ttsAbortController = new AbortController();
+  //     const { signal } = this.ttsAbortController;
+  //     try {
+  //       const ttsAudio = await this.elevenLabsTts(text);
+  //       const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
+  //       if (signal.aborted) {
+  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted before streaming');
+  //         return;
+  //       }
+  //       await this.streamToJanus(pcm, 48000);
+  //       if (signal.aborted) {
+  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted after streaming');
+  //         return;
+  //       }
+  //     } catch (err) {
+  //       elizaLogger.error('[SttTtsPlugin] TTS streaming error =>', err);
+  //     } finally {
+  //       // Clean up the AbortController
+  //       this.ttsAbortController = null;
+  //     }
+  //   }
+  //   this.isSpeaking = false;
+  // }
   /**
    * Handle User Message
    */
@@ -3574,32 +3796,66 @@ var SttTtsPlugin = class {
     return Buffer.from(arrayBuf);
   }
   /**
-   * Convert MP3 => PCM via ffmpeg
+   * Convert MP3 => PCM via ffmpeg with optimizations
    */
   convertMp3ToPcm(mp3Buf, outRate) {
     return new Promise((resolve, reject) => {
       const ff = spawn("ffmpeg", [
+        // Input buffer settings
         "-i",
         "pipe:0",
+        // Performance optimizations
+        "-threads",
+        "4",
+        // Use multiple threads (adjust based on your CPU)
+        "-loglevel",
+        "error",
+        // Reduce logging overhead
+        "-nostdin",
+        // Don't wait for console input
+        // Optimization flags
+        "-fflags",
+        "+nobuffer",
+        // Reduce buffering
+        "-flags",
+        "+low_delay",
+        // Prioritize low delay processing
+        "-probesize",
+        "32",
+        // Use minimal probing (we know it's an MP3)
+        "-analyzeduration",
+        "0",
+        // Skip lengthy analysis
+        // Output format settings (unchanged but grouped)
         "-f",
         "s16le",
+        // Output format
         "-ar",
         outRate.toString(),
+        // Sample rate
         "-ac",
         "1",
+        // Mono audio
         "pipe:1"
+        // Output to stdout
       ]);
-      let raw = Buffer.alloc(0);
+      const chunks = [];
+      let totalLength = 0;
       ff.stdout.on("data", (chunk) => {
-        raw = Buffer.concat([raw, chunk]);
+        chunks.push(chunk);
+        totalLength += chunk.length;
       });
-      ff.stderr.on("data", () => {
+      ff.stderr.on("data", (data) => {
+        if (data.toString().includes("Error")) {
+          console.error("[FFmpeg Error]", data.toString().trim());
+        }
       });
       ff.on("close", (code) => {
         if (code !== 0) {
           reject(new Error(`ffmpeg error code=${code}`));
           return;
         }
+        const raw = Buffer.concat(chunks, totalLength);
         const samples = new Int16Array(
           raw.buffer,
           raw.byteOffset,
@@ -3607,8 +3863,7 @@ var SttTtsPlugin = class {
         );
         resolve(samples);
       });
-      ff.stdin.write(mp3Buf);
-      ff.stdin.end();
+      ff.stdin.end(mp3Buf);
     });
   }
   /**
