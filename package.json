@@ -1,6 +1,6 @@
 {
   "name": "@flooz-link/client-twitter",
-  "version": "0.25.6-alpha.22",
+  "version": "0.25.6-alpha.23",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",

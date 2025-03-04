@@ -790,98 +790,157 @@ export class SttTtsPlugin implements Plugin {
 
   /**
    * Stream a single chunk of audio to Janus
-   * This method should be adapted to match your Janus implementation
+   * Fixed to ensure exact byte length requirement is met
    */
   private async streamChunkToJanus(
     samples: Int16Array,
     sampleRate: number,
   ): Promise<void> {
-    // Make sure we're sending exactly the frame size Janus expects
-    if (samples.length !== 480) {
-      console.warn(
-        `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`,
-      );
-    }
+    // Janus expects exactly 480 samples (960 bytes)
+    const EXPECTED_SAMPLES = 480;
+    const EXPECTED_BYTES = EXPECTED_SAMPLES * 2; // 960 bytes
 
-    return new Promise<void>((resolve) => {
-      // Send the audio chunk to Janus
-      this.janus?.pushLocalAudio(samples, sampleRate);
-      resolve();
+    return new Promise<void>((resolve, reject) => {
+      try {
+        // Check if we need to create a properly sized buffer
+        if (
+          samples.length !== EXPECTED_SAMPLES ||
+          samples.buffer.byteLength !== EXPECTED_BYTES
+        ) {
+          // Create a new buffer with exactly the right size
+          const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
+
+          // Copy data from original samples, being careful not to overflow
+          const copySamples = Math.min(samples.length, EXPECTED_SAMPLES);
+          for (let i = 0; i < copySamples; i++) {
+            properSizedSamples[i] = samples[i];
+          }
+
+          // Create a buffer view that's EXACTLY 960 bytes (480 samples)
+          // This is crucial - we need the buffer to be exactly 960 bytes
+          const bufferView = new Int16Array(
+            properSizedSamples.buffer,
+            0,
+            EXPECTED_SAMPLES,
+          );
+
+          // Log the buffer size to verify
+          console.log(
+            `[SttTtsPlugin] Sending audio frame: ${bufferView.length} samples, ${bufferView.buffer.byteLength} bytes`,
+          );
+
+          // Send the properly sized buffer to Janus
+          this.janus?.pushLocalAudio(bufferView, sampleRate);
+        } else {
+          // The buffer is already the right size
+          console.log(
+            `[SttTtsPlugin] Sending audio frame: ${samples.length} samples, ${samples.buffer.byteLength} bytes`,
+          );
+          this.janus?.pushLocalAudio(samples, sampleRate);
+        }
+
+        resolve();
+      } catch (error) {
+        console.error('[SttTtsPlugin] Error sending audio to Janus:', error);
+        reject(error);
+      }
     });
   }
 
-  /**
-   * Modified ElevenLabs TTS function that streams the response to a writable stream
-   * instead of waiting for the full response
-   */
-  private async elevenLabsTtsStreaming(
-    text: string,
-    outputStream: NodeJS.WritableStream,
-    signal: AbortSignal,
-  ): Promise<void> {
-    try {
-      // Set up ElevenLabs API request
-      const apiKey = this.elevenLabsApiKey;
-      const voiceId = this.voiceId;
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+  // /**
+  //  * Stream a single chunk of audio to Janus
+  //  * This method should be adapted to match your Janus implementation
+  //  */
+  // private async streamChunkToJanus(
+  //   samples: Int16Array,
+  //   sampleRate: number,
+  // ): Promise<void> {
+  //   // Make sure we're sending exactly the frame size Janus expects
+  //   if (samples.length !== 480) {
+  //     console.warn(
+  //       `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`,
+  //     );
+  //   }
 
-      // Make the API request
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          Accept: 'audio/mpeg',
-          'Content-Type': 'application/json',
-          'xi-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          text,
-          model_id: 'eleven_monolingual_v1',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-          },
-        }),
-        signal,
-      });
+  //   return new Promise<void>((resolve) => {
+  //     // Send the audio chunk to Janus
+  //     this.janus?.pushLocalAudio(samples, sampleRate);
+  //     resolve();
+  //   });
+  // }
 
-      if (!response.ok) {
-        throw new Error(
-          `ElevenLabs API error: ${response.status} ${response.statusText}`,
-        );
-      }
+  // /**
+  //  * Modified ElevenLabs TTS function that streams the response to a writable stream
+  //  * instead of waiting for the full response
+  //  */
+  // private async elevenLabsTtsStreaming(
+  //   text: string,
+  //   outputStream: NodeJS.WritableStream,
+  //   signal: AbortSignal,
+  // ): Promise<void> {
+  //   try {
+  //     // Set up ElevenLabs API request
+  //     const apiKey = this.elevenLabsApiKey;
+  //     const voiceId = this.voiceId;
+  //     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
-      if (!response.body) {
-        throw new Error('Response body is null');
-      }
+  //     // Make the API request
+  //     const response = await fetch(url, {
+  //       method: 'POST',
+  //       headers: {
+  //         Accept: 'audio/mpeg',
+  //         'Content-Type': 'application/json',
+  //         'xi-api-key': apiKey,
+  //       },
+  //       body: JSON.stringify({
+  //         text,
+  //         model_id: 'eleven_monolingual_v1',
+  //         voice_settings: {
+  //           stability: 0.5,
+  //           similarity_boost: 0.75,
+  //         },
+  //       }),
+  //       signal,
+  //     });
 
-      // Stream the response directly to our output stream
-      const reader = response.body.getReader();
+  //     if (!response.ok) {
+  //       throw new Error(
+  //         `ElevenLabs API error: ${response.status} ${response.statusText}`,
+  //       );
+  //     }
 
-      let done = false;
-      while (!done && !signal.aborted) {
-        const { value, done: readerDone } = await reader.read();
-        done = readerDone;
+  //     if (!response.body) {
+  //       throw new Error('Response body is null');
+  //     }
 
-        if (value && !signal.aborted) {
-          // Write chunk to our stream
-          outputStream.write(value);
-        }
-      }
+  //     // Stream the response directly to our output stream
+  //     const reader = response.body.getReader();
 
-      // End the stream when done
-      outputStream.end();
-    } catch (error) {
-      if (error.name === 'AbortError') {
-        console.log('[SttTtsPlugin] ElevenLabs request aborted');
-      } else {
-        console.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
-      }
+  //     let done = false;
+  //     while (!done && !signal.aborted) {
+  //       const { value, done: readerDone } = await reader.read();
+  //       done = readerDone;
 
-      // Make sure to end the stream on error
-      outputStream.end();
-      throw error;
-    }
-  }
+  //       if (value && !signal.aborted) {
+  //         // Write chunk to our stream
+  //         outputStream.write(value);
+  //       }
+  //     }
+
+  //     // End the stream when done
+  //     outputStream.end();
+  //   } catch (error) {
+  //     if (error.name === 'AbortError') {
+  //       console.log('[SttTtsPlugin] ElevenLabs request aborted');
+  //     } else {
+  //       console.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
+  //     }
+
+  //     // Make sure to end the stream on error
+  //     outputStream.end();
+  //     throw error;
+  //   }
+  // }
 
   /**
    * Process the TTS queue with optimized parallelism
@@ -1184,113 +1243,113 @@ export class SttTtsPlugin implements Plugin {
   /**
    * Convert MP3 => PCM via ffmpeg with optimizations
    */
-  private convertMp3ToPcm(
-    mp3Buf: Buffer,
-    outRate: number,
-  ): Promise<Int16Array> {
-    return new Promise((resolve, reject) => {
-      // Optimize ffmpeg parameters for speed
-      const ff = spawn('ffmpeg', [
-        // Input buffer settings
-        '-i',
-        'pipe:0',
+  // private convertMp3ToPcm(
+  //   mp3Buf: Buffer,
+  //   outRate: number,
+  // ): Promise<Int16Array> {
+  //   return new Promise((resolve, reject) => {
+  //     // Optimize ffmpeg parameters for speed
+  //     const ff = spawn('ffmpeg', [
+  //       // Input buffer settings
+  //       '-i',
+  //       'pipe:0',
 
-        // Performance optimizations
-        '-threads',
-        '4', // Use multiple threads (adjust based on your CPU)
-        '-loglevel',
-        'error', // Reduce logging overhead
-        '-nostdin', // Don't wait for console input
+  //       // Performance optimizations
+  //       '-threads',
+  //       '4', // Use multiple threads (adjust based on your CPU)
+  //       '-loglevel',
+  //       'error', // Reduce logging overhead
+  //       '-nostdin', // Don't wait for console input
 
-        // Optimization flags
-        '-fflags',
-        '+nobuffer', // Reduce buffering
-        '-flags',
-        '+low_delay', // Prioritize low delay processing
-        '-probesize',
-        '32', // Use minimal probing (we know it's an MP3)
-        '-analyzeduration',
-        '0', // Skip lengthy analysis
+  //       // Optimization flags
+  //       '-fflags',
+  //       '+nobuffer', // Reduce buffering
+  //       '-flags',
+  //       '+low_delay', // Prioritize low delay processing
+  //       '-probesize',
+  //       '32', // Use minimal probing (we know it's an MP3)
+  //       '-analyzeduration',
+  //       '0', // Skip lengthy analysis
 
-        // Output format settings (unchanged but grouped)
-        '-f',
-        's16le', // Output format
-        '-ar',
-        outRate.toString(), // Sample rate
-        '-ac',
-        '1', // Mono audio
-        'pipe:1', // Output to stdout
-      ]);
+  //       // Output format settings (unchanged but grouped)
+  //       '-f',
+  //       's16le', // Output format
+  //       '-ar',
+  //       outRate.toString(), // Sample rate
+  //       '-ac',
+  //       '1', // Mono audio
+  //       'pipe:1', // Output to stdout
+  //     ]);
 
-      // Pre-allocate larger chunks to reduce Buffer.concat operations
-      const chunks: Buffer[] = [];
-      let totalLength = 0;
+  //     // Pre-allocate larger chunks to reduce Buffer.concat operations
+  //     const chunks: Buffer[] = [];
+  //     let totalLength = 0;
 
-      ff.stdout.on('data', (chunk: Buffer) => {
-        chunks.push(chunk);
-        totalLength += chunk.length;
-      });
+  //     ff.stdout.on('data', (chunk: Buffer) => {
+  //       chunks.push(chunk);
+  //       totalLength += chunk.length;
+  //     });
 
-      ff.stderr.on('data', (data) => {
-        // Only log actual errors
-        if (data.toString().includes('Error')) {
-          console.error('[FFmpeg Error]', data.toString().trim());
-        }
-      });
+  //     ff.stderr.on('data', (data) => {
+  //       // Only log actual errors
+  //       if (data.toString().includes('Error')) {
+  //         console.error('[FFmpeg Error]', data.toString().trim());
+  //       }
+  //     });
 
-      ff.on('close', (code) => {
-        if (code !== 0) {
-          reject(new Error(`ffmpeg error code=${code}`));
-          return;
-        }
+  //     ff.on('close', (code) => {
+  //       if (code !== 0) {
+  //         reject(new Error(`ffmpeg error code=${code}`));
+  //         return;
+  //       }
 
-        // Efficient buffer concatenation
-        const raw = Buffer.concat(chunks, totalLength);
+  //       // Efficient buffer concatenation
+  //       const raw = Buffer.concat(chunks, totalLength);
 
-        // Directly create the Int16Array from buffer
-        // This avoids an extra copy operation
-        const samples = new Int16Array(
-          raw.buffer,
-          raw.byteOffset,
-          raw.byteLength / 2,
-        );
+  //       // Directly create the Int16Array from buffer
+  //       // This avoids an extra copy operation
+  //       const samples = new Int16Array(
+  //         raw.buffer,
+  //         raw.byteOffset,
+  //         raw.byteLength / 2,
+  //       );
 
-        resolve(samples);
-      });
+  //       resolve(samples);
+  //     });
 
-      // Write the input buffer and end the stream in one operation
-      ff.stdin.end(mp3Buf);
-    });
-  }
+  //     // Write the input buffer and end the stream in one operation
+  //     ff.stdin.end(mp3Buf);
+  //   });
+  // }
 
   /**
    * Push PCM back to Janus in small frames
    * We'll do 10ms @48k => 480 samples per frame (not 960)
    */
-  private async streamToJanus(
-    samples: Int16Array,
-    sampleRate: number,
-  ): Promise<void> {
-    // FIXED: Use 480 samples per frame as required by Janus
-    const FRAME_SIZE = 480; // 10ms frames @ 48kHz
+  // private async streamToJanus(
+  //   samples: Int16Array,
+  //   sampleRate: number,
+  // ): Promise<void> {
+  //   // FIXED: Use 480 samples per frame as required by Janus
+  //   const FRAME_SIZE = 480; // 10ms frames @ 48kHz
 
-    for (
-      let offset = 0;
-      offset + FRAME_SIZE <= samples.length;
-      offset += FRAME_SIZE
-    ) {
-      if (this.ttsAbortController?.signal.aborted) {
-        elizaLogger.log('[SttTtsPlugin] streamToJanus interrupted');
-        return;
-      }
-      const frame = new Int16Array(FRAME_SIZE);
-      frame.set(samples.subarray(offset, offset + FRAME_SIZE));
-      this.janus?.pushLocalAudio(frame, sampleRate, 1);
+  //   for (
+  //     let offset = 0;
+  //     offset + FRAME_SIZE <= samples.length;
+  //     offset += FRAME_SIZE
+  //   ) {
+  //     if (this.ttsAbortController?.signal.aborted) {
+  //       elizaLogger.log('[SttTtsPlugin] streamToJanus interrupted');
+  //       return;
+  //     }
+  //     const frame = new Int16Array(FRAME_SIZE);
+  //     frame.set(samples.subarray(offset, offset + FRAME_SIZE));
+  //     this.janus?.pushLocalAudio(frame, sampleRate, 1);
 
-      // Short pause so we don't overload
-      await new Promise((r) => setTimeout(r, 10));
-    }
-  }
+  //     // Short pause so we don't overload
+  //     await new Promise((r) => setTimeout(r, 10));
+  //   }
+  // }
 
   /**
    * Add a message (system, user or assistant) to the chat context.
