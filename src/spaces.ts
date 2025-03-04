@@ -5,7 +5,6 @@ import {
   ModelClass,
   ServiceType,
   type ITranscriptionService,
-  type TwitterSpaceDecisionOptions,
 } from '@elizaos/core';
 import type { ClientBase } from './base';
 import {
@@ -21,6 +20,7 @@ import {
 import { SttTtsPlugin } from './plugins/SttTtsSpacesPlugin.ts';
 import { SpaceParticipant } from '@flooz-link/agent-twitter-client';
 import { isEmpty, isNotEmpty } from './utils.ts';
+import { FloozTwitterSpaceDecisionOptions } from './types.ts';
 
 interface CurrentSpeakerState {
   userId: string;
@@ -129,7 +129,7 @@ export class TwitterSpaceClient {
   private activeSpeakers: CurrentSpeakerState[] = [];
   private speakerQueue: SpeakerRequest[] = [];
 
-  private decisionOptions: TwitterSpaceDecisionOptions;
+  private decisionOptions: FloozTwitterSpaceDecisionOptions;
 
   constructor(client: ClientBase, runtime: IAgentRuntime) {
     this.client = client;
@@ -192,7 +192,13 @@ export class TwitterSpaceClient {
       // 5) Wait for host acceptance with a maximum wait time (e.g., 15 seconds).
       try {
         try {
-          await this.waitForApproval(participant, sessionUUID, 15000);
+          await this.waitForApproval(
+            participant,
+            sessionUUID,
+            isNotEmpty(this.decisionOptions?.speakerApprovalWaitTime)
+              ? this.decisionOptions.speakerApprovalWaitTime
+              : 15000,
+          );
         } catch (error) {
           elizaLogger.warn(`Speaker request was not approved, error ${error}`);
           await participant.cancelSpeakerRequest();
@@ -673,7 +679,7 @@ export class TwitterSpaceClient {
   }
 
   private async removeSpeaker(userId?: string) {
-    if (!this.currentSpace) {
+    if (isEmpty(this.currentSpace)) {
       return;
     }
     if (isEmpty(userId)) {
@@ -695,11 +701,17 @@ export class TwitterSpaceClient {
    * Also update activeSpeakers array
    */
   private async kickExtraSpeakers(speakers: any[]) {
-    if (!this.currentSpace) return;
-    const ms = this.decisionOptions.maxSpeakers ?? 1;
+    if (isEmpty(this.currentSpace)) {
+      return;
+    }
+    const speakersLen = speakers?.length ?? 0;
+    if (speakersLen === 0) {
+      return;
+    }
+    const ms = this.decisionOptions?.maxSpeakers ?? 1;
 
     // sort by who joined first if needed, or just slice
-    const extras = speakers.slice(ms);
+    const extras = speakers?.slice(ms) ?? [];
     for (const sp of extras) {
       elizaLogger.log(`[Space] Removing extra speaker => userId=${sp.user_id}`);
       await this.removeSpeaker(sp.user_id);

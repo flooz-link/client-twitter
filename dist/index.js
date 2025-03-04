@@ -2971,7 +2971,6 @@ var twitterVoiceHandlerTemplate = `# Task: Generate conversational voice dialog 
 // src/plugins/SttTtsSpacesPlugin.ts
 var VOLUME_WINDOW_SIZE = 100;
 var SPEAKING_THRESHOLD = 0.05;
-var SILENCE_DETECTION_THRESHOLD_MS = 1e3;
 var SttTtsPlugin = class {
   name = "SttTtsPlugin";
   description = "Speech-to-text (OpenAI) + conversation + TTS (ElevenLabs)";
@@ -2993,6 +2992,10 @@ var SttTtsPlugin = class {
    * For ignoring near-silence frames (if amplitude < threshold)
    */
   silenceThreshold = 50;
+  /**
+   * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
+   */
+  silenceDetectionThreshold = 1e3;
   // TTS queue for sequentially speaking
   ttsQueue = [];
   isSpeaking = false;
@@ -3019,8 +3022,13 @@ var SttTtsPlugin = class {
     if (typeof (config == null ? void 0 : config.silenceThreshold) === "number") {
       this.silenceThreshold = config.silenceThreshold;
     }
-    if (config == null ? void 0 : config.voiceId) {
-      this.voiceId = config.voiceId;
+    if (typeof (config == null ? void 0 : config.silenceDetectionWindow) === "number") {
+      this.silenceDetectionThreshold = config.silenceDetectionWindow;
+    }
+    if (typeof (config == null ? void 0 : config.silenceThreshold)) {
+      if (config == null ? void 0 : config.voiceId) {
+        this.voiceId = config.voiceId;
+      }
     }
     if (config == null ? void 0 : config.elevenLabsModel) {
       this.elevenLabsModel = config.elevenLabsModel;
@@ -3064,7 +3072,7 @@ var SttTtsPlugin = class {
         this.processAudio(data.userId).catch(
           (err) => elizaLogger6.error("[SttTtsPlugin] handleSilence error =>", err)
         );
-      }, SILENCE_DETECTION_THRESHOLD_MS);
+      }, this.silenceDetectionThreshold);
     } else {
       let volumeBuffer = this.volumeBuffers.get(data.userId);
       if (!volumeBuffer) {
@@ -3133,6 +3141,7 @@ var SttTtsPlugin = class {
     }
     this.isProcessingAudio = true;
     try {
+      const start = Date.now();
       elizaLogger6.log(
         "[SttTtsPlugin] Starting audio processing for user:",
         userId
@@ -3146,6 +3155,7 @@ var SttTtsPlugin = class {
       elizaLogger6.log(
         `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`
       );
+      console.log(`PCM took: ${Date.now() - start} ms`);
       const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
       const merged = new Int16Array(totalLen);
       let offset = 0;
@@ -3154,9 +3164,11 @@ var SttTtsPlugin = class {
         offset += c.length;
       }
       const wavBuffer = await this.convertPcmToWavInMemory(merged, 48e3);
+      console.log(`Convert Wav took: ${Date.now() - start} ms`);
       const sttText = await this.transcriptionService.transcribe(wavBuffer);
+      console.log(`Transcription took: ${Date.now() - start} ms`);
       elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-      if (!sttText || !sttText.trim()) {
+      if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
         elizaLogger6.warn(
           "[SttTtsPlugin] No speech recognized for user =>",
           userId
@@ -3230,26 +3242,20 @@ var SttTtsPlugin = class {
     const numericId = userId.replace("tw-", "");
     const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
     const userUuid = stringToUuid6(`twitter-user-${numericId}`);
-    await this.runtime.ensureUserExists(
-      userUuid,
-      userId,
-      // Use full Twitter ID as username
-      `Twitter User ${numericId}`,
-      "twitter"
-    );
-    await this.runtime.ensureRoomExists(roomId);
-    await this.runtime.ensureParticipantInRoom(userUuid, roomId);
-    let state = await this.runtime.composeState(
-      {
-        agentId: this.runtime.agentId,
-        content: { text: userText, source: "twitter" },
-        userId: userUuid,
-        roomId
-      },
-      {
-        twitterUserName: this.client.profile.username,
-        agentName: this.runtime.character.name
-      }
+    const start = Date.now();
+    await Promise.all([
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId,
+        // Use full Twitter ID as username
+        `Twitter User ${numericId}`,
+        "twitter"
+      ),
+      this.runtime.ensureRoomExists(roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId)
+    ]);
+    console.log(
+      `Ensuring user, room and participant exists took ${Date.now() - start} ms`
     );
     const memory = {
       id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
@@ -3263,13 +3269,29 @@ var SttTtsPlugin = class {
       embedding: getEmbeddingZeroVector5(),
       createdAt: Date.now()
     };
+    let state = await this.runtime.composeState(
+      {
+        agentId: this.runtime.agentId,
+        content: { text: userText, source: "twitter" },
+        userId: userUuid,
+        roomId
+      },
+      {
+        twitterUserName: this.client.profile.username,
+        agentName: this.runtime.character.name
+      }
+    );
+    console.log(`Compose state took ${Date.now() - start} ms`);
     await this.runtime.messageManager.createMemory(memory);
+    console.log(`Create memory took ${Date.now() - start} ms`);
     state = await this.runtime.updateRecentMessageState(state);
+    console.log(`Recent messages state update took ${Date.now() - start} ms`);
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
       return "";
     }
     const shouldRespond = await this._shouldRespond(userText, state);
+    console.log(`should Respond took ${Date.now() - start} ms`);
     if (!shouldRespond) {
       return "";
     }
@@ -3278,6 +3300,7 @@ var SttTtsPlugin = class {
       template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate
     });
     const responseContent = await this._generateResponse(memory, context);
+    console.log(`Generating Response took ${Date.now() - start} ms`);
     const responseMemory = {
       id: stringToUuid6(`${memory.id}-voice-response-${Date.now()}`),
       agentId: this.runtime.agentId,
@@ -3321,7 +3344,9 @@ var SttTtsPlugin = class {
   async _shouldIgnore(message) {
     var _a;
     elizaLogger6.debug("message.content: ", message.content);
-    if (message.content.text.length < 3) {
+    const messageStr = (_a = message == null ? void 0 : message.content) == null ? void 0 : _a.text;
+    const messageLen = (messageStr == null ? void 0 : messageStr.length) ?? 0;
+    if (messageLen < 3) {
       return true;
     }
     const loseInterestWords = [
@@ -3346,21 +3371,19 @@ var SttTtsPlugin = class {
       "sex",
       "sexy"
     ];
-    if (message.content.text.length < 50 && loseInterestWords.some(
+    if (messageLen < 50 && loseInterestWords.some(
       (word) => {
         var _a2;
-        return (_a2 = message.content.text) == null ? void 0 : _a2.toLowerCase().includes(word);
+        return (_a2 = messageStr == null ? void 0 : messageStr.toLowerCase()) == null ? void 0 : _a2.includes(word);
       }
     )) {
       return true;
     }
     const ignoreWords = ["k", "ok", "bye", "lol", "nm", "uh"];
-    if (((_a = message.content.text) == null ? void 0 : _a.length) < 8 && ignoreWords.some(
-      (word) => {
-        var _a2;
-        return (_a2 = message.content.text) == null ? void 0 : _a2.toLowerCase().includes(word);
-      }
-    )) {
+    if ((messageStr == null ? void 0 : messageStr.length) < 8 && ignoreWords.some((word) => {
+      var _a2;
+      return (_a2 = messageStr == null ? void 0 : messageStr.toLowerCase()) == null ? void 0 : _a2.includes(word);
+    })) {
       return true;
     }
     return false;
@@ -3596,6 +3619,7 @@ var TwitterSpaceClient = class {
     };
   }
   async joinSpace(spaceId) {
+    var _a;
     this.spaceId = spaceId;
     this.isSpaceRunning = true;
     elizaLogger7.log("[Space] Joining a new Twitter Space...");
@@ -3614,7 +3638,11 @@ var TwitterSpaceClient = class {
       console.log("[TestParticipant] Requested speaker =>", sessionUUID);
       try {
         try {
-          await this.waitForApproval(participant, sessionUUID, 15e3);
+          await this.waitForApproval(
+            participant,
+            sessionUUID,
+            isNotEmpty((_a = this.decisionOptions) == null ? void 0 : _a.speakerApprovalWaitTime) ? this.decisionOptions.speakerApprovalWaitTime : 15e3
+          );
         } catch (error) {
           elizaLogger7.warn(`Speaker request was not approved, error ${error}`);
           await participant.cancelSpeakerRequest();
@@ -3997,7 +4025,7 @@ var TwitterSpaceClient = class {
     }
   }
   async removeSpeaker(userId) {
-    if (!this.currentSpace) {
+    if (isEmpty(this.currentSpace)) {
       return;
     }
     if (isEmpty(userId)) {
@@ -4018,9 +4046,16 @@ var TwitterSpaceClient = class {
    * Also update activeSpeakers array
    */
   async kickExtraSpeakers(speakers) {
-    if (!this.currentSpace) return;
-    const ms = this.decisionOptions.maxSpeakers ?? 1;
-    const extras = speakers.slice(ms);
+    var _a;
+    if (isEmpty(this.currentSpace)) {
+      return;
+    }
+    const speakersLen = (speakers == null ? void 0 : speakers.length) ?? 0;
+    if (speakersLen === 0) {
+      return;
+    }
+    const ms = ((_a = this.decisionOptions) == null ? void 0 : _a.maxSpeakers) ?? 1;
+    const extras = (speakers == null ? void 0 : speakers.slice(ms)) ?? [];
     for (const sp of extras) {
       elizaLogger7.log(`[Space] Removing extra speaker => userId=${sp.user_id}`);
       await this.removeSpeaker(sp.user_id);

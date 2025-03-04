@@ -27,6 +27,7 @@ import {
   twitterVoiceHandlerTemplate,
   twitterShouldRespondTemplate,
 } from './templates';
+import { isEmpty } from '../utils';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -35,6 +36,7 @@ interface PluginConfig {
   elevenLabsApiKey?: string; // for TTS
   sttLanguage?: string; // e.g. "en" for Whisper
   silenceThreshold?: number; // amplitude threshold for ignoring silence
+  silenceDetectionWindow?: number; // time to detect silence
   voiceId?: string; // specify which ElevenLabs voice to use
   elevenLabsModel?: string; // e.g. "eleven_monolingual_v1"
   chatContext?: Array<{
@@ -46,7 +48,6 @@ interface PluginConfig {
 
 const VOLUME_WINDOW_SIZE = 100;
 const SPEAKING_THRESHOLD = 0.05;
-const SILENCE_DETECTION_THRESHOLD_MS = 1000; // 1-second silence threshold
 
 /**
  * MVP plugin for speech-to-text (OpenAI) + conversation + TTS (ElevenLabs)
@@ -85,6 +86,11 @@ export class SttTtsPlugin implements Plugin {
    */
   private silenceThreshold = 50;
 
+  /**
+   * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
+   */
+  private silenceDetectionThreshold = 1000;
+
   // TTS queue for sequentially speaking
   private ttsQueue: string[] = [];
   private isSpeaking = false;
@@ -115,9 +121,13 @@ export class SttTtsPlugin implements Plugin {
     if (typeof config?.silenceThreshold === 'number') {
       this.silenceThreshold = config.silenceThreshold;
     }
-    if (config?.voiceId) {
-      this.voiceId = config.voiceId;
+    if (typeof config?.silenceDetectionWindow === 'number') {
+      this.silenceDetectionThreshold = config.silenceDetectionWindow;
     }
+    if (typeof config?.silenceThreshold)
+      if (config?.voiceId) {
+        this.voiceId = config.voiceId;
+      }
     if (config?.elevenLabsModel) {
       this.elevenLabsModel = config.elevenLabsModel;
     }
@@ -165,7 +175,7 @@ export class SttTtsPlugin implements Plugin {
         this.processAudio(data.userId).catch((err) =>
           elizaLogger.error('[SttTtsPlugin] handleSilence error =>', err),
         );
-      }, SILENCE_DETECTION_THRESHOLD_MS);
+      }, this.silenceDetectionThreshold);
     } else {
       // check interruption
       let volumeBuffer = this.volumeBuffers.get(data.userId);
@@ -258,6 +268,7 @@ export class SttTtsPlugin implements Plugin {
     }
     this.isProcessingAudio = true;
     try {
+      const start = Date.now();
       elizaLogger.log(
         '[SttTtsPlugin] Starting audio processing for user:',
         userId,
@@ -272,6 +283,7 @@ export class SttTtsPlugin implements Plugin {
       elizaLogger.log(
         `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`,
       );
+      console.log(`PCM took: ${Date.now() - start} ms`);
 
       const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
       const merged = new Int16Array(totalLen);
@@ -283,13 +295,16 @@ export class SttTtsPlugin implements Plugin {
 
       // Convert PCM to WAV for STT
       const wavBuffer = await this.convertPcmToWavInMemory(merged, 48000);
+      console.log(`Convert Wav took: ${Date.now() - start} ms`);
 
       // Whisper STT
       const sttText = await this.transcriptionService.transcribe(wavBuffer);
 
+      console.log(`Transcription took: ${Date.now() - start} ms`);
+
       elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
 
-      if (!sttText || !sttText.trim()) {
+      if (isEmpty(sttText?.trim())) {
         elizaLogger.warn(
           '[SttTtsPlugin] No speech recognized for user =>',
           userId,
@@ -379,28 +394,22 @@ export class SttTtsPlugin implements Plugin {
     const userUuid = stringToUuid(`twitter-user-${numericId}`);
 
     // Ensure the user exists in the accounts table
-    await this.runtime.ensureUserExists(
-      userUuid,
-      userId, // Use full Twitter ID as username
-      `Twitter User ${numericId}`,
-      'twitter',
-    );
-
     // Ensure room exists and user is in it
-    await this.runtime.ensureRoomExists(roomId);
-    await this.runtime.ensureParticipantInRoom(userUuid, roomId);
+    const start = Date.now();
 
-    let state = await this.runtime.composeState(
-      {
-        agentId: this.runtime.agentId,
-        content: { text: userText, source: 'twitter' },
-        userId: userUuid,
-        roomId,
-      },
-      {
-        twitterUserName: this.client.profile.username,
-        agentName: this.runtime.character.name,
-      },
+    await Promise.all([
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId, // Use full Twitter ID as username
+        `Twitter User ${numericId}`,
+        'twitter',
+      ),
+      this.runtime.ensureRoomExists(roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId),
+    ]);
+
+    console.log(
+      `Ensuring user, room and participant exists took ${Date.now() - start} ms`,
     );
 
     const memory = {
@@ -416,9 +425,26 @@ export class SttTtsPlugin implements Plugin {
       createdAt: Date.now(),
     };
 
+    let state = await this.runtime.composeState(
+      {
+        agentId: this.runtime.agentId,
+        content: { text: userText, source: 'twitter' },
+        userId: userUuid,
+        roomId,
+      },
+      {
+        twitterUserName: this.client.profile.username,
+        agentName: this.runtime.character.name,
+      },
+    );
+    console.log(`Compose state took ${Date.now() - start} ms`);
+
     await this.runtime.messageManager.createMemory(memory);
 
+    console.log(`Create memory took ${Date.now() - start} ms`);
+
     state = await this.runtime.updateRecentMessageState(state);
+    console.log(`Recent messages state update took ${Date.now() - start} ms`);
 
     const shouldIgnore = await this._shouldIgnore(memory);
 
@@ -427,6 +453,8 @@ export class SttTtsPlugin implements Plugin {
     }
 
     const shouldRespond = await this._shouldRespond(userText, state);
+
+    console.log(`should Respond took ${Date.now() - start} ms`);
 
     if (!shouldRespond) {
       return '';
@@ -441,6 +469,8 @@ export class SttTtsPlugin implements Plugin {
     });
 
     const responseContent = await this._generateResponse(memory, context);
+
+    console.log(`Generating Response took ${Date.now() - start} ms`);
 
     const responseMemory: Memory = {
       id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
@@ -497,7 +527,9 @@ export class SttTtsPlugin implements Plugin {
   private async _shouldIgnore(message: Memory): Promise<boolean> {
     elizaLogger.debug('message.content: ', message.content);
     // if the message is 3 characters or less, ignore it
-    if ((message.content as Content).text.length < 3) {
+    const messageStr = message?.content?.text;
+    const messageLen = messageStr?.length ?? 0;
+    if (messageLen < 3) {
       return true;
     }
 
@@ -525,9 +557,9 @@ export class SttTtsPlugin implements Plugin {
       'sexy',
     ];
     if (
-      (message.content as Content).text.length < 50 &&
+      messageLen < 50 &&
       loseInterestWords.some((word) =>
-        (message.content as Content).text?.toLowerCase().includes(word),
+        messageStr?.toLowerCase()?.includes(word),
       )
     ) {
       return true;
@@ -535,10 +567,8 @@ export class SttTtsPlugin implements Plugin {
 
     const ignoreWords = ['k', 'ok', 'bye', 'lol', 'nm', 'uh'];
     if (
-      (message.content as Content).text?.length < 8 &&
-      ignoreWords.some((word) =>
-        (message.content as Content).text?.toLowerCase().includes(word),
-      )
+      messageStr?.length < 8 &&
+      ignoreWords.some((word) => messageStr?.toLowerCase()?.includes(word))
     ) {
       return true;
     }
