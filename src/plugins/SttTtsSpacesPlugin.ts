@@ -74,6 +74,12 @@ export class SttTtsPlugin implements Plugin {
     content: string;
   }> = [];
 
+  /**
+   * Map of user IDs to promises representing ongoing processing operations
+   * Used to prevent duplicate processing for the same user while allowing
+   * concurrent processing for different users
+   */
+  private processingLocks: Map<string, Promise<void>> = new Map();
   private transcriptionService: ITranscriptionService;
 
   /**
@@ -136,6 +142,7 @@ export class SttTtsPlugin implements Plugin {
     }
 
     this.volumeBuffers = new Map<string, number[]>();
+    this.processingLocks = new Map<string, Promise<void>>();
   }
 
   /**
@@ -263,75 +270,268 @@ export class SttTtsPlugin implements Plugin {
    * On speaker silence => flush STT => GPT => TTS => push to Janus
    */
   private async processAudio(userId: string): Promise<void> {
-    if (this.isProcessingAudio) {
+    // Use non-blocking lock pattern with a Map of promises
+    if (!this.processingLocks) {
+      this.processingLocks = new Map<string, Promise<void>>();
+    }
+
+    // If already processing for this user, wait for it to complete
+    if (this.processingLocks.has(userId)) {
+      await this.processingLocks.get(userId);
       return;
     }
-    this.isProcessingAudio = true;
+
+    // Create a deferred promise to track completion
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      resolveLock = resolve;
+    });
+
+    // Set the lock
+    this.processingLocks.set(userId, lockPromise);
+
     try {
       const start = Date.now();
       elizaLogger.log(
         '[SttTtsPlugin] Starting audio processing for user:',
         userId,
       );
+
+      // Get chunks and clear only this user's buffer (more efficient)
       const chunks = this.pcmBuffers.get(userId) || [];
-      this.pcmBuffers.clear();
+      this.pcmBuffers.delete(userId); // Only delete this user's buffer instead of clearing all
 
       if (!chunks.length) {
         elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
         return;
       }
+
       elizaLogger.log(
-        `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`,
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`,
       );
-      console.log(`PCM took: ${Date.now() - start} ms`);
 
-      const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-      const merged = new Int16Array(totalLen);
-      let offset = 0;
-      for (const c of chunks) {
-        merged.set(c, offset);
-        offset += c.length;
-      }
+      // ---- Start parallel operations ----
 
-      // Convert PCM to WAV for STT
-      const wavBuffer = await this.convertPcmToWavInMemory(merged, 48000);
+      // 1. Start merging audio buffer (CPU-bound operation)
+      const mergeBufferPromise = this.mergeAudioChunks(chunks);
+
+      // 2. Do any non-dependent work here while CPU is busy with buffer merging
+      // For example, prepare any context needed for processing or clean up old resources
+      this.volumeBuffers.delete(userId);
+
+      // 3. Wait for buffer merging to complete and continue with dependent operations
+      const merged = await mergeBufferPromise;
+      console.log(`PCM merging took: ${Date.now() - start} ms`);
+
+      // 4. Start audio optimization (CPU-bound) and WAV conversion (potentially I/O bound) in parallel
+      const optimizedPcmPromise = Promise.resolve().then(() => {
+        // Run in next tick to allow other operations to proceed
+        return this.maybeDownsampleAudio(merged, 48000, 16000);
+      });
+
+      // 5. Do any non-dependent work here while waiting
+      // Perhaps prepare for TTS or update UI states
+
+      // 6. Wait for optimization to complete
+      const optimizedPcm = await optimizedPcmPromise;
+      console.log(`Audio optimization took: ${Date.now() - start} ms`);
+
+      // 7. Start WAV conversion
+      const wavBufferPromise = this.convertPcmToWavInMemory(
+        optimizedPcm,
+        optimizedPcm === merged ? 48000 : 16000,
+      );
+
+      // 8. Do any non-dependent work here while waiting for WAV conversion
+
+      // 9. Wait for WAV conversion
+      const wavBuffer = await wavBufferPromise;
       console.log(`Convert Wav took: ${Date.now() - start} ms`);
 
-      // Whisper STT
-      const sttText = await this.transcriptionService.transcribe(wavBuffer);
+      // 10. Start transcription (I/O and CPU intensive)
+      const transcriptionPromise =
+        this.transcriptionService.transcribe(wavBuffer);
 
+      // 11. Do any non-dependent work here while transcription runs
+      // This is where we could prepare TTS or update UI
+
+      // 12. Wait for transcription
+      const sttText = await transcriptionPromise;
       console.log(`Transcription took: ${Date.now() - start} ms`);
 
       elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
 
-      if (isEmpty(sttText?.trim())) {
+      if (!sttText?.trim()) {
         elizaLogger.warn(
           '[SttTtsPlugin] No speech recognized for user =>',
           userId,
         );
         return;
       }
+
       elizaLogger.log(
         `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
       );
 
-      // Get response
-      const replyText = await this.handleUserMessage(sttText, userId);
-      if (isEmpty(replyText?.trim())) {
+      // 13. Start getting the response while doing other preparations
+      const replyPromise = this.handleUserMessage(sttText, userId);
+
+      // 14. Prepare for TTS while waiting for the response
+      const ttsPreparationPromise = this.prepareTTS?.() || Promise.resolve();
+
+      // 15. Wait for both the reply and TTS preparation (if implemented)
+      const [replyText] = await Promise.all([
+        replyPromise,
+        ttsPreparationPromise,
+      ]);
+
+      if (!replyText?.trim()) {
         elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
         return;
       }
+
       elizaLogger.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
-      this.isProcessingAudio = false;
-      this.volumeBuffers.clear();
-      // Use the standard speak method with queue
+
+      // 16. Speak the reply
       await this.speakText(replyText);
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     } finally {
-      this.isProcessingAudio = false;
+      // Release the lock
+      this.processingLocks.delete(userId);
+      resolveLock();
     }
   }
+
+  /**
+   * Helper method to merge audio chunks in a non-blocking way
+   * This allows other operations to continue while CPU-intensive merging happens
+   */
+  private async mergeAudioChunks(chunks: Int16Array[]): Promise<Int16Array> {
+    return new Promise<Int16Array>((resolve) => {
+      // Use setImmediate to allow other operations to proceed
+      setImmediate(() => {
+        const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+        const merged = new Int16Array(totalLen);
+        let offset = 0;
+        for (const c of chunks) {
+          merged.set(c, offset);
+          offset += c.length;
+        }
+        resolve(merged);
+      });
+    });
+  }
+
+  /**
+   * Optional TTS preparation method - implement if needed
+   * This could pre-warm TTS systems or prepare audio output devices
+   */
+  private async prepareTTS(): Promise<void> {
+    // Implementation depends on your TTS system
+    // This is a placeholder for potential TTS preparation tasks that could run in parallel
+    return Promise.resolve();
+  }
+
+  /**
+   * Downsample audio if needed for Whisper
+   * Whisper works best with 16kHz audio
+   */
+  private maybeDownsampleAudio(
+    audio: Int16Array,
+    originalSampleRate: number,
+    targetSampleRate: number,
+  ): Int16Array {
+    // If already at target rate or downsampling not needed, return original
+    if (originalSampleRate <= targetSampleRate) {
+      return audio;
+    }
+
+    // Calculate the ratio for downsampling
+    const ratio = originalSampleRate / targetSampleRate;
+    const newLength = Math.floor(audio.length / ratio);
+    const result = new Int16Array(newLength);
+
+    // Simple downsampling by picking every Nth sample
+    // For production use, consider a proper resampling algorithm with anti-aliasing
+    for (let i = 0; i < newLength; i++) {
+      const sourceIndex = Math.floor(i * ratio);
+      result[i] = audio[sourceIndex];
+    }
+
+    return result;
+  }
+
+  // private async processAudio(userId: string): Promise<void> {
+  //   if (this.isProcessingAudio) {
+  //     return;
+  //   }
+  //   this.isProcessingAudio = true;
+  //   try {
+  //     const start = Date.now();
+  //     elizaLogger.log(
+  //       '[SttTtsPlugin] Starting audio processing for user:',
+  //       userId,
+  //     );
+  //     const chunks = this.pcmBuffers.get(userId) || [];
+  //     this.pcmBuffers.clear();
+
+  //     if (!chunks.length) {
+  //       elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
+  //       return;
+  //     }
+  //     elizaLogger.log(
+  //       `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`,
+  //     );
+  //     console.log(`PCM took: ${Date.now() - start} ms`);
+
+  //     const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
+  //     const merged = new Int16Array(totalLen);
+  //     let offset = 0;
+  //     for (const c of chunks) {
+  //       merged.set(c, offset);
+  //       offset += c.length;
+  //     }
+
+  //     // Convert PCM to WAV for STT
+  //     const wavBuffer = await this.convertPcmToWavInMemory(merged, 48000);
+  //     console.log(`Convert Wav took: ${Date.now() - start} ms`);
+
+  //     // Whisper STT
+  //     const sttText = await this.transcriptionService.transcribe(wavBuffer);
+
+  //     console.log(`Transcription took: ${Date.now() - start} ms`);
+
+  //     elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
+
+  //     if (isEmpty(sttText?.trim())) {
+  //       elizaLogger.warn(
+  //         '[SttTtsPlugin] No speech recognized for user =>',
+  //         userId,
+  //       );
+  //       return;
+  //     }
+  //     elizaLogger.log(
+  //       `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
+  //     );
+
+  //     // Get response
+  //     const replyText = await this.handleUserMessage(sttText, userId);
+  //     if (isEmpty(replyText?.trim())) {
+  //       elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
+  //       return;
+  //     }
+  //     elizaLogger.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
+  //     this.isProcessingAudio = false;
+  //     this.volumeBuffers.clear();
+  //     // Use the standard speak method with queue
+  //     await this.speakText(replyText);
+  //   } catch (error) {
+  //     elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
+  //   } finally {
+  //     this.isProcessingAudio = false;
+  //   }
+  // }
 
   /**
    * Public method to queue a TTS request
