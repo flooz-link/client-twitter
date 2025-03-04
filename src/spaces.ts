@@ -234,7 +234,8 @@ export class TwitterSpaceClient {
                   ServiceType.TRANSCRIPTION,
                 ),
               silenceThreshold: this.decisionOptions.silenceThreshold,
-              silence,
+              silenceDetectionWindow:
+                this.decisionOptions?.silenceDetectionWindow ?? 200,
             },
           });
           this.sttTtsPlugin = sttTts;

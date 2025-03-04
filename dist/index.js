@@ -3620,7 +3620,7 @@ var TwitterSpaceClient = class {
     };
   }
   async joinSpace(spaceId) {
-    var _a;
+    var _a, _b;
     this.spaceId = spaceId;
     this.isSpaceRunning = true;
     elizaLogger7.log("[Space] Joining a new Twitter Space...");
@@ -3673,7 +3673,7 @@ var TwitterSpaceClient = class {
                 ServiceType4.TRANSCRIPTION
               ),
               silenceThreshold: this.decisionOptions.silenceThreshold,
-              silence
+              silenceDetectionWindow: ((_b = this.decisionOptions) == null ? void 0 : _b.silenceDetectionWindow) ?? 200
             }
           });
           this.sttTtsPlugin = sttTts;
