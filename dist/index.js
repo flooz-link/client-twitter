@@ -3179,7 +3179,7 @@ var SttTtsPlugin = class {
         `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
       );
       const replyText = await this.handleUserMessage(sttText, userId);
-      if (!replyText || !replyText.length || !replyText.trim()) {
+      if (isEmpty(replyText == null ? void 0 : replyText.trim())) {
         elizaLogger6.warn("[SttTtsPlugin] No replyText for user =>", userId);
         return;
       }
@@ -3200,8 +3200,12 @@ var SttTtsPlugin = class {
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
+      const start = Date.now();
       this.processTtsQueue().catch((err) => {
         elizaLogger6.error("[SttTtsPlugin] processTtsQueue error =>", err);
+      }).then((res) => {
+        console.log(`Voice took ${Date.now() - start}`);
+        return res;
       });
     }
   }
@@ -3242,7 +3246,6 @@ var SttTtsPlugin = class {
     const numericId = userId.replace("tw-", "");
     const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
     const userUuid = stringToUuid6(`twitter-user-${numericId}`);
-    const start = Date.now();
     await Promise.all([
       this.runtime.ensureUserExists(
         userUuid,
@@ -3254,9 +3257,7 @@ var SttTtsPlugin = class {
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId)
     ]);
-    console.log(
-      `Ensuring user, room and participant exists took ${Date.now() - start} ms`
-    );
+    let start = Date.now();
     const memory = {
       id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
       agentId: this.runtime.agentId,
@@ -3269,32 +3270,32 @@ var SttTtsPlugin = class {
       embedding: getEmbeddingZeroVector5(),
       createdAt: Date.now()
     };
-    let state = await this.runtime.composeState(
-      {
-        agentId: this.runtime.agentId,
-        content: { text: userText, source: "twitter" },
-        userId: userUuid,
-        roomId
-      },
-      {
-        twitterUserName: this.client.profile.username,
-        agentName: this.runtime.character.name
-      }
+    let [state] = await Promise.all([
+      this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: userText, source: "twitter" },
+          userId: userUuid,
+          roomId
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name
+        }
+      ),
+      this.runtime.messageManager.createMemory(memory)
+    ]);
+    console.log(
+      `Compose state and create memory took ${Date.now() - start} ms`
     );
-    console.log(`Compose state took ${Date.now() - start} ms`);
-    await this.runtime.messageManager.createMemory(memory);
-    console.log(`Create memory took ${Date.now() - start} ms`);
+    start = Date.now();
     state = await this.runtime.updateRecentMessageState(state);
     console.log(`Recent messages state update took ${Date.now() - start} ms`);
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
       return "";
     }
-    const shouldRespond = await this._shouldRespond(userText, state);
-    console.log(`should Respond took ${Date.now() - start} ms`);
-    if (!shouldRespond) {
-      return "";
-    }
+    start = Date.now();
     const context = composeContext4({
       state,
       template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate

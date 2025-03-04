@@ -317,7 +317,7 @@ export class SttTtsPlugin implements Plugin {
 
       // Get response
       const replyText = await this.handleUserMessage(sttText, userId);
-      if (!replyText || !replyText.length || !replyText.trim()) {
+      if (isEmpty(replyText?.trim())) {
         elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
         return;
       }
@@ -340,9 +340,15 @@ export class SttTtsPlugin implements Plugin {
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
-      this.processTtsQueue().catch((err) => {
-        elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
-      });
+      const start = Date.now();
+      this.processTtsQueue()
+        .catch((err) => {
+          elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
+        })
+        .then((res) => {
+          console.log(`Voice took ${Date.now() - start}`);
+          return res;
+        });
     }
   }
 
@@ -395,7 +401,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Ensure the user exists in the accounts table
     // Ensure room exists and user is in it
-    const start = Date.now();
 
     await Promise.all([
       this.runtime.ensureUserExists(
@@ -408,9 +413,7 @@ export class SttTtsPlugin implements Plugin {
       this.runtime.ensureParticipantInRoom(userUuid, roomId),
     ]);
 
-    console.log(
-      `Ensuring user, room and participant exists took ${Date.now() - start} ms`,
-    );
+    let start = Date.now();
 
     const memory = {
       id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
@@ -425,24 +428,26 @@ export class SttTtsPlugin implements Plugin {
       createdAt: Date.now(),
     };
 
-    let state = await this.runtime.composeState(
-      {
-        agentId: this.runtime.agentId,
-        content: { text: userText, source: 'twitter' },
-        userId: userUuid,
-        roomId,
-      },
-      {
-        twitterUserName: this.client.profile.username,
-        agentName: this.runtime.character.name,
-      },
+    let [state] = await Promise.all([
+      this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: userText, source: 'twitter' },
+          userId: userUuid,
+          roomId,
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name,
+        },
+      ),
+      this.runtime.messageManager.createMemory(memory),
+    ]);
+    console.log(
+      `Compose state and create memory took ${Date.now() - start} ms`,
     );
-    console.log(`Compose state took ${Date.now() - start} ms`);
 
-    await this.runtime.messageManager.createMemory(memory);
-
-    console.log(`Create memory took ${Date.now() - start} ms`);
-
+    start = Date.now();
     state = await this.runtime.updateRecentMessageState(state);
     console.log(`Recent messages state update took ${Date.now() - start} ms`);
 
@@ -452,14 +457,15 @@ export class SttTtsPlugin implements Plugin {
       return '';
     }
 
-    const shouldRespond = await this._shouldRespond(userText, state);
+    // const shouldRespond = await this._shouldRespond(userText, state);
 
-    console.log(`should Respond took ${Date.now() - start} ms`);
+    // console.log(`should Respond took ${Date.now() - start} ms`);
 
-    if (!shouldRespond) {
-      return '';
-    }
+    // if (!shouldRespond) {
+    //   return '';
+    // }
 
+    start = Date.now();
     const context = composeContext({
       state,
       template:
