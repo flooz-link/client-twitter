@@ -1247,11 +1247,10 @@ export class SttTtsPlugin implements Plugin {
     });
 
     let fullResponse = '';
-    let buffer = '';
+    let jsonBuffer = '';
     let isJsonResponse = false;
-    let foundTextField = false;
-    let textContent = '';
-    let inTextValue = false;
+    let textValue = '';
+    let lastEmittedLength = 0;
 
     // Process each chunk as it arrives
     for await (const chunk of stream) {
@@ -1260,86 +1259,112 @@ export class SttTtsPlugin implements Plugin {
       
       fullResponse += content;
       
-      // Initial detection phase - check if this is JSON
-      if (!isJsonResponse && buffer.length < 20) {
-        buffer += content;
-        if (buffer.includes('```json') || buffer.includes('```\njson') || buffer.includes('{') || buffer.includes('```')) {
+      // Check early chunks for JSON indicators
+      if (!isJsonResponse && jsonBuffer.length < 30) {
+        jsonBuffer += content;
+        if (jsonBuffer.includes('```json') || jsonBuffer.includes('```\njson') || 
+            jsonBuffer.includes('```') || jsonBuffer.includes('{')) {
           isJsonResponse = true;
-          continue;
-        }
-        
-        // If we've collected enough and it doesn't look like JSON, emit directly
-        if (buffer.length >= 20 && !isJsonResponse) {
-          this.eventEmitter.emit('stream-chunk', buffer);
-          buffer = '';
         }
       }
       
-      // Not JSON - emit directly
+      // If it's not JSON, emit directly
       if (!isJsonResponse) {
         this.eventEmitter.emit('stream-chunk', content);
         continue;
       }
       
-      // It's JSON - continue buffering until we find the text field
-      if (!foundTextField) {
-        buffer += content;
+      // It's JSON, continue buffering
+      jsonBuffer += content;
+      
+      // Try to extract the text field value
+      try {
+        // Look for "text": pattern
+        const textMatch = /"text":\s*"([^"]*)/.exec(jsonBuffer);
         
-        // Look for the text field
-        if (buffer.includes('"text"')) {
-          foundTextField = true;
+        if (textMatch) {
+          // We found the text field
+          const capturedText = textMatch[1];
           
-          // Find the position after "text":
-          const textPos = buffer.indexOf('"text"') + 6;
+          // If we have more text than before, emit the difference
+          if (capturedText.length > textValue.length) {
+            const newText = capturedText.substring(textValue.length);
+            this.eventEmitter.emit('stream-chunk', newText);
+            textValue = capturedText;
+          }
+        }
+        
+        // Also check for a complete JSON object and parse it
+        if (jsonBuffer.includes('}') && (jsonBuffer.includes('```') || jsonBuffer.endsWith('}'))) {
+          // Try to extract the complete JSON
+          let jsonStr = jsonBuffer;
           
-          // Find the opening quote of the text value
-          let quotePos = -1;
-          for (let i = textPos; i < buffer.length; i++) {
-            if (buffer[i] === '"') {
-              quotePos = i;
-              break;
-            }
+          // Clean up markdown code block syntax if present
+          if (jsonStr.includes('```json')) {
+            jsonStr = jsonStr.replace(/```json\s*/, '').replace(/\s*```$/, '');
+          } else if (jsonStr.includes('```')) {
+            jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
           }
           
-          if (quotePos > 0) {
-            // We found the opening quote of the text value
-            inTextValue = true;
+          // Find the first { and last }
+          const firstBrace = jsonStr.indexOf('{');
+          const lastBrace = jsonStr.lastIndexOf('}');
+          
+          if (firstBrace >= 0 && lastBrace > firstBrace) {
+            const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
             
-            // Extract any text already in the buffer after the quote
-            if (quotePos + 1 < buffer.length) {
-              const initialText = buffer.substring(quotePos + 1);
-              textContent = initialText;
-              this.eventEmitter.emit('stream-chunk', initialText);
+            try {
+              const parsed = JSON.parse(jsonObject);
+              
+              // If we have a text field, emit any new content
+              if (parsed.text && parsed.text.length > textValue.length) {
+                const newText = parsed.text.substring(textValue.length);
+                this.eventEmitter.emit('stream-chunk', newText);
+                textValue = parsed.text;
+              }
+            } catch (e) {
+              // Incomplete or invalid JSON, continue buffering
             }
           }
         }
-      } else if (inTextValue) {
-        // We're inside the text value - check for closing quote
-        let endQuotePos = -1;
-        for (let i = 0; i < content.length; i++) {
-          if (content[i] === '"' && (i === 0 || content[i-1] !== '\\')) {
-            endQuotePos = i;
-            break;
-          }
-        }
-        
-        if (endQuotePos >= 0) {
-          // We found the closing quote
-          const textPart = content.substring(0, endQuotePos);
-          if (textPart) {
-            this.eventEmitter.emit('stream-chunk', textPart);
-          }
-          inTextValue = false;
-        } else {
-          // No closing quote yet, emit the whole chunk
-          this.eventEmitter.emit('stream-chunk', content);
-        }
+      } catch (e) {
+        // Error in regex or parsing, continue buffering
       }
     }
 
-    // If we buffered content but never found a text field, emit it all
-    if (buffer && !foundTextField) {
-      this.eventEmitter.emit('stream-chunk', buffer);
+    // If we never found a text field but have JSON, try one last time to parse it
+    if (isJsonResponse && jsonBuffer && !textValue) {
+      try {
+        // Clean up markdown code block syntax if present
+        let jsonStr = jsonBuffer;
+        if (jsonStr.includes('```json')) {
+          jsonStr = jsonStr.replace(/```json\s*/, '').replace(/\s*```$/, '');
+        } else if (jsonStr.includes('```')) {
+          jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
+        }
+        
+        // Find the first { and last }
+        const firstBrace = jsonStr.indexOf('{');
+        const lastBrace = jsonStr.lastIndexOf('}');
+        
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
+          const parsed = JSON.parse(jsonObject);
+          
+          if (parsed.text) {
+            this.eventEmitter.emit('stream-chunk', parsed.text);
+          } else {
+            // No text field found, emit the whole buffer as fallback
+            this.eventEmitter.emit('stream-chunk', jsonBuffer);
+          }
+        } else {
+          // No valid JSON found, emit the whole buffer as fallback
+          this.eventEmitter.emit('stream-chunk', jsonBuffer);
+        }
+      } catch (e) {
+        // Parsing failed, emit the whole buffer as fallback
+        this.eventEmitter.emit('stream-chunk', jsonBuffer);
+      }
     }
 
     // Signal stream end
