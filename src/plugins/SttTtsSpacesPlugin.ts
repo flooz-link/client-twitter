@@ -1247,6 +1247,35 @@ export class SttTtsPlugin implements Plugin {
     });
 
     let fullResponse = '';
+    let jsonStarted = false;
+    let jsonContent = '';
+    let lastParsedText = '';
+
+    // Helper function to try parsing JSON and extract text
+    const tryParseJsonAndEmit = (jsonStr: string) => {
+      try {
+        // Clean up the JSON string by removing markdown code block syntax
+        const cleanJson = jsonStr.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        
+        // Try to parse the JSON
+        const parsed = JSON.parse(cleanJson);
+        
+        // If we have a text field and it's different from what we last emitted
+        if (parsed.text && parsed.text !== lastParsedText) {
+          // Only emit the new part of the text
+          const newText = parsed.text.substring(lastParsedText.length);
+          if (newText) {
+            this.eventEmitter.emit('stream-chunk', newText);
+            lastParsedText = parsed.text;
+          }
+        }
+        
+        return true;
+      } catch (e) {
+        // JSON parsing failed, which is expected for incomplete JSON
+        return false;
+      }
+    };
 
     // Process each chunk as it arrives
     for await (const chunk of stream) {
@@ -1254,10 +1283,35 @@ export class SttTtsPlugin implements Plugin {
       if (content) {
         fullResponse += content;
         
-        // Throttle the emission of stream chunks to avoid overwhelming the TTS system
-        // This prevents sending too many tiny fragments that make speech sound unnatural
-        this.eventEmitter.emit('stream-chunk', content);
+        // Check for JSON code block start
+        if (content.includes('```json') && !jsonStarted) {
+          jsonStarted = true;
+          jsonContent = content.substring(content.indexOf('```json'));
+          continue;
+        }
+        
+        // If we're collecting JSON content
+        if (jsonStarted) {
+          jsonContent += content;
+          
+          // Check if JSON block has ended
+          if (content.includes('```') && content.lastIndexOf('```') > content.lastIndexOf('```json')) {
+            // We have a complete JSON block, try to parse it
+            tryParseJsonAndEmit(jsonContent);
+          } else {
+            // Try parsing what we have so far, it might be valid JSON already
+            tryParseJsonAndEmit(jsonContent);
+          }
+        } else {
+          // Not in JSON mode, emit directly (fallback for non-JSON responses)
+          this.eventEmitter.emit('stream-chunk', content);
+        }
       }
+    }
+
+    // Final attempt to parse any remaining JSON content
+    if (jsonStarted && jsonContent) {
+      tryParseJsonAndEmit(jsonContent);
     }
 
     // Signal stream end
