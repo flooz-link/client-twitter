@@ -878,9 +878,6 @@ export class SttTtsPlugin implements Plugin {
           this.janus?.pushLocalAudio(bufferView, sampleRate);
         } else {
           // The buffer is already the right size
-          console.log(
-            `[SttTtsPlugin] Sending audio frame: ${samples.length} samples, ${samples.buffer.byteLength} bytes`,
-          );
           this.janus?.pushLocalAudio(samples, sampleRate);
         }
 
