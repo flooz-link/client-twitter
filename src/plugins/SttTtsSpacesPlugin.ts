@@ -382,9 +382,41 @@ export class SttTtsPlugin implements Plugin {
       // 13. Start getting the response while doing other preparations
       // Set up streaming response handler
       let accumulatedText = '';
-      const minChunkSize = 20; // Minimum characters for TTS to work effectively
+      const minChunkSize = 50; // Increased minimum characters for more natural speech
       let currentChunk = '';
       let isSpeaking = false;
+      let pendingChunks: string[] = [];
+      let processingTimer: NodeJS.Timeout | null = null;
+
+      // Helper function to determine if a text chunk forms a natural break point
+      const isNaturalBreakPoint = (text: string): boolean => {
+        // Check for sentence endings or natural pauses
+        return /[.!?;:](\s|$)/.test(text) || // Sentence endings or strong pauses
+               /[,](\s|$)/.test(text) && text.length > 30; // Commas with sufficient context
+      };
+
+      // Process chunks with a slight delay to allow for more complete thoughts
+      const processQueuedChunks = async () => {
+        if (pendingChunks.length === 0) return;
+        
+        // Join pending chunks into a more natural speech unit
+        const textToSpeak = pendingChunks.join('');
+        pendingChunks = [];
+        
+        // Add slight pauses for more natural speech rhythm
+        // Replace periods and other sentence endings with a period and a pause marker
+        const textWithPauses = textToSpeak
+          .replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2')
+          .replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
+        
+        if (!isSpeaking) {
+          isSpeaking = true;
+          await this.speakText(textWithPauses);
+          isSpeaking = false;
+        } else {
+          this.ttsQueue.push(textWithPauses);
+        }
+      };
 
       // Set up event listener for streaming response chunks
       this.eventEmitter.once('stream-start', () => {
@@ -400,23 +432,23 @@ export class SttTtsPlugin implements Plugin {
         accumulatedText += chunk;
         currentChunk += chunk;
 
-        // Process chunk when it reaches minimum size or contains sentence-ending punctuation
-        if (
-          currentChunk.length >= minChunkSize ||
-          /[.!?](\s|$)/.test(currentChunk)
-        ) {
+        // Clear any existing processing timer
+        if (processingTimer) {
+          clearTimeout(processingTimer);
+          processingTimer = null;
+        }
+
+        // Process chunk when it reaches minimum size or contains natural break points
+        if (currentChunk.length >= minChunkSize || isNaturalBreakPoint(currentChunk)) {
           const chunkToProcess = currentChunk;
           currentChunk = '';
-
-          // If not already speaking, start speaking this chunk
-          if (!isSpeaking) {
-            isSpeaking = true;
-            await this.speakText(chunkToProcess);
-            isSpeaking = false;
-          } else {
-            // Queue this chunk for speaking
-            this.ttsQueue.push(chunkToProcess);
-          }
+          
+          // Add to pending chunks
+          pendingChunks.push(chunkToProcess);
+          
+          // Set a timer to process chunks, allowing more text to accumulate
+          // This creates more natural speech by processing larger, more complete thoughts
+          processingTimer = setTimeout(processQueuedChunks, 300);
         }
       });
 
@@ -424,7 +456,12 @@ export class SttTtsPlugin implements Plugin {
       this.eventEmitter.once('stream-end', () => {
         // Process any remaining text
         if (currentChunk.length > 0) {
-          this.ttsQueue.push(currentChunk);
+          pendingChunks.push(currentChunk);
+        }
+        
+        // Process any final chunks immediately
+        if (pendingChunks.length > 0) {
+          processQueuedChunks();
         }
 
         elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
@@ -1216,6 +1253,9 @@ export class SttTtsPlugin implements Plugin {
       const content = chunk.choices[0]?.delta?.content || '';
       if (content) {
         fullResponse += content;
+        
+        // Throttle the emission of stream chunks to avoid overwhelming the TTS system
+        // This prevents sending too many tiny fragments that make speech sound unnatural
         this.eventEmitter.emit('stream-chunk', content);
       }
     }
