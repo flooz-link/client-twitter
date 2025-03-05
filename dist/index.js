@@ -2875,9 +2875,7 @@ import {
   composeContext as composeContext4,
   getEmbeddingZeroVector as getEmbeddingZeroVector5,
   generateMessageResponse as generateMessageResponse3,
-  ModelClass as ModelClass4,
-  composeRandomUser,
-  generateShouldRespond as generateShouldRespond2
+  ModelClass as ModelClass4
 } from "@elizaos/core";
 
 // src/plugins/templates.ts
@@ -2970,6 +2968,8 @@ var twitterVoiceHandlerTemplate = `# Task: Generate conversational voice dialog 
 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { PassThrough } from "stream";
+import { EventEmitter as EventEmitter2 } from "events";
+import OpenAI from "openai";
 var VOLUME_WINDOW_SIZE = 100;
 var SPEAKING_THRESHOLD = 0.05;
 var SttTtsPlugin = class {
@@ -2981,6 +2981,8 @@ var SttTtsPlugin = class {
   space;
   janus;
   elevenLabsApiKey;
+  grokApiKey;
+  grokBaseUrl = "https://api.x.ai/v1";
   voiceId = "21m00Tcm4TlvDq8ikWAM";
   elevenLabsModel = "eleven_monolingual_v1";
   chatContext = [];
@@ -3010,6 +3012,7 @@ var SttTtsPlugin = class {
   userSpeakingTimer = null;
   volumeBuffers;
   ttsAbortController = null;
+  eventEmitter = new EventEmitter2();
   onAttach(_space) {
     elizaLogger6.log("[SttTtsPlugin] onAttach => space was attached");
   }
@@ -3042,6 +3045,12 @@ var SttTtsPlugin = class {
     }
     if (config == null ? void 0 : config.chatContext) {
       this.chatContext = config.chatContext;
+    }
+    if (config == null ? void 0 : config.grokApiKey) {
+      this.grokApiKey = config == null ? void 0 : config.grokApiKey;
+    }
+    if (config == null ? void 0 : config.grokBaseUrl) {
+      this.grokBaseUrl = config == null ? void 0 : config.grokBaseUrl;
     }
     this.volumeBuffers = /* @__PURE__ */ new Map();
     this.processingLocks = /* @__PURE__ */ new Map();
@@ -3154,7 +3163,6 @@ var SttTtsPlugin = class {
    * On speaker silence => flush STT => GPT => TTS => push to Janus
    */
   async processAudio(userId) {
-    var _a;
     if (!this.processingLocks) {
       this.processingLocks = /* @__PURE__ */ new Map();
     }
@@ -3186,11 +3194,7 @@ var SttTtsPlugin = class {
       this.volumeBuffers.delete(userId);
       const merged = await mergeBufferPromise;
       console.log(`PCM merging took: ${Date.now() - start} ms`);
-      const optimizedPcmPromise = Promise.resolve().then(() => {
-        return this.maybeDownsampleAudio(merged, 48e3, 16e3);
-      });
-      const optimizedPcm = await optimizedPcmPromise;
-      console.log(`Audio optimization took: ${Date.now() - start} ms`);
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
       const wavBufferPromise = this.convertPcmToWavInMemory(
         optimizedPcm,
         optimizedPcm === merged ? 48e3 : 16e3
@@ -3201,7 +3205,7 @@ var SttTtsPlugin = class {
       const sttText = await transcriptionPromise;
       console.log(`Transcription took: ${Date.now() - start} ms`);
       elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-      if (!(sttText == null ? void 0 : sttText.trim())) {
+      if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
         elizaLogger6.warn(
           "[SttTtsPlugin] No speech recognized for user =>",
           userId
@@ -3211,18 +3215,42 @@ var SttTtsPlugin = class {
       elizaLogger6.log(
         `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
       );
-      const replyPromise = this.handleUserMessage(sttText, userId);
-      const ttsPreparationPromise = ((_a = this.prepareTTS) == null ? void 0 : _a.call(this)) || Promise.resolve();
-      const [replyText] = await Promise.all([
-        replyPromise,
-        ttsPreparationPromise
-      ]);
-      if (!(replyText == null ? void 0 : replyText.trim())) {
-        elizaLogger6.warn("[SttTtsPlugin] No replyText for user =>", userId);
-        return;
-      }
-      elizaLogger6.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
-      await this.speakText(replyText);
+      let accumulatedText = "";
+      let minChunkSize = 20;
+      let currentChunk = "";
+      let isSpeaking = false;
+      this.eventEmitter.once("stream-start", () => {
+        elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
+      });
+      this.eventEmitter.on("stream-chunk", async (chunk) => {
+        if (isEmpty(chunk)) {
+          return;
+        }
+        accumulatedText += chunk;
+        currentChunk += chunk;
+        if (currentChunk.length >= minChunkSize || /[.!?](\s|$)/.test(currentChunk)) {
+          const chunkToProcess = currentChunk;
+          currentChunk = "";
+          if (!isSpeaking) {
+            isSpeaking = true;
+            await this.speakText(chunkToProcess);
+            isSpeaking = false;
+          } else {
+            this.ttsQueue.push(chunkToProcess);
+          }
+        }
+      });
+      this.eventEmitter.once("stream-end", () => {
+        if (currentChunk.length > 0) {
+          this.ttsQueue.push(currentChunk);
+        }
+        elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
+        elizaLogger6.log(`[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`);
+        this.eventEmitter.removeAllListeners("stream-chunk");
+        this.eventEmitter.removeAllListeners("stream-start");
+        this.eventEmitter.removeAllListeners("stream-end");
+      });
+      this.handleUserMessageStreaming(sttText, userId);
     } catch (error) {
       elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
     } finally {
@@ -3249,13 +3277,6 @@ var SttTtsPlugin = class {
     });
   }
   /**
-   * Optional TTS preparation method - implement if needed
-   * This could pre-warm TTS systems or prepare audio output devices
-   */
-  async prepareTTS() {
-    return Promise.resolve();
-  }
-  /**
    * Downsample audio if needed for Whisper
    * Whisper works best with 16kHz audio
    */
@@ -3272,68 +3293,6 @@ var SttTtsPlugin = class {
     }
     return result;
   }
-  // private async processAudio(userId: string): Promise<void> {
-  //   if (this.isProcessingAudio) {
-  //     return;
-  //   }
-  //   this.isProcessingAudio = true;
-  //   try {
-  //     const start = Date.now();
-  //     elizaLogger.log(
-  //       '[SttTtsPlugin] Starting audio processing for user:',
-  //       userId,
-  //     );
-  //     const chunks = this.pcmBuffers.get(userId) || [];
-  //     this.pcmBuffers.clear();
-  //     if (!chunks.length) {
-  //       elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
-  //       return;
-  //     }
-  //     elizaLogger.log(
-  //       `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`,
-  //     );
-  //     console.log(`PCM took: ${Date.now() - start} ms`);
-  //     const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-  //     const merged = new Int16Array(totalLen);
-  //     let offset = 0;
-  //     for (const c of chunks) {
-  //       merged.set(c, offset);
-  //       offset += c.length;
-  //     }
-  //     // Convert PCM to WAV for STT
-  //     const wavBuffer = await this.convertPcmToWavInMemory(merged, 48000);
-  //     console.log(`Convert Wav took: ${Date.now() - start} ms`);
-  //     // Whisper STT
-  //     const sttText = await this.transcriptionService.transcribe(wavBuffer);
-  //     console.log(`Transcription took: ${Date.now() - start} ms`);
-  //     elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-  //     if (isEmpty(sttText?.trim())) {
-  //       elizaLogger.warn(
-  //         '[SttTtsPlugin] No speech recognized for user =>',
-  //         userId,
-  //       );
-  //       return;
-  //     }
-  //     elizaLogger.log(
-  //       `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
-  //     );
-  //     // Get response
-  //     const replyText = await this.handleUserMessage(sttText, userId);
-  //     if (isEmpty(replyText?.trim())) {
-  //       elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
-  //       return;
-  //     }
-  //     elizaLogger.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
-  //     this.isProcessingAudio = false;
-  //     this.volumeBuffers.clear();
-  //     // Use the standard speak method with queue
-  //     await this.speakText(replyText);
-  //   } catch (error) {
-  //     elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
-  //   } finally {
-  //     this.isProcessingAudio = false;
-  //   }
-  // }
   /**
    * Public method to queue a TTS request
    */
@@ -3616,26 +3575,6 @@ var SttTtsPlugin = class {
       }
     });
   }
-  // /**
-  //  * Stream a single chunk of audio to Janus
-  //  * This method should be adapted to match your Janus implementation
-  //  */
-  // private async streamChunkToJanus(
-  //   samples: Int16Array,
-  //   sampleRate: number,
-  // ): Promise<void> {
-  //   // Make sure we're sending exactly the frame size Janus expects
-  //   if (samples.length !== 480) {
-  //     console.warn(
-  //       `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`,
-  //     );
-  //   }
-  //   return new Promise<void>((resolve) => {
-  //     // Send the audio chunk to Janus
-  //     this.janus?.pushLocalAudio(samples, sampleRate);
-  //     resolve();
-  //   });
-  // }
   /**
    * Modified ElevenLabs TTS function that streams the response to a writable stream
    * instead of waiting for the full response
@@ -3710,36 +3649,6 @@ var SttTtsPlugin = class {
       throw error;
     }
   }
-  /**
-   * Process the TTS queue with optimized parallelism
-   */
-  // private async processTtsQueue(): Promise<void> {
-  //   while (this.ttsQueue.length > 0) {
-  //     const text = this.ttsQueue.shift();
-  //     if (!text) continue;
-  //     this.ttsAbortController = new AbortController();
-  //     const { signal } = this.ttsAbortController;
-  //     try {
-  //       const ttsAudio = await this.elevenLabsTts(text);
-  //       const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
-  //       if (signal.aborted) {
-  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted before streaming');
-  //         return;
-  //       }
-  //       await this.streamToJanus(pcm, 48000);
-  //       if (signal.aborted) {
-  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted after streaming');
-  //         return;
-  //       }
-  //     } catch (err) {
-  //       elizaLogger.error('[SttTtsPlugin] TTS streaming error =>', err);
-  //     } finally {
-  //       // Clean up the AbortController
-  //       this.ttsAbortController = null;
-  //     }
-  //   }
-  //   this.isSpeaking = false;
-  // }
   /**
    * Handle User Message
    */
@@ -3820,8 +3729,62 @@ var SttTtsPlugin = class {
     if (reply) {
       await this.runtime.messageManager.createMemory(responseMemory);
     }
+    this.eventEmitter.emit("response", reply);
     return reply;
   }
+  /**
+   * Handle User Message with streaming support
+   */
+  async handleUserMessageStreaming(userText, userId) {
+    var _a, _b;
+    const openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl
+    });
+    const systemMessage = {
+      role: "system",
+      content: this.runtime.character.system
+    };
+    const userMessage = {
+      role: "user",
+      content: userText
+    };
+    const messages = [...this.chatContext, systemMessage, userMessage];
+    this.eventEmitter.emit("stream-start");
+    const stream = await openai.chat.completions.create({
+      model: "grok-2-latest",
+      messages,
+      stream: true
+    });
+    let fullResponse = "";
+    for await (const chunk of stream) {
+      const content = ((_b = (_a = chunk.choices[0]) == null ? void 0 : _a.delta) == null ? void 0 : _b.content) || "";
+      if (content) {
+        fullResponse += content;
+        this.eventEmitter.emit("stream-chunk", content);
+      }
+    }
+    this.eventEmitter.emit("stream-end");
+    if (fullResponse.trim()) {
+      const responseMemory = {
+        id: stringToUuid6(`${userId}-voice-response-${Date.now()}`),
+        agentId: this.runtime.agentId,
+        userId: this.runtime.agentId,
+        content: {
+          text: fullResponse,
+          source: "twitter",
+          user: this.runtime.character.name
+          // inReplyTo: userId,
+        },
+        roomId: stringToUuid6(`twitter_generate_room-${this.spaceId}`),
+        embedding: getEmbeddingZeroVector5()
+      };
+      await this.runtime.messageManager.createMemory(responseMemory);
+    }
+  }
+  /**
+   * Generate Response
+   */
   async _generateResponse(message, context) {
     const { userId, roomId } = message;
     const response = await generateMessageResponse3({
@@ -3844,6 +3807,9 @@ var SttTtsPlugin = class {
     });
     return response;
   }
+  /**
+   * Should Ignore
+   */
   async _shouldIgnore(message) {
     var _a;
     elizaLogger6.debug("message.content: ", message.content);
@@ -3891,156 +3857,6 @@ var SttTtsPlugin = class {
     }
     return false;
   }
-  async _shouldRespond(message, state) {
-    var _a, _b;
-    const lowerMessage = message.toLowerCase();
-    const characterName = this.runtime.character.name.toLowerCase();
-    if (lowerMessage.includes(characterName)) {
-      return true;
-    }
-    const shouldRespondContext = composeContext4({
-      state,
-      template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterShouldRespondTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.shouldRespondTemplate) || composeRandomUser(twitterShouldRespondTemplate2, 2)
-    });
-    const response = await generateShouldRespond2({
-      runtime: this.runtime,
-      context: shouldRespondContext,
-      modelClass: ModelClass4.SMALL
-    });
-    if (response === "RESPOND") {
-      return true;
-    }
-    if (response === "IGNORE" || response === "STOP") {
-      return false;
-    }
-    elizaLogger6.error("Invalid response from response generateText:", response);
-    return false;
-  }
-  /**
-   * ElevenLabs TTS => returns MP3 Buffer
-   */
-  async elevenLabsTts(text) {
-    if (!this.elevenLabsApiKey) {
-      throw new Error("[SttTtsPlugin] No ElevenLabs API key");
-    }
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "xi-api-key": this.elevenLabsApiKey
-      },
-      body: JSON.stringify({
-        text,
-        model_id: this.elevenLabsModel,
-        voice_settings: { stability: 0.4, similarity_boost: 0.8 }
-      })
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(
-        `[SttTtsPlugin] ElevenLabs TTS error => ${resp.status} ${errText}`
-      );
-    }
-    const arrayBuf = await resp.arrayBuffer();
-    return Buffer.from(arrayBuf);
-  }
-  /**
-   * Convert MP3 => PCM via ffmpeg with optimizations
-   */
-  // private convertMp3ToPcm(
-  //   mp3Buf: Buffer,
-  //   outRate: number,
-  // ): Promise<Int16Array> {
-  //   return new Promise((resolve, reject) => {
-  //     // Optimize ffmpeg parameters for speed
-  //     const ff = spawn('ffmpeg', [
-  //       // Input buffer settings
-  //       '-i',
-  //       'pipe:0',
-  //       // Performance optimizations
-  //       '-threads',
-  //       '4', // Use multiple threads (adjust based on your CPU)
-  //       '-loglevel',
-  //       'error', // Reduce logging overhead
-  //       '-nostdin', // Don't wait for console input
-  //       // Optimization flags
-  //       '-fflags',
-  //       '+nobuffer', // Reduce buffering
-  //       '-flags',
-  //       '+low_delay', // Prioritize low delay processing
-  //       '-probesize',
-  //       '32', // Use minimal probing (we know it's an MP3)
-  //       '-analyzeduration',
-  //       '0', // Skip lengthy analysis
-  //       // Output format settings (unchanged but grouped)
-  //       '-f',
-  //       's16le', // Output format
-  //       '-ar',
-  //       outRate.toString(), // Sample rate
-  //       '-ac',
-  //       '1', // Mono audio
-  //       'pipe:1', // Output to stdout
-  //     ]);
-  //     // Pre-allocate larger chunks to reduce Buffer.concat operations
-  //     const chunks: Buffer[] = [];
-  //     let totalLength = 0;
-  //     ff.stdout.on('data', (chunk: Buffer) => {
-  //       chunks.push(chunk);
-  //       totalLength += chunk.length;
-  //     });
-  //     ff.stderr.on('data', (data) => {
-  //       // Only log actual errors
-  //       if (data.toString().includes('Error')) {
-  //         console.error('[FFmpeg Error]', data.toString().trim());
-  //       }
-  //     });
-  //     ff.on('close', (code) => {
-  //       if (code !== 0) {
-  //         reject(new Error(`ffmpeg error code=${code}`));
-  //         return;
-  //       }
-  //       // Efficient buffer concatenation
-  //       const raw = Buffer.concat(chunks, totalLength);
-  //       // Directly create the Int16Array from buffer
-  //       // This avoids an extra copy operation
-  //       const samples = new Int16Array(
-  //         raw.buffer,
-  //         raw.byteOffset,
-  //         raw.byteLength / 2,
-  //       );
-  //       resolve(samples);
-  //     });
-  //     // Write the input buffer and end the stream in one operation
-  //     ff.stdin.end(mp3Buf);
-  //   });
-  // }
-  /**
-   * Push PCM back to Janus in small frames
-   * We'll do 10ms @48k => 480 samples per frame (not 960)
-   */
-  // private async streamToJanus(
-  //   samples: Int16Array,
-  //   sampleRate: number,
-  // ): Promise<void> {
-  //   // FIXED: Use 480 samples per frame as required by Janus
-  //   const FRAME_SIZE = 480; // 10ms frames @ 48kHz
-  //   for (
-  //     let offset = 0;
-  //     offset + FRAME_SIZE <= samples.length;
-  //     offset += FRAME_SIZE
-  //   ) {
-  //     if (this.ttsAbortController?.signal.aborted) {
-  //       elizaLogger.log('[SttTtsPlugin] streamToJanus interrupted');
-  //       return;
-  //     }
-  //     const frame = new Int16Array(FRAME_SIZE);
-  //     frame.set(samples.subarray(offset, offset + FRAME_SIZE));
-  //     this.janus?.pushLocalAudio(frame, sampleRate, 1);
-  //     // Short pause so we don't overload
-  //     await new Promise((r) => setTimeout(r, 10));
-  //   }
-  // }
   /**
    * Add a message (system, user or assistant) to the chat context.
    * E.g. to store conversation history or inject a persona.

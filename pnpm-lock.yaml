@@ -17,6 +17,9 @@ importers:
       glob:
         specifier: 11.0.0
         version: 11.0.0
+      openai:
+        specifier: ^4.86.1
+        version: 4.86.1(ws@8.18.1)(zod@3.24.2)
       whatwg-url:
         specifier: 7.1.0
         version: 7.1.0
@@ -2171,6 +2174,18 @@ packages:
 
   openai@4.82.0:
     resolution: {integrity: sha512-1bTxOVGZuVGsKKUWbh3BEwX1QxIXUftJv+9COhhGGVDTFwiaOd4gWsMynF2ewj1mg6by3/O+U8+EEHpWRdPaJg==}
+    hasBin: true
+    peerDependencies:
+      ws: ^8.18.0
+      zod: ^3.23.8
+    peerDependenciesMeta:
+      ws:
+        optional: true
+      zod:
+        optional: true
+
+  openai@4.86.1:
+    resolution: {integrity: sha512-x3iCLyaC3yegFVZaxOmrYJjitKxZ9hpVbLi+ZlT5UHuHTMlEQEbKXkGOM78z9qm2T5GF+XRUZCP2/aV4UPFPJQ==}
     hasBin: true
     peerDependencies:
       ws: ^8.18.0
@@ -5279,6 +5294,21 @@ snapshots:
       onnxruntime-common: 1.15.1
 
   openai@4.82.0(ws@8.18.1)(zod@3.24.2):
+    dependencies:
+      '@types/node': 18.19.76
+      '@types/node-fetch': 2.6.12
+      abort-controller: 3.0.0
+      agentkeepalive: 4.6.0
+      form-data-encoder: 1.7.2
+      formdata-node: 4.4.1
+      node-fetch: 2.7.0
+    optionalDependencies:
+      ws: 8.18.1
+      zod: 3.24.2
+    transitivePeerDependencies:
+      - encoding
+
+  openai@4.86.1(ws@8.18.1)(zod@3.24.2):
     dependencies:
       '@types/node': 18.19.76
       '@types/node-fetch': 2.6.12

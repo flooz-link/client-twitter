@@ -29,6 +29,8 @@ import {
 } from './templates';
 import { isEmpty } from '../utils';
 import { PassThrough } from 'stream';
+import { EventEmitter } from 'events';
+import OpenAI from 'openai';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -45,6 +47,8 @@ interface PluginConfig {
     content: string;
   }>;
   transcriptionService: ITranscriptionService;
+  grokApiKey?: string; // API key for Grok
+  grokBaseUrl?: string; // Base URL for Grok API
 }
 
 const VOLUME_WINDOW_SIZE = 100;
@@ -67,6 +71,8 @@ export class SttTtsPlugin implements Plugin {
   private janus?: JanusClient;
 
   private elevenLabsApiKey?: string;
+  private grokApiKey?: string;
+  private grokBaseUrl = 'https://api.x.ai/v1';
 
   private voiceId = '21m00Tcm4TlvDq8ikWAM';
   private elevenLabsModel = 'eleven_monolingual_v1';
@@ -107,6 +113,8 @@ export class SttTtsPlugin implements Plugin {
   private volumeBuffers: Map<string, number[]>;
   private ttsAbortController: AbortController | null = null;
 
+  private eventEmitter = new EventEmitter();
+
   onAttach(_space: Space) {
     elizaLogger.log('[SttTtsPlugin] onAttach => space was attached');
   }
@@ -140,6 +148,12 @@ export class SttTtsPlugin implements Plugin {
     }
     if (config?.chatContext) {
       this.chatContext = config.chatContext;
+    }
+    if (config?.grokApiKey) {
+      this.grokApiKey = config?.grokApiKey;
+    }
+    if (config?.grokBaseUrl) {
+      this.grokBaseUrl = config?.grokBaseUrl;
     }
 
     this.volumeBuffers = new Map<string, number[]>();
@@ -335,17 +349,7 @@ export class SttTtsPlugin implements Plugin {
       console.log(`PCM merging took: ${Date.now() - start} ms`);
 
       // 4. Start audio optimization (CPU-bound) and WAV conversion (potentially I/O bound) in parallel
-      const optimizedPcmPromise = Promise.resolve().then(() => {
-        // Run in next tick to allow other operations to proceed
-        return this.maybeDownsampleAudio(merged, 48000, 16000);
-      });
-
-      // 5. Do any non-dependent work here while waiting
-      // Perhaps prepare for TTS or update UI states
-
-      // 6. Wait for optimization to complete
-      const optimizedPcm = await optimizedPcmPromise;
-      console.log(`Audio optimization took: ${Date.now() - start} ms`);
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
       // 7. Start WAV conversion
       const wavBufferPromise = this.convertPcmToWavInMemory(
@@ -372,7 +376,7 @@ export class SttTtsPlugin implements Plugin {
 
       elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
 
-      if (!sttText?.trim()) {
+      if (isEmpty(sttText?.trim())) {
         elizaLogger.warn(
           '[SttTtsPlugin] No speech recognized for user =>',
           userId,
@@ -385,26 +389,64 @@ export class SttTtsPlugin implements Plugin {
       );
 
       // 13. Start getting the response while doing other preparations
-      const replyPromise = this.handleUserMessage(sttText, userId);
+      // Set up streaming response handler
+      let accumulatedText = '';
+      let minChunkSize = 20; // Minimum characters for TTS to work effectively
+      let currentChunk = '';
+      let isSpeaking = false;
 
-      // 14. Prepare for TTS while waiting for the response
-      const ttsPreparationPromise = this.prepareTTS?.() || Promise.resolve();
+      // Set up event listener for streaming response chunks
+      this.eventEmitter.once('stream-start', () => {
+        elizaLogger.log('[SttTtsPlugin] Stream started for user:', userId);
+      });
 
-      // 15. Wait for both the reply and TTS preparation (if implemented)
-      const [replyText] = await Promise.all([
-        replyPromise,
-        ttsPreparationPromise,
-      ]);
+      // Handle each chunk as it comes in
+      this.eventEmitter.on('stream-chunk', async (chunk: string) => {
+        if (isEmpty(chunk)) {
+          return;
+        }
+        
+        accumulatedText += chunk;
+        currentChunk += chunk;
+        
+        // Process chunk when it reaches minimum size or contains sentence-ending punctuation
+        if (currentChunk.length >= minChunkSize || 
+            /[.!?](\s|$)/.test(currentChunk)) {
+          
+          const chunkToProcess = currentChunk;
+          currentChunk = '';
+          
+          // If not already speaking, start speaking this chunk
+          if (!isSpeaking) {
+            isSpeaking = true;
+            await this.speakText(chunkToProcess);
+            isSpeaking = false;
+          } else {
+            // Queue this chunk for speaking
+            this.ttsQueue.push(chunkToProcess);
+          }
+        }
+      });
 
-      if (!replyText?.trim()) {
-        elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
-        return;
-      }
+      // Clean up when stream ends
+      this.eventEmitter.once('stream-end', () => {
+        // Process any remaining text
+        if (currentChunk.length > 0) {
+          this.ttsQueue.push(currentChunk);
+        }
+        
+        elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
+        elizaLogger.log(`[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`);
+        
+        // Remove all stream listeners to prevent memory leaks
+        this.eventEmitter.removeAllListeners('stream-chunk');
+        this.eventEmitter.removeAllListeners('stream-start');
+        this.eventEmitter.removeAllListeners('stream-end');
+      });
 
-      elizaLogger.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
+      // Start the streaming response
+      this.handleUserMessageStreaming(sttText, userId);
 
-      // 16. Speak the reply
-      await this.speakText(replyText);
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     } finally {
@@ -435,16 +477,6 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Optional TTS preparation method - implement if needed
-   * This could pre-warm TTS systems or prepare audio output devices
-   */
-  private async prepareTTS(): Promise<void> {
-    // Implementation depends on your TTS system
-    // This is a placeholder for potential TTS preparation tasks that could run in parallel
-    return Promise.resolve();
-  }
-
-  /**
    * Downsample audio if needed for Whisper
    * Whisper works best with 16kHz audio
    */
@@ -472,77 +504,6 @@ export class SttTtsPlugin implements Plugin {
 
     return result;
   }
-
-  // private async processAudio(userId: string): Promise<void> {
-  //   if (this.isProcessingAudio) {
-  //     return;
-  //   }
-  //   this.isProcessingAudio = true;
-  //   try {
-  //     const start = Date.now();
-  //     elizaLogger.log(
-  //       '[SttTtsPlugin] Starting audio processing for user:',
-  //       userId,
-  //     );
-  //     const chunks = this.pcmBuffers.get(userId) || [];
-  //     this.pcmBuffers.clear();
-
-  //     if (!chunks.length) {
-  //       elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
-  //       return;
-  //     }
-  //     elizaLogger.log(
-  //       `[SttTtsPlugin] Flushing STT buffer for user=${userId}, chunks=${chunks.length}`,
-  //     );
-  //     console.log(`PCM took: ${Date.now() - start} ms`);
-
-  //     const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-  //     const merged = new Int16Array(totalLen);
-  //     let offset = 0;
-  //     for (const c of chunks) {
-  //       merged.set(c, offset);
-  //       offset += c.length;
-  //     }
-
-  //     // Convert PCM to WAV for STT
-  //     const wavBuffer = await this.convertPcmToWavInMemory(merged, 48000);
-  //     console.log(`Convert Wav took: ${Date.now() - start} ms`);
-
-  //     // Whisper STT
-  //     const sttText = await this.transcriptionService.transcribe(wavBuffer);
-
-  //     console.log(`Transcription took: ${Date.now() - start} ms`);
-
-  //     elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-
-  //     if (isEmpty(sttText?.trim())) {
-  //       elizaLogger.warn(
-  //         '[SttTtsPlugin] No speech recognized for user =>',
-  //         userId,
-  //       );
-  //       return;
-  //     }
-  //     elizaLogger.log(
-  //       `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
-  //     );
-
-  //     // Get response
-  //     const replyText = await this.handleUserMessage(sttText, userId);
-  //     if (isEmpty(replyText?.trim())) {
-  //       elizaLogger.warn('[SttTtsPlugin] No replyText for user =>', userId);
-  //       return;
-  //     }
-  //     elizaLogger.log(`[SttTtsPlugin] user=${userId}, reply="${replyText}"`);
-  //     this.isProcessingAudio = false;
-  //     this.volumeBuffers.clear();
-  //     // Use the standard speak method with queue
-  //     await this.speakText(replyText);
-  //   } catch (error) {
-  //     elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
-  //   } finally {
-  //     this.isProcessingAudio = false;
-  //   }
-  // }
 
   /**
    * Public method to queue a TTS request
@@ -934,27 +895,6 @@ export class SttTtsPlugin implements Plugin {
     });
   }
 
-  // /**
-  //  * Stream a single chunk of audio to Janus
-  //  * This method should be adapted to match your Janus implementation
-  //  */
-  // private async streamChunkToJanus(
-  //   samples: Int16Array,
-  //   sampleRate: number,
-  // ): Promise<void> {
-  //   // Make sure we're sending exactly the frame size Janus expects
-  //   if (samples.length !== 480) {
-  //     console.warn(
-  //       `[SttTtsPlugin] Invalid frame size: ${samples.length}, expected 480`,
-  //     );
-  //   }
-
-  //   return new Promise<void>((resolve) => {
-  //     // Send the audio chunk to Janus
-  //     this.janus?.pushLocalAudio(samples, sampleRate);
-  //     resolve();
-  //   });
-  // }
   /**
    * Modified ElevenLabs TTS function that streams the response to a writable stream
    * instead of waiting for the full response
@@ -1056,39 +996,6 @@ export class SttTtsPlugin implements Plugin {
       throw error;
     }
   }
-
-  /**
-   * Process the TTS queue with optimized parallelism
-   */
-  // private async processTtsQueue(): Promise<void> {
-  //   while (this.ttsQueue.length > 0) {
-  //     const text = this.ttsQueue.shift();
-  //     if (!text) continue;
-
-  //     this.ttsAbortController = new AbortController();
-  //     const { signal } = this.ttsAbortController;
-
-  //     try {
-  //       const ttsAudio = await this.elevenLabsTts(text);
-  //       const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
-  //       if (signal.aborted) {
-  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted before streaming');
-  //         return;
-  //       }
-  //       await this.streamToJanus(pcm, 48000);
-  //       if (signal.aborted) {
-  //         elizaLogger.log('[SttTtsPlugin] TTS interrupted after streaming');
-  //         return;
-  //       }
-  //     } catch (err) {
-  //       elizaLogger.error('[SttTtsPlugin] TTS streaming error =>', err);
-  //     } finally {
-  //       // Clean up the AbortController
-  //       this.ttsAbortController = null;
-  //     }
-  //   }
-  //   this.isSpeaking = false;
-  // }
 
   /**
    * Handle User Message
@@ -1201,9 +1108,84 @@ export class SttTtsPlugin implements Plugin {
       await this.runtime.messageManager.createMemory(responseMemory);
     }
 
+    this.eventEmitter.emit('response', reply);
+
     return reply;
   }
 
+  /**
+   * Handle User Message with streaming support
+   */
+  private async handleUserMessageStreaming(
+    userText: string,
+    userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
+  ): Promise<void> {
+    // Create OpenAI client
+    const openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl,
+    });
+
+    // Create messages
+    const systemMessage = {
+      role: 'system' as const,
+      content: this.runtime.character.system,
+    };
+
+    const userMessage = {
+      role: 'user' as const,
+      content: userText,
+    };
+
+    const messages = [...this.chatContext, systemMessage, userMessage];
+
+    // Signal stream start
+    this.eventEmitter.emit('stream-start');
+
+    // Make streaming request to Grok
+    const stream = await openai.chat.completions.create({
+      model: 'grok-2-latest',
+      messages: messages,
+      stream: true,
+    });
+
+    let fullResponse = '';
+
+    // Process each chunk as it arrives
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) {
+        fullResponse += content;
+        this.eventEmitter.emit('stream-chunk', content);
+      }
+    }
+
+    // Signal stream end
+    this.eventEmitter.emit('stream-end');
+
+    // Save the complete response to memory
+    if (fullResponse.trim()) {
+      const responseMemory: Memory = {
+        id: stringToUuid(`${userId}-voice-response-${Date.now()}`),
+        agentId: this.runtime.agentId,
+        userId: this.runtime.agentId,
+        content: {
+          text: fullResponse,
+          source: 'twitter',
+          user: this.runtime.character.name,
+          // inReplyTo: userId,
+        },
+        roomId: stringToUuid(`twitter_generate_room-${this.spaceId}`),
+        embedding: getEmbeddingZeroVector(),
+      };
+
+      await this.runtime.messageManager.createMemory(responseMemory);
+    }
+  }
+
+  /**
+   * Generate Response
+   */
   private async _generateResponse(
     message: Memory,
     context: string,
@@ -1235,6 +1217,9 @@ export class SttTtsPlugin implements Plugin {
     return response;
   }
 
+  /**
+   * Should Ignore
+   */
   private async _shouldIgnore(message: Memory): Promise<boolean> {
     elizaLogger.debug('message.content: ', message.content);
     // if the message is 3 characters or less, ignore it
@@ -1286,185 +1271,6 @@ export class SttTtsPlugin implements Plugin {
 
     return false;
   }
-
-  private async _shouldRespond(
-    message: string,
-    state: State,
-  ): Promise<boolean> {
-    const lowerMessage = message.toLowerCase();
-    const characterName = this.runtime.character.name.toLowerCase();
-
-    if (lowerMessage.includes(characterName)) {
-      return true;
-    }
-
-    // If none of the above conditions are met, use the generateText to decide
-    const shouldRespondContext = composeContext({
-      state,
-      template:
-        this.runtime.character.templates?.twitterShouldRespondTemplate ||
-        this.runtime.character.templates?.shouldRespondTemplate ||
-        composeRandomUser(twitterShouldRespondTemplate, 2),
-    });
-
-    const response = await generateShouldRespond({
-      runtime: this.runtime,
-      context: shouldRespondContext,
-      modelClass: ModelClass.SMALL,
-    });
-
-    if (response === 'RESPOND') {
-      return true;
-    }
-
-    if (response === 'IGNORE' || response === 'STOP') {
-      return false;
-    }
-
-    elizaLogger.error('Invalid response from response generateText:', response);
-    return false;
-  }
-
-  /**
-   * ElevenLabs TTS => returns MP3 Buffer
-   */
-  private async elevenLabsTts(text: string): Promise<Buffer> {
-    if (!this.elevenLabsApiKey) {
-      throw new Error('[SttTtsPlugin] No ElevenLabs API key');
-    }
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'xi-api-key': this.elevenLabsApiKey,
-      },
-      body: JSON.stringify({
-        text,
-        model_id: this.elevenLabsModel,
-        voice_settings: { stability: 0.4, similarity_boost: 0.8 },
-      }),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(
-        `[SttTtsPlugin] ElevenLabs TTS error => ${resp.status} ${errText}`,
-      );
-    }
-    const arrayBuf = await resp.arrayBuffer();
-    return Buffer.from(arrayBuf);
-  }
-
-  /**
-   * Convert MP3 => PCM via ffmpeg with optimizations
-   */
-  // private convertMp3ToPcm(
-  //   mp3Buf: Buffer,
-  //   outRate: number,
-  // ): Promise<Int16Array> {
-  //   return new Promise((resolve, reject) => {
-  //     // Optimize ffmpeg parameters for speed
-  //     const ff = spawn('ffmpeg', [
-  //       // Input buffer settings
-  //       '-i',
-  //       'pipe:0',
-
-  //       // Performance optimizations
-  //       '-threads',
-  //       '4', // Use multiple threads (adjust based on your CPU)
-  //       '-loglevel',
-  //       'error', // Reduce logging overhead
-  //       '-nostdin', // Don't wait for console input
-
-  //       // Optimization flags
-  //       '-fflags',
-  //       '+nobuffer', // Reduce buffering
-  //       '-flags',
-  //       '+low_delay', // Prioritize low delay processing
-  //       '-probesize',
-  //       '32', // Use minimal probing (we know it's an MP3)
-  //       '-analyzeduration',
-  //       '0', // Skip lengthy analysis
-
-  //       // Output format settings (unchanged but grouped)
-  //       '-f',
-  //       's16le', // Output format
-  //       '-ar',
-  //       outRate.toString(), // Sample rate
-  //       '-ac',
-  //       '1', // Mono audio
-  //       'pipe:1', // Output to stdout
-  //     ]);
-
-  //     // Pre-allocate larger chunks to reduce Buffer.concat operations
-  //     const chunks: Buffer[] = [];
-  //     let totalLength = 0;
-
-  //     ff.stdout.on('data', (chunk: Buffer) => {
-  //       chunks.push(chunk);
-  //       totalLength += chunk.length;
-  //     });
-
-  //     ff.stderr.on('data', (data) => {
-  //       // Only log actual errors
-  //       if (data.toString().includes('Error')) {
-  //         console.error('[FFmpeg Error]', data.toString().trim());
-  //       }
-  //     });
-
-  //     ff.on('close', (code) => {
-  //       if (code !== 0) {
-  //         reject(new Error(`ffmpeg error code=${code}`));
-  //         return;
-  //       }
-
-  //       // Efficient buffer concatenation
-  //       const raw = Buffer.concat(chunks, totalLength);
-
-  //       // Directly create the Int16Array from buffer
-  //       // This avoids an extra copy operation
-  //       const samples = new Int16Array(
-  //         raw.buffer,
-  //         raw.byteOffset,
-  //         raw.byteLength / 2,
-  //       );
-
-  //       resolve(samples);
-  //     });
-
-  //     // Write the input buffer and end the stream in one operation
-  //     ff.stdin.end(mp3Buf);
-  //   });
-  // }
-
-  /**
-   * Push PCM back to Janus in small frames
-   * We'll do 10ms @48k => 480 samples per frame (not 960)
-   */
-  // private async streamToJanus(
-  //   samples: Int16Array,
-  //   sampleRate: number,
-  // ): Promise<void> {
-  //   // FIXED: Use 480 samples per frame as required by Janus
-  //   const FRAME_SIZE = 480; // 10ms frames @ 48kHz
-
-  //   for (
-  //     let offset = 0;
-  //     offset + FRAME_SIZE <= samples.length;
-  //     offset += FRAME_SIZE
-  //   ) {
-  //     if (this.ttsAbortController?.signal.aborted) {
-  //       elizaLogger.log('[SttTtsPlugin] streamToJanus interrupted');
-  //       return;
-  //     }
-  //     const frame = new Int16Array(FRAME_SIZE);
-  //     frame.set(samples.subarray(offset, offset + FRAME_SIZE));
-  //     this.janus?.pushLocalAudio(frame, sampleRate, 1);
-
-  //     // Short pause so we don't overload
-  //     await new Promise((r) => setTimeout(r, 10));
-  //   }
-  // }
 
   /**
    * Add a message (system, user or assistant) to the chat context.
