@@ -149,12 +149,8 @@ export class SttTtsPlugin implements Plugin {
     if (config?.chatContext) {
       this.chatContext = config.chatContext;
     }
-    if (config?.grokApiKey) {
-      this.grokApiKey = config?.grokApiKey;
-    }
-    if (config?.grokBaseUrl) {
-      this.grokBaseUrl = config?.grokBaseUrl;
-    }
+    this.grokApiKey = config?.grokApiKey ?? this.runtime.getSetting("GROK_API_KEY")
+    this.grokBaseUrl = config?.grokBaseUrl ?? this.runtime.getSetting("GROK_BASE_URL") ?? 'https://api.x.ai/v1'
 
     this.volumeBuffers = new Map<string, number[]>();
     this.processingLocks = new Map<string, Promise<void>>();
