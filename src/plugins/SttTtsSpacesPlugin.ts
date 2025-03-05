@@ -874,11 +874,6 @@ export class SttTtsPlugin implements Plugin {
             EXPECTED_SAMPLES,
           );
 
-          // Log the buffer size to verify
-          console.log(
-            `[SttTtsPlugin] Sending audio frame: ${bufferView.length} samples, ${bufferView.buffer.byteLength} bytes`,
-          );
-
           // Send the properly sized buffer to Janus
           this.janus?.pushLocalAudio(bufferView, sampleRate);
         } else {
