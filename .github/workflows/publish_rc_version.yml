@@ -1,0 +1,93 @@
+name: Publish RC package to GitHub Packages
+on:
+  push:
+    branches:
+      - 'rc_**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest 
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install PNPM
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9.15.4
+      
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20.18.1'
+          cache: 'pnpm'
+
+      - name: Setup .npmrc file
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
+          echo "@flooz-link:registry=https://npm.pkg.github.com" >> .npmrc
+      
+      - run: pnpm install
+      - run: pnpm lint
+
+  build-and-publish-rc:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for all branches and tags
+      
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9.15.4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.18.1'
+          cache: 'pnpm'
+      
+      - name: Setup .npmrc file
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
+          echo "@flooz-link:registry=https://npm.pkg.github.com" >> .npmrc
+      
+      - name: Install dependencies
+        run: pnpm install
+      
+      - name: Calculate RC version
+        id: rc-version
+        run: |
+          # Get current version from package.json
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          
+          # Get branch name
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          
+          # Count previous RC versions in this branch to determine the RC number
+          RC_COUNT=$(git tag -l "v$CURRENT_VERSION-rc.*" | wc -l)
+          RC_NUMBER=$((RC_COUNT + 1))
+          
+          # Create new RC version
+          NEW_VERSION="$CURRENT_VERSION-rc.$RC_NUMBER"
+          
+          # Update version in package.json
+          node -e "const pkg = require('./package.json'); pkg.version = '$NEW_VERSION'; fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n')"
+          
+          echo "New RC version: $NEW_VERSION"
+          echo "rc_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Build
+        run: pnpm build
+      
+      - name: Create git tag
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag -a "v${{ steps.rc-version.outputs.rc_version }}" -m "Release Candidate v${{ steps.rc-version.outputs.rc_version }}"
+          git push origin "v${{ steps.rc-version.outputs.rc_version }}"
+
+      - name: Publish RC version
+        run: pnpm publish --no-git-checks --tag rc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
