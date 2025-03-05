@@ -149,8 +149,12 @@ export class SttTtsPlugin implements Plugin {
     if (config?.chatContext) {
       this.chatContext = config.chatContext;
     }
-    this.grokApiKey = config?.grokApiKey ?? this.runtime.getSetting("GROK_API_KEY")
-    this.grokBaseUrl = config?.grokBaseUrl ?? this.runtime.getSetting("GROK_BASE_URL") ?? 'https://api.x.ai/v1'
+    this.grokApiKey =
+      config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
+    this.grokBaseUrl =
+      config?.grokBaseUrl ??
+      this.runtime.getSetting('GROK_BASE_URL') ??
+      'https://api.x.ai/v1';
 
     this.volumeBuffers = new Map<string, number[]>();
     this.processingLocks = new Map<string, Promise<void>>();
@@ -387,7 +391,7 @@ export class SttTtsPlugin implements Plugin {
       // 13. Start getting the response while doing other preparations
       // Set up streaming response handler
       let accumulatedText = '';
-      let minChunkSize = 20; // Minimum characters for TTS to work effectively
+      const minChunkSize = 20; // Minimum characters for TTS to work effectively
       let currentChunk = '';
       let isSpeaking = false;
 
@@ -401,17 +405,18 @@ export class SttTtsPlugin implements Plugin {
         if (isEmpty(chunk)) {
           return;
         }
-        
+
         accumulatedText += chunk;
         currentChunk += chunk;
-        
+
         // Process chunk when it reaches minimum size or contains sentence-ending punctuation
-        if (currentChunk.length >= minChunkSize || 
-            /[.!?](\s|$)/.test(currentChunk)) {
-          
+        if (
+          currentChunk.length >= minChunkSize ||
+          /[.!?](\s|$)/.test(currentChunk)
+        ) {
           const chunkToProcess = currentChunk;
           currentChunk = '';
-          
+
           // If not already speaking, start speaking this chunk
           if (!isSpeaking) {
             isSpeaking = true;
@@ -430,10 +435,12 @@ export class SttTtsPlugin implements Plugin {
         if (currentChunk.length > 0) {
           this.ttsQueue.push(currentChunk);
         }
-        
+
         elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
-        elizaLogger.log(`[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`);
-        
+        elizaLogger.log(
+          `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`,
+        );
+
         // Remove all stream listeners to prevent memory leaks
         this.eventEmitter.removeAllListeners('stream-chunk');
         this.eventEmitter.removeAllListeners('stream-start');
@@ -442,7 +449,6 @@ export class SttTtsPlugin implements Plugin {
 
       // Start the streaming response
       this.handleUserMessageStreaming(sttText, userId);
-
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     } finally {
