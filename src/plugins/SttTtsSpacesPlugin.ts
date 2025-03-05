@@ -352,26 +352,17 @@ export class SttTtsPlugin implements Plugin {
       const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
       // 7. Start WAV conversion
-      const wavBufferPromise = this.convertPcmToWavInMemory(
+      const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
         optimizedPcm === merged ? 48000 : 16000,
       );
 
-      // 8. Do any non-dependent work here while waiting for WAV conversion
-
-      // 9. Wait for WAV conversion
-      const wavBuffer = await wavBufferPromise;
       console.log(`Convert Wav took: ${Date.now() - start} ms`);
 
       // 10. Start transcription (I/O and CPU intensive)
-      const transcriptionPromise =
-        this.transcriptionService.transcribe(wavBuffer);
+      const sttText =
+        await this.transcriptionService.transcribe(wavBuffer);
 
-      // 11. Do any non-dependent work here while transcription runs
-      // This is where we could prepare TTS or update UI
-
-      // 12. Wait for transcription
-      const sttText = await transcriptionPromise;
       console.log(`Transcription took: ${Date.now() - start} ms`);
 
       elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
