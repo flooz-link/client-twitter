@@ -1247,131 +1247,99 @@ export class SttTtsPlugin implements Plugin {
     });
 
     let fullResponse = '';
-
-    // State machine for tracking JSON parsing
-    const stateMachine = {
-      inJsonBlock: false, // Are we inside a ```json block
-      inTextField: false, // Are we inside the "text": "..." part
-      inTextQuotes: false, // Are we inside the quotes of the text field
-      textFieldContent: '', // Accumulated text field content
-      jsonAccumulator: '', // Full JSON accumulator for debugging
-      fieldNameBuffer: '', // Buffer to detect "text" field name
-      escapeNext: false, // Handle escaped characters
-      lastEmittedLength: 0, // Track how much we've already emitted
-    };
+    let buffer = '';
+    let isJsonResponse = false;
+    let foundTextField = false;
+    let textContent = '';
+    let inTextValue = false;
 
     // Process each chunk as it arrives
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content || '';
       if (!content) continue;
-
+      
       fullResponse += content;
-
-      // Process character by character for precise state tracking
-      for (let i = 0; i < content.length; i++) {
-        const char = content[i];
-        stateMachine.jsonAccumulator += char;
-
-        // Handle start of JSON block
-        if (!stateMachine.inJsonBlock && stateMachine.jsonAccumulator.endsWith('```json')) {
-          stateMachine.inJsonBlock = true;
+      
+      // Initial detection phase - check if this is JSON
+      if (!isJsonResponse && buffer.length < 20) {
+        buffer += content;
+        if (buffer.includes('```json') || buffer.includes('```\njson') || buffer.includes('{') || buffer.includes('```')) {
+          isJsonResponse = true;
           continue;
         }
-
-        // Skip processing if we're not in a JSON block
-        if (!stateMachine.inJsonBlock) {
-          this.eventEmitter.emit('stream-chunk', char);
-          continue;
-        }
-
-        // Handle end of JSON block
-        if (stateMachine.inJsonBlock && !stateMachine.inTextQuotes &&
-            stateMachine.jsonAccumulator.endsWith('```') &&
-            !stateMachine.jsonAccumulator.endsWith('```json')) {
-          stateMachine.inJsonBlock = false;
-          stateMachine.inTextField = false;
-          stateMachine.inTextQuotes = false;
-          stateMachine.fieldNameBuffer = '';
-          continue;
-        }
-
-        // Handle escape character
-        if (char === '\\' && !stateMachine.escapeNext) {
-          stateMachine.escapeNext = true;
-          continue;
-        }
-
-        // Inside text field quotes - this is the content we want to emit
-        if (stateMachine.inTextField && stateMachine.inTextQuotes) {
-          // Handle escaped quote
-          if (stateMachine.escapeNext) {
-            if (char === '"') {
-              stateMachine.textFieldContent += char;
-            } else {
-              stateMachine.textFieldContent += '\\' + char;
-            }
-            stateMachine.escapeNext = false;
-            continue;
-          }
-
-          // End of text field quotes
-          if (char === '"') {
-            stateMachine.inTextQuotes = false;
-            continue;
-          }
-
-          // Actual text content - add to buffer
-          stateMachine.textFieldContent += char;
-
-          // Emit any new content
-          if (stateMachine.textFieldContent.length > stateMachine.lastEmittedLength) {
-            const newContent = stateMachine.textFieldContent.substring(stateMachine.lastEmittedLength);
-            this.eventEmitter.emit('stream-chunk', newContent);
-            stateMachine.lastEmittedLength = stateMachine.textFieldContent.length;
-          }
-          continue;
-        }
-
-        // Track field name to detect "text" field
-        if (stateMachine.inJsonBlock && !stateMachine.inTextField) {
-          // Reset field name buffer on whitespace outside quotes
-          if (/\s/.test(char)) {
-            stateMachine.fieldNameBuffer = '';
-            continue;
-          }
-
-          // Start of a field name
-          if (char === '"') {
-            stateMachine.fieldNameBuffer = '';
-            continue;
-          }
-
-          // Building field name
-          stateMachine.fieldNameBuffer += char;
-
-          // Check if we found the text field
-          if (stateMachine.fieldNameBuffer === 'text"') {
-            stateMachine.inTextField = true;
-            stateMachine.fieldNameBuffer = '';
-            continue;
-          }
-        }
-
-        // Looking for the start of text field value
-        if (stateMachine.inTextField && !stateMachine.inTextQuotes) {
-          if (char === '"') {
-            stateMachine.inTextQuotes = true;
-            stateMachine.textFieldContent = '';
-            stateMachine.lastEmittedLength = 0;
-          }
-          continue;
-        }
-
-        // Reset escape flag if it wasn't used
-        if (stateMachine.escapeNext) {
-          stateMachine.escapeNext = false;
+        
+        // If we've collected enough and it doesn't look like JSON, emit directly
+        if (buffer.length >= 20 && !isJsonResponse) {
+          this.eventEmitter.emit('stream-chunk', buffer);
+          buffer = '';
         }
       }
+      
+      // Not JSON - emit directly
+      if (!isJsonResponse) {
+        this.eventEmitter.emit('stream-chunk', content);
+        continue;
+      }
+      
+      // It's JSON - continue buffering until we find the text field
+      if (!foundTextField) {
+        buffer += content;
+        
+        // Look for the text field
+        if (buffer.includes('"text"')) {
+          foundTextField = true;
+          
+          // Find the position after "text":
+          const textPos = buffer.indexOf('"text"') + 6;
+          
+          // Find the opening quote of the text value
+          let quotePos = -1;
+          for (let i = textPos; i < buffer.length; i++) {
+            if (buffer[i] === '"') {
+              quotePos = i;
+              break;
+            }
+          }
+          
+          if (quotePos > 0) {
+            // We found the opening quote of the text value
+            inTextValue = true;
+            
+            // Extract any text already in the buffer after the quote
+            if (quotePos + 1 < buffer.length) {
+              const initialText = buffer.substring(quotePos + 1);
+              textContent = initialText;
+              this.eventEmitter.emit('stream-chunk', initialText);
+            }
+          }
+        }
+      } else if (inTextValue) {
+        // We're inside the text value - check for closing quote
+        let endQuotePos = -1;
+        for (let i = 0; i < content.length; i++) {
+          if (content[i] === '"' && (i === 0 || content[i-1] !== '\\')) {
+            endQuotePos = i;
+            break;
+          }
+        }
+        
+        if (endQuotePos >= 0) {
+          // We found the closing quote
+          const textPart = content.substring(0, endQuotePos);
+          if (textPart) {
+            this.eventEmitter.emit('stream-chunk', textPart);
+          }
+          inTextValue = false;
+        } else {
+          // No closing quote yet, emit the whole chunk
+          this.eventEmitter.emit('stream-chunk', content);
+        }
+      }
+    }
+
+    // If we buffered content but never found a text field, emit it all
+    if (buffer && !foundTextField) {
+      this.eventEmitter.emit('stream-chunk', buffer);
     }
 
     // Signal stream end
