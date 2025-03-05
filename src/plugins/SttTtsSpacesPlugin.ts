@@ -1105,16 +1105,91 @@ export class SttTtsPlugin implements Plugin {
     userText: string,
     userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
   ): Promise<void> {
+    // Extract the numeric ID part
+    const numericId = userId.replace('tw-', '');
+    const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
+
+    // Create consistent UUID for the user
+    const userUuid = stringToUuid(`twitter-user-${numericId}`);
+
+    // Ensure the user exists in the accounts table
+    // Ensure room exists and user is in it
+    await Promise.all([
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId, // Use full Twitter ID as username
+        `Twitter User ${numericId}`,
+        'twitter',
+      ),
+      this.runtime.ensureRoomExists(roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId),
+    ]);
+
+    let start = Date.now();
+
+    const memory = {
+      id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
+      agentId: this.runtime.agentId,
+      content: {
+        text: userText,
+        source: 'twitter',
+      },
+      userId: userUuid,
+      roomId,
+      embedding: getEmbeddingZeroVector(),
+      createdAt: Date.now(),
+    };
+
+    let [state] = await Promise.all([
+      this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: userText, source: 'twitter' },
+          userId: userUuid,
+          roomId,
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name,
+        },
+      ),
+      this.runtime.messageManager.createMemory(memory),
+    ]);
+
+    start = Date.now();
+    state = await this.runtime.updateRecentMessageState(state);
+    console.log(`Recent messages state update took ${Date.now() - start} ms`);
+
+    const shouldIgnore = await this._shouldIgnore(memory);
+    if (shouldIgnore) {
+      return;
+    }
+
+    // Compose context using the template
+    const context = composeContext({
+      state,
+      template:
+        this.runtime.character.templates?.twitterVoiceHandlerTemplate ||
+        this.runtime.character.templates?.messageHandlerTemplate ||
+        twitterVoiceHandlerTemplate,
+    });
+
+    // Log character information for debugging
+    elizaLogger.log('[SttTtsPlugin] Character info:', {
+      name: this.runtime.character.name,
+      system: this.runtime.character.system,
+    });
+
     // Create OpenAI client
     const openai = new OpenAI({
       apiKey: this.grokApiKey,
       baseURL: this.grokBaseUrl,
     });
 
-    // Create messages
+    // Create a system message that includes the full context
     const systemMessage = {
       role: 'system' as const,
-      content: this.runtime.character.system,
+      content: context,
     };
 
     const userMessage = {
@@ -1151,16 +1226,16 @@ export class SttTtsPlugin implements Plugin {
     // Save the complete response to memory
     if (fullResponse.trim()) {
       const responseMemory: Memory = {
-        id: stringToUuid(`${userId}-voice-response-${Date.now()}`),
+        id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
         agentId: this.runtime.agentId,
         userId: this.runtime.agentId,
         content: {
           text: fullResponse,
           source: 'twitter',
           user: this.runtime.character.name,
-          // inReplyTo: userId,
+          inReplyTo: memory.id,
         },
-        roomId: stringToUuid(`twitter_generate_room-${this.spaceId}`),
+        roomId,
         embedding: getEmbeddingZeroVector(),
       };
 
