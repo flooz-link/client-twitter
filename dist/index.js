@@ -2867,15 +2867,13 @@ import {
   IdleMonitorPlugin
 } from "@flooz-link/agent-twitter-client";
 
-// src/plugins/SttTtsSpacesPlugin.ts
+// src/plugins/DeepgramStreamingClient.ts
 import { spawn } from "child_process";
 import {
   elizaLogger as elizaLogger6,
   stringToUuid as stringToUuid6,
   composeContext as composeContext4,
-  getEmbeddingZeroVector as getEmbeddingZeroVector5,
-  generateMessageResponse as generateMessageResponse3,
-  ModelClass as ModelClass4
+  getEmbeddingZeroVector as getEmbeddingZeroVector5
 } from "@elizaos/core";
 
 // src/plugins/templates.ts
@@ -2994,15 +2992,15 @@ You should always respond with a short and concise message.
 **Important** 
 If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`.`;
 
-// src/plugins/SttTtsSpacesPlugin.ts
+// src/plugins/DeepgramStreamingClient.ts
 import { PassThrough } from "stream";
 import { EventEmitter as EventEmitter2 } from "events";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
-var VOLUME_WINDOW_SIZE = 100;
+import { createClient } from "@deepgram/sdk";
 var SttTtsPlugin = class {
   name = "SttTtsPlugin";
-  description = "Speech-to-text (OpenAI) + conversation + TTS (ElevenLabs)";
+  description = "Speech-to-text (Deepgram) + conversation + TTS (ElevenLabs)";
   runtime;
   client;
   spaceId;
@@ -3014,44 +3012,27 @@ var SttTtsPlugin = class {
   voiceId = "21m00Tcm4TlvDq8ikWAM";
   elevenLabsModel = "eleven_monolingual_v1";
   chatContext = [];
-  /**
-   * userId => arrayOfChunks (PCM Int16)
-   */
-  pcmBuffers = /* @__PURE__ */ new Map();
-  /**
-   * For ignoring near-silence frames (if amplitude < threshold)
-   */
-  silenceThreshold = 50;
-  /**
-   * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
-   */
-  silenceDetectionThreshold = 1e3;
-  // TTS queue for sequentially speaking
   ttsQueue = [];
   isSpeaking = false;
   isProcessingAudio = false;
-  userSpeakingTimer = null;
-  volumeBuffers;
   ttsAbortController = null;
   currentStreamId = null;
   activeStreams = /* @__PURE__ */ new Set();
   eventEmitter = new EventEmitter2();
   openai;
-  transcriptionService;
-  interruptAnalysisBuffer = new Int16Array(1024);
-  interruptBufferIndex = 0;
-  lastInterruptCheck = 0;
-  audioBuffer = [];
-  streamingInterval = null;
-  // Transcription buffer system to maintain context for 5 minutes
-  transcriptionBuffers = /* @__PURE__ */ new Map();
-  transcriptionBufferTimeout = 5 * 60 * 1e3;
-  // 5 minutes in milliseconds
+  deepgram;
+  socket;
+  // Deepgram WebSocket
+  lastSpeaker = null;
+  interruptionThreshold = 3e3;
+  // Energy threshold for detecting speech (configurable)
+  consecutiveFramesForInterruption = 5;
+  // Number of consecutive frames to confirm interruption (e.g., 5 frames of 10ms each)
+  interruptionCounter = 0;
+  // Counter for consecutive high-energy frames
   init(params) {
     var _a;
-    elizaLogger6.log(
-      "[SttTtsPlugin] init => Space fully ready. Subscribing to events."
-    );
+    elizaLogger6.log("[SttTtsPlugin] init => Space fully ready. Subscribing to events.");
     this.space = params.space;
     this.janus = (_a = this.space) == null ? void 0 : _a.janusClient;
     const config = params.pluginConfig;
@@ -3059,17 +3040,8 @@ var SttTtsPlugin = class {
     this.client = config == null ? void 0 : config.client;
     this.spaceId = config == null ? void 0 : config.spaceId;
     this.elevenLabsApiKey = config == null ? void 0 : config.elevenLabsApiKey;
-    this.transcriptionService = config.transcriptionService;
-    if (typeof (config == null ? void 0 : config.silenceThreshold) === "number") {
-      this.silenceThreshold = config.silenceThreshold;
-    }
-    if (typeof (config == null ? void 0 : config.silenceDetectionWindow) === "number") {
-      this.silenceDetectionThreshold = config.silenceDetectionWindow;
-    }
-    if (typeof (config == null ? void 0 : config.silenceThreshold)) {
-      if (config == null ? void 0 : config.voiceId) {
-        this.voiceId = config.voiceId;
-      }
+    if (config == null ? void 0 : config.voiceId) {
+      this.voiceId = config.voiceId;
     }
     if (config == null ? void 0 : config.elevenLabsModel) {
       this.elevenLabsModel = config.elevenLabsModel;
@@ -3089,7 +3061,98 @@ var SttTtsPlugin = class {
       apiKey: this.grokApiKey,
       baseURL: this.grokBaseUrl
     });
-    this.volumeBuffers = /* @__PURE__ */ new Map();
+    const deepGramApiKey = this.runtime.getSetting("DEEPGRAM_API_KEY");
+    this.deepgram = createClient(deepGramApiKey);
+    this.socket = this.deepgram.listen.live({
+      language: "en",
+      punctuate: true,
+      smart_format: true,
+      model: "nova"
+    });
+    this.socket.on("transcript", (data) => {
+      const transcript = data.channel.alternatives[0].transcript;
+      if (transcript && this.lastSpeaker) {
+        this.handleTranscription(transcript, data.is_final, this.lastSpeaker);
+      }
+    });
+    this.socket.on("error", (err) => {
+      elizaLogger6.error("[SttTtsPlugin] Deepgram WebSocket error:", err);
+    });
+    this.socket.on("close", () => {
+      elizaLogger6.log("[SttTtsPlugin] Deepgram WebSocket closed");
+    });
+  }
+  /**
+   * Called whenever we receive PCM from a speaker
+   */
+  onAudioData(data) {
+    if (this.isSpeaking) {
+      const energy = this.calculateEnergy(data.samples);
+      if (energy > this.interruptionThreshold) {
+        this.interruptionCounter++;
+        if (this.interruptionCounter >= this.consecutiveFramesForInterruption) {
+          this.stopSpeaking();
+          this.interruptionCounter = 0;
+        }
+      } else {
+        this.interruptionCounter = 0;
+      }
+    }
+    this.socket.send(data.samples.buffer);
+  }
+  calculateEnergy(samples) {
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sum += Math.abs(samples[i]);
+    }
+    return sum / samples.length;
+  }
+  /**
+   * Handle transcriptions from Deepgram
+   */
+  handleTranscription(transcript, isFinal, userId) {
+    elizaLogger6.log(`[SttTtsPlugin] Transcription (${isFinal ? "final" : "interim"}): ${transcript} for user ${userId}`);
+    if (this.isSpeaking && transcript.trim()) {
+      this.stopSpeaking();
+    }
+    if (isFinal && transcript.trim()) {
+      this.processTranscription(userId, transcript).catch(
+        (err) => elizaLogger6.error("[SttTtsPlugin] processTranscription error:", err)
+      );
+    }
+  }
+  /**
+   * Stop the bot's speech when interrupted
+   */
+  stopSpeaking() {
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
+    }
+    this.isSpeaking = false;
+    this.ttsQueue = [];
+    elizaLogger6.log("[SttTtsPlugin] Bot speech interrupted by user");
+  }
+  /**
+   * Process final transcription for response
+   */
+  async processTranscription(userId, transcript) {
+    try {
+      if (this.isProcessingAudio) {
+        elizaLogger6.log("[SttTtsPlugin] Already processing audio, skipping");
+        return;
+      }
+      this.isProcessingAudio = true;
+      this.abortPreviousStreams();
+      const streamId = uuidv4();
+      this.currentStreamId = streamId;
+      this.activeStreams.add(streamId);
+      await this.handleUserMessageStreaming(transcript, userId);
+    } catch (error) {
+      elizaLogger6.error("[SttTtsPlugin] processTranscription error:", error);
+    } finally {
+      this.isProcessingAudio = false;
+    }
   }
   /**
    * Public method to queue a TTS request
@@ -3100,95 +3163,11 @@ var SttTtsPlugin = class {
       this.isSpeaking = true;
       this.processTtsQueue().catch((err) => {
         elizaLogger6.error("[SttTtsPlugin] processTtsQueue error =>", err);
-      }).then((res) => {
-        return res;
       });
     }
   }
   /**
-   * Called whenever we receive PCM from a speaker
-   */
-  onAudioData(data) {
-    if (this.isProcessingAudio) {
-      return;
-    }
-    let maxVal = 0;
-    for (let i = 0; i < data.samples.length; i++) {
-      const val = Math.abs(data.samples[i]);
-      if (val > maxVal) maxVal = val;
-    }
-    let volumeBuffer = this.volumeBuffers.get(data.userId);
-    if (!volumeBuffer) {
-      volumeBuffer = [];
-      this.volumeBuffers.set(data.userId, volumeBuffer);
-    }
-    volumeBuffer.push(maxVal);
-    if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
-      volumeBuffer.shift();
-    }
-    const avgVolume = volumeBuffer.reduce((sum, val) => sum + val, 0) / volumeBuffer.length;
-    const variance = volumeBuffer.reduce((sum, val) => sum + Math.pow(val - avgVolume, 2), 0) / volumeBuffer.length;
-    const stdDev = Math.sqrt(variance);
-    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
-    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
-      return;
-    }
-    if (this.userSpeakingTimer) {
-      clearTimeout(this.userSpeakingTimer);
-    }
-    let arr = this.pcmBuffers.get(data.userId);
-    if (!arr) {
-      arr = [];
-      this.pcmBuffers.set(data.userId, arr);
-    }
-    arr.push(data.samples);
-    if (!this.isSpeaking) {
-      this.userSpeakingTimer = setTimeout(() => {
-        const chunks = this.pcmBuffers.get(data.userId) || [];
-        const totalAudioLength = chunks.reduce(
-          (sum, chunk) => sum + chunk.length,
-          0
-        );
-        const minSamplesToProcess = 48e3 * 0.5;
-        if (totalAudioLength < minSamplesToProcess) {
-          elizaLogger6.log(
-            "[SttTtsPlugin] Audio too short, skipping processing for user =>",
-            data.userId,
-            `(${totalAudioLength} samples)`
-          );
-          return;
-        }
-        elizaLogger6.log(
-          "[SttTtsPlugin] start processing audio for user =>",
-          data.userId
-        );
-        this.userSpeakingTimer = null;
-        this.processAudio(data.userId).catch(
-          (err) => elizaLogger6.error("[SttTtsPlugin] handleSilence error =>", err)
-        );
-      }, this.silenceDetectionThreshold);
-    } else {
-      const samples = new Int16Array(
-        data.samples.buffer,
-        data.samples.byteOffset,
-        data.samples.length / 4
-      );
-      samples.forEach((sample) => {
-        var _a;
-        this.interruptAnalysisBuffer[this.interruptBufferIndex++] = sample;
-        if (this.interruptBufferIndex >= this.interruptAnalysisBuffer.length) {
-          this.interruptBufferIndex = 0;
-          if (this.enhancedAnalyzeForInterruption(this.interruptAnalysisBuffer)) {
-            (_a = this.ttsAbortController) == null ? void 0 : _a.abort();
-            this.isSpeaking = false;
-            elizaLogger6.log("[SttTtsPlugin] Fast interruption detected");
-          }
-        }
-      });
-    }
-  }
-  /**
-   * Process the TTS queue with streaming optimizations
+   * Process the TTS queue
    */
   async processTtsQueue() {
     try {
@@ -3197,28 +3176,21 @@ var SttTtsPlugin = class {
         if (!text) continue;
         this.ttsAbortController = new AbortController();
         const { signal } = this.ttsAbortController;
-        const startTime = Date.now();
-        try {
-          await this.streamTtsToJanus(text, signal);
-          console.log(
-            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`
-          );
-          if (signal.aborted) {
-            console.log("[SttTtsPlugin] TTS streaming was interrupted");
-            return;
-          }
-        } catch (err) {
-          console.error("[SttTtsPlugin] TTS streaming error =>", err);
-        } finally {
-          this.ttsAbortController = null;
+        await this.streamTtsToJanus(text, signal);
+        if (signal.aborted) {
+          elizaLogger6.log("[SttTtsPlugin] TTS streaming was interrupted");
+          return;
         }
       }
     } catch (error) {
-      console.error("[SttTtsPlugin] Queue processing error =>", error);
+      elizaLogger6.error("[SttTtsPlugin] Queue processing error =>", error);
     } finally {
       this.isSpeaking = false;
     }
   }
+  /**
+   * Stream TTS to Janus
+   */
   async streamTtsToJanus(text, signal) {
     elizaLogger6.log(`[SttTtsPlugin] Streaming text to Janus: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`);
     if (!this.janus) {
@@ -3236,8 +3208,6 @@ var SttTtsPlugin = class {
       isInterrupted = true;
       mp3Stream.end();
     });
-    elizaLogger6.log("[SttTtsPlugin] Starting ElevenLabs streaming request");
-    const audioBuffer = [];
     const ffmpeg = spawn("ffmpeg", [
       "-i",
       "pipe:0",
@@ -3255,30 +3225,27 @@ var SttTtsPlugin = class {
       elizaLogger6.error("[SttTtsPlugin] FFMPEG process error:", err);
       isInterrupted = true;
     });
+    const audioBuffer = [];
     const processingPromise = new Promise((resolve, reject) => {
       let pcmBuffer = Buffer.alloc(0);
       ffmpeg.stdout.on("data", (chunk) => {
-        try {
-          if (isInterrupted || signal.aborted) return;
-          pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
-          const FRAME_SIZE = 480;
-          const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2));
-          if (frameCount > 0) {
-            for (let i = 0; i < frameCount; i++) {
-              const frame = new Int16Array(
-                pcmBuffer.buffer.slice(
-                  i * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
-                  (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset
-                )
-              );
-              const frameCopy = new Int16Array(FRAME_SIZE);
-              frameCopy.set(frame);
-              audioBuffer.push(frameCopy);
-            }
-            pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
+        if (isInterrupted || signal.aborted) return;
+        pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+        const FRAME_SIZE = 480;
+        const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2));
+        if (frameCount > 0) {
+          for (let i = 0; i < frameCount; i++) {
+            const frame = new Int16Array(
+              pcmBuffer.buffer.slice(
+                i * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
+                (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset
+              )
+            );
+            const frameCopy = new Int16Array(FRAME_SIZE);
+            frameCopy.set(frame);
+            audioBuffer.push(frameCopy);
           }
-        } catch (error) {
-          reject(error);
+          pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
         }
       });
       ffmpeg.stdout.on("end", () => {
@@ -3300,556 +3267,103 @@ var SttTtsPlugin = class {
         reject(err);
       });
     });
-    try {
-      const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream?optimize_streaming_latency=3`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "xi-api-key": this.elevenLabsApiKey || ""
-          },
-          body: JSON.stringify({
-            text,
-            model_id: this.elevenLabsModel,
-            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-          })
-        }
-      );
-      if (!response.ok || !response.body) {
-        throw new Error(`ElevenLabs API error: ${response.status} ${response.statusText}`);
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream?optimize_streaming_latency=3`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "xi-api-key": this.elevenLabsApiKey || ""
+        },
+        body: JSON.stringify({
+          text,
+          model_id: this.elevenLabsModel,
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        })
       }
-      const reader = response.body.getReader();
-      const readStream = async () => {
-        try {
-          while (true) {
-            if (isInterrupted || signal.aborted) break;
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              ffmpeg.stdin.write(value);
-            }
+    );
+    if (!response.ok || !response.body) {
+      throw new Error(`ElevenLabs API error: ${response.status} ${response.statusText}`);
+    }
+    const reader = response.body.getReader();
+    const readStream = async () => {
+      try {
+        while (true) {
+          if (isInterrupted || signal.aborted) break;
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            ffmpeg.stdin.write(value);
           }
-        } catch (err) {
-          elizaLogger6.error("[SttTtsPlugin] Error reading from ElevenLabs stream:", err);
-        } finally {
-          ffmpeg.stdin.end();
         }
-      };
-      readStream();
-      await Promise.race([
-        processingPromise.catch((err) => {
-          elizaLogger6.error("[SttTtsPlugin] Processing error:", err);
-        }),
-        // Also wait for a minimum buffer to build up before starting playback
-        new Promise((resolve) => {
-          const checkBuffer = () => {
-            if (audioBuffer.length > 3 || signal.aborted || isInterrupted) {
+      } catch (err) {
+        elizaLogger6.error("[SttTtsPlugin] Error reading from ElevenLabs stream:", err);
+      } finally {
+        ffmpeg.stdin.end();
+      }
+    };
+    readStream();
+    await Promise.race([
+      processingPromise.catch((err) => {
+        elizaLogger6.error("[SttTtsPlugin] Processing error:", err);
+      }),
+      new Promise((resolve) => {
+        const checkBuffer = () => {
+          if (audioBuffer.length > 3 || signal.aborted || isInterrupted) {
+            resolve();
+          } else {
+            setTimeout(checkBuffer, 10);
+          }
+        };
+        checkBuffer();
+      })
+    ]);
+    let frameIndex = 0;
+    const startTime = Date.now();
+    while ((frameIndex < audioBuffer.length || !processingComplete) && !isInterrupted && !signal.aborted) {
+      if (frameIndex >= audioBuffer.length && !processingComplete) {
+        await new Promise((resolve) => {
+          const waitForMoreFrames = () => {
+            if (frameIndex < audioBuffer.length || processingComplete || isInterrupted || signal.aborted) {
               resolve();
             } else {
-              setTimeout(checkBuffer, 10);
+              setTimeout(waitForMoreFrames, 10);
             }
           };
-          checkBuffer();
-        })
-      ]);
-      let frameIndex = 0;
-      const startTime = Date.now();
-      while ((frameIndex < audioBuffer.length || !processingComplete) && !isInterrupted && !signal.aborted) {
-        if (frameIndex >= audioBuffer.length && !processingComplete) {
-          await new Promise((resolve) => {
-            const waitForMoreFrames = () => {
-              if (frameIndex < audioBuffer.length || processingComplete || isInterrupted || signal.aborted) {
-                resolve();
-              } else {
-                setTimeout(waitForMoreFrames, 10);
-              }
-            };
-            waitForMoreFrames();
-          });
-          if (frameIndex >= audioBuffer.length || signal.aborted || isInterrupted) {
-            break;
-          }
-        }
-        const idealPlaybackTime = startTime + frameIndex * 10;
-        const currentTime = Date.now();
-        if (currentTime < idealPlaybackTime) {
-          await new Promise(
-            (r) => setTimeout(r, idealPlaybackTime - currentTime)
-          );
-        } else if (currentTime > idealPlaybackTime + 100) {
-          const framesToSkip = Math.floor(
-            (currentTime - idealPlaybackTime) / 10
-          );
-          if (framesToSkip > 0) {
-            elizaLogger6.log(
-              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`
-            );
-            frameIndex += framesToSkip;
-            continue;
-          }
-        }
-        if (frameIndex < audioBuffer.length) {
-          try {
-            const frame = audioBuffer[frameIndex];
-            if (!isInterrupted && !signal.aborted) {
-              if (this.enhancedAnalyzeForInterruption(frame)) {
-                elizaLogger6.log("[SttTtsPlugin] User interrupt detected during TTS playback");
-                isInterrupted = true;
-                break;
-              }
-              const EXPECTED_SAMPLES = 480;
-              if (frame.length !== EXPECTED_SAMPLES) {
-                const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
-                const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
-                properSizedFrame.set(frame.subarray(0, copyLength));
-                this.janus.pushLocalAudio(properSizedFrame, 48e3);
-              } else {
-                this.janus.pushLocalAudio(frame, 48e3);
-              }
-            } else {
-              break;
-            }
-          } catch (error) {
-            elizaLogger6.error("[SttTtsPlugin] Error sending audio frame:", error);
-          }
-        }
-        frameIndex++;
-      }
-      if (signal.aborted || isInterrupted) {
-        elizaLogger6.log("[SttTtsPlugin] Audio streaming was interrupted before completion");
-      } else {
-        elizaLogger6.log("[SttTtsPlugin] Audio streaming completed successfully");
-      }
-    } catch (error) {
-      elizaLogger6.error("[SttTtsPlugin] Error streaming TTS to Janus:", error);
-    }
-  }
-  /**
-   * On speaker silence => flush STT => GPT => TTS => push to Janus
-   */
-  async processAudio(userId) {
-    var _a;
-    try {
-      if (this.isProcessingAudio) {
-        elizaLogger6.log(
-          "[SttTtsPlugin] Already processing audio, skipping this request"
-        );
-        return;
-      }
-      this.isProcessingAudio = true;
-      this.abortPreviousStreams();
-      const signal = this.ttsAbortController.signal;
-      const streamId = uuidv4();
-      this.currentStreamId = streamId;
-      this.activeStreams.add(streamId);
-      elizaLogger6.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
-      const chunks = this.pcmBuffers.get(userId) || [];
-      this.pcmBuffers.delete(userId);
-      if (!chunks.length) {
-        elizaLogger6.warn("[SttTtsPlugin] No audio chunks for user =>", userId);
-        this.isProcessingAudio = false;
-        return;
-      }
-      elizaLogger6.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`
-      );
-      const mergeBufferPromise = this.mergeAudioChunks(chunks);
-      this.volumeBuffers.delete(userId);
-      const merged = await mergeBufferPromise;
-      elizaLogger6.debug(
-        `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, estimated duration=${(merged.length / 48e3).toFixed(2)}s`
-      );
-      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
-      let wavBuffer;
-      let sttText;
-      try {
-        wavBuffer = await this.convertPcmToWavInMemory(
-          optimizedPcm,
-          optimizedPcm === merged ? 48e3 : 16e3
-        );
-        const start = Date.now();
-        sttText = await this.transcriptionService.transcribe(wavBuffer);
-        console.log(`Transcription took: ${Date.now() - start} ms`);
-        elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-        if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
-          elizaLogger6.warn(
-            `[SttTtsPlugin] No speech recognized for user => ${userId}, audio buffer size: ${wavBuffer.byteLength} bytes, transcription time: ${Date.now() - start}ms`
-          );
-          this.isProcessingAudio = false;
-          return;
-        }
-        elizaLogger6.log(
-          `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
-        );
-        const now = Date.now();
-        const prevBuffer = this.transcriptionBuffers.get(userId);
-        let contextualText = sttText;
-        if (prevBuffer && now - prevBuffer.timestamp < this.transcriptionBufferTimeout) {
-          contextualText = prevBuffer.text + " " + sttText;
-          elizaLogger6.log(
-            `[SttTtsPlugin] Added context from previous transcription for user=${userId}, combined text="${contextualText.substring(0, 100)}${contextualText.length > 100 ? "..." : ""}"`
-          );
-        }
-        this.transcriptionBuffers.set(userId, {
-          text: contextualText,
-          timestamp: now
+          waitForMoreFrames();
         });
-        let accumulatedText = "";
-        let ttsBuffer = "";
-        const minTtsChunkSize = 20;
-        let isTtsProcessing = false;
-        const isNaturalBreakPoint = (text) => {
-          return /[.!?](\s|$)/.test(text) || // Strong sentence endings
-          /[;:](\s|$)/.test(text) && text.length > 40 || // Medium pauses with sufficient context
-          /[,](\s|$)/.test(text) && text.length > 80;
-        };
-        let progressiveTimeout = null;
-        const minCharactersForProgressive = 10;
-        const progressiveDelay = 200;
-        const processTtsChunk = async () => {
-          if (isTtsProcessing || ttsBuffer.length === 0) return;
-          isTtsProcessing = true;
-          try {
-            const textToProcess = ttsBuffer;
-            ttsBuffer = "";
-            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="30ms"/> ').replace(/,\s+/g, ', <break time="5ms"/> ');
-            elizaLogger6.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? "..." : ""}"`);
-            await this.streamTtsToJanus(textWithPauses, signal);
-            if (ttsBuffer.length > 0 && !signal.aborted) {
-              setTimeout(() => {
-                processTtsChunk();
-              }, 50);
-            }
-          } catch (error) {
-            elizaLogger6.error("[SttTtsPlugin] Error processing TTS chunk:", error);
-          } finally {
-            isTtsProcessing = false;
-          }
-        };
-        const manageTtsBuffer = () => {
-          if (isTtsProcessing || signal.aborted) return;
-          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
-            if (progressiveTimeout !== null) {
-              clearTimeout(progressiveTimeout);
-              progressiveTimeout = null;
-            }
-            processTtsChunk();
-          } else if (ttsBuffer.length >= minCharactersForProgressive && progressiveTimeout === null) {
-            progressiveTimeout = setTimeout(() => {
-              progressiveTimeout = null;
-              if (ttsBuffer.length > 0 && !isTtsProcessing) {
-                processTtsChunk();
-              }
-            }, progressiveDelay);
-          }
-        };
-        this.eventEmitter.once("stream-start", (startStreamId) => {
-          if (startStreamId && (!this.activeStreams.has(startStreamId) || signal.aborted)) {
-            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-start from outdated stream`);
-            return;
-          }
-          elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
-        });
-        this.eventEmitter.on("stream-chunk", (chunk, chunkStreamId) => {
-          if (!chunkStreamId || !this.activeStreams.has(chunkStreamId) || signal.aborted) {
-            elizaLogger6.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
-            return;
-          }
-          if (typeof chunk !== "string" || isEmpty(chunk)) {
-            return;
-          }
-          accumulatedText += chunk;
-          ttsBuffer += chunk;
-          manageTtsBuffer();
-        });
-        this.eventEmitter.once("stream-end", (endStreamId) => {
-          if (!endStreamId || !this.activeStreams.has(endStreamId) || signal.aborted) {
-            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
-            return;
-          }
-          this.activeStreams.delete(endStreamId);
-          if (ttsBuffer.length > 0 && !signal.aborted) {
-            processTtsChunk();
-          }
-          elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
-          elizaLogger6.log(
-            `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`
-          );
-          this.eventEmitter.removeAllListeners("stream-chunk");
-          this.eventEmitter.removeAllListeners("stream-start");
-          this.eventEmitter.removeAllListeners("stream-end");
-        });
-        await this.handleUserMessageStreaming(contextualText, userId);
-      } catch (error) {
-        if (error.name === "TranscriptionError" || ((_a = error.message) == null ? void 0 : _a.includes("transcription"))) {
-          elizaLogger6.error(`[SttTtsPlugin] Transcription error: ${error}`, {
-            userId,
-            audioBufferSize: (wavBuffer == null ? void 0 : wavBuffer.byteLength) || 0,
-            sampleRate: optimizedPcm === merged ? 48e3 : 16e3,
-            error
-          });
+      }
+      const idealPlaybackTime = startTime + frameIndex * 10;
+      const currentTime = Date.now();
+      if (currentTime < idealPlaybackTime) {
+        await new Promise((r) => setTimeout(r, idealPlaybackTime - currentTime));
+      } else if (currentTime > idealPlaybackTime + 100) {
+        const framesToSkip = Math.floor((currentTime - idealPlaybackTime) / 10);
+        if (framesToSkip > 0) {
+          elizaLogger6.log(`[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`);
+          frameIndex += framesToSkip;
+          continue;
+        }
+      }
+      if (frameIndex < audioBuffer.length) {
+        const frame = audioBuffer[frameIndex];
+        const EXPECTED_SAMPLES = 480;
+        if (frame.length !== EXPECTED_SAMPLES) {
+          const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
+          const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
+          properSizedFrame.set(frame.subarray(0, copyLength));
+          this.janus.pushLocalAudio(properSizedFrame, 48e3);
         } else {
-          elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
+          this.janus.pushLocalAudio(frame, 48e3);
         }
-      } finally {
-        this.isProcessingAudio = false;
       }
-    } catch (error) {
-      elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
-      this.isProcessingAudio = false;
+      frameIndex++;
     }
-  }
-  /**
-   * Abort any ongoing TTS and streaming processes
-   * This should be called before starting a new stream
-   */
-  abortPreviousStreams() {
-    if (this.ttsAbortController) {
-      elizaLogger6.log("[SttTtsPlugin] Aborting previous TTS stream");
-      this.ttsAbortController.abort();
+    if (signal.aborted || isInterrupted) {
+      elizaLogger6.log("[SttTtsPlugin] Audio streaming was interrupted before completion");
+    } else {
+      elizaLogger6.log("[SttTtsPlugin] Audio streaming completed successfully");
     }
-    this.ttsAbortController = new AbortController();
-    this.audioBuffer = [];
-    this.activeStreams.clear();
-    this.currentStreamId = null;
-  }
-  /**
-   * Stream a single chunk of audio to Janus
-   * Fixed to ensure exact byte length requirement is met
-   */
-  async streamChunkToJanus(samples, sampleRate) {
-    const EXPECTED_SAMPLES = 480;
-    const EXPECTED_BYTES = EXPECTED_SAMPLES * 2;
-    return new Promise((resolve, reject) => {
-      var _a, _b;
-      try {
-        if (samples.length !== EXPECTED_SAMPLES || samples.buffer.byteLength !== EXPECTED_BYTES) {
-          const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
-          const copySamples = Math.min(samples.length, EXPECTED_SAMPLES);
-          for (let i = 0; i < copySamples; i++) {
-            properSizedSamples[i] = samples[i];
-          }
-          const bufferView = new Int16Array(
-            properSizedSamples.buffer,
-            0,
-            EXPECTED_SAMPLES
-          );
-          (_a = this.janus) == null ? void 0 : _a.pushLocalAudio(bufferView, sampleRate);
-        } else {
-          (_b = this.janus) == null ? void 0 : _b.pushLocalAudio(samples, sampleRate);
-        }
-        resolve();
-      } catch (error) {
-        console.error("[SttTtsPlugin] Error sending audio to Janus:", error);
-        reject(error);
-      }
-    });
-  }
-  /**
-   * Helper method to convert audio chunk to Int16Array format required by Janus
-   */
-  convertAudioChunkToInt16(audioChunk) {
-    if (audioChunk instanceof Int16Array) {
-      return audioChunk;
-    }
-    if (audioChunk instanceof Float32Array) {
-      const int16Chunk = new Int16Array(audioChunk.length);
-      for (let i = 0; i < audioChunk.length; i++) {
-        int16Chunk[i] = Math.max(
-          -32768,
-          Math.min(32767, Math.round(audioChunk[i] * 32767))
-        );
-      }
-      return int16Chunk;
-    }
-    if (audioChunk instanceof ArrayBuffer || ArrayBuffer.isView(audioChunk)) {
-      return new Int16Array(
-        audioChunk instanceof ArrayBuffer ? audioChunk : audioChunk.buffer
-      );
-    }
-    elizaLogger6.warn(
-      "[SttTtsPlugin] Unknown audio chunk format, returning empty array"
-    );
-    return new Int16Array(0);
-  }
-  /**
-   * Downsample audio if needed for Whisper
-   * Whisper works best with 16kHz audio
-   */
-  maybeDownsampleAudio(audio, originalSampleRate, targetSampleRate) {
-    if (originalSampleRate <= targetSampleRate) {
-      return audio;
-    }
-    const ratio = originalSampleRate / targetSampleRate;
-    const newLength = Math.floor(audio.length / ratio);
-    const result = new Int16Array(newLength);
-    for (let i = 0; i < newLength; i++) {
-      const exactPos = i * ratio;
-      const lowIndex = Math.floor(exactPos);
-      const highIndex = Math.min(lowIndex + 1, audio.length - 1);
-      const fraction = exactPos - lowIndex;
-      result[i] = Math.round(
-        (1 - fraction) * audio[lowIndex] + fraction * audio[highIndex]
-      );
-    }
-    elizaLogger6.debug(
-      `[SttTtsPlugin] Downsampled audio from ${originalSampleRate}Hz to ${targetSampleRate}Hz, original length: ${audio.length}, new length: ${newLength}`
-    );
-    return this.normalizeAudioLevels(result);
-  }
-  /**
-   * Normalize audio levels to improve speech recognition
-   * This helps ensure the audio is in an optimal range for the transcription service
-   */
-  normalizeAudioLevels(audio) {
-    let maxAmplitude = 0;
-    for (let i = 0; i < audio.length; i++) {
-      const absValue = Math.abs(audio[i]);
-      if (absValue > maxAmplitude) {
-        maxAmplitude = absValue;
-      }
-    }
-    let gainFactor = 1;
-    if (maxAmplitude > 1e4) {
-      gainFactor = Math.min(3, 1e4 / Math.max(1, maxAmplitude));
-      elizaLogger6.debug(
-        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`
-      );
-      for (let i = 0; i < audio.length; i++) {
-        audio[i] = Math.max(
-          -32768,
-          Math.min(32767, Math.round(audio[i] * gainFactor))
-        );
-      }
-    }
-    elizaLogger6.debug(
-      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, scale factor: ${gainFactor.toFixed(2)}`
-    );
-    return audio;
-  }
-  /**
-   * Convert to WAV format
-   */
-  async convertPcmToWavInMemory(pcmData, sampleRate) {
-    const numChannels = 1;
-    const byteRate = sampleRate * numChannels * 2;
-    const blockAlign = numChannels * 2;
-    const dataSize = pcmData.length * 2;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-    this.writeString(view, 0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    this.writeString(view, 8, "WAVE");
-    this.writeString(view, 12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, 16, true);
-    this.writeString(view, 36, "data");
-    view.setUint32(40, dataSize, true);
-    let offset = 44;
-    for (let i = 0; i < pcmData.length; i++, offset += 2) {
-      view.setInt16(offset, pcmData[i], true);
-    }
-    elizaLogger6.debug(
-      `[SttTtsPlugin] Created WAV buffer: size=${buffer.byteLength} bytes, sample rate=${sampleRate}Hz, channels=${numChannels}, samples=${pcmData.length}, duration=${(pcmData.length / sampleRate).toFixed(2)}s`
-    );
-    return buffer;
-  }
-  /**
-   * Helper method to write a string to a DataView at a specific offset
-   */
-  writeString(view, offset, string) {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
-    }
-  }
-  /**
-   * Handle User Message
-   */
-  async handleUserMessage(userText, userId) {
-    var _a, _b, _c;
-    const numericId = userId.replace("tw-", "");
-    const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
-    const userUuid = stringToUuid6(`twitter-user-${numericId}`);
-    await Promise.all([
-      this.runtime.ensureUserExists(
-        userUuid,
-        userId,
-        // Use full Twitter ID as username
-        `Twitter User ${numericId}`,
-        "twitter"
-      ),
-      this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId)
-    ]);
-    let start = Date.now();
-    const memory = {
-      id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      content: {
-        text: userText,
-        source: "twitter"
-      },
-      userId: userUuid,
-      roomId,
-      embedding: getEmbeddingZeroVector5(),
-      createdAt: Date.now()
-    };
-    let [state] = await Promise.all([
-      this.runtime.composeState(
-        {
-          agentId: this.runtime.agentId,
-          content: { text: userText, source: "twitter" },
-          userId: userUuid,
-          roomId
-        },
-        {
-          twitterUserName: this.client.profile.username,
-          agentName: this.runtime.character.name
-        }
-      ),
-      this.runtime.messageManager.createMemory(memory)
-    ]);
-    console.log(
-      `Compose state and create memory took ${Date.now() - start} ms`
-    );
-    start = Date.now();
-    state = await this.runtime.updateRecentMessageState(state);
-    console.log(`Recent messages state update took ${Date.now() - start} ms`);
-    const shouldIgnore = await this._shouldIgnore(memory);
-    if (shouldIgnore) {
-      return "";
-    }
-    start = Date.now();
-    const context = composeContext4({
-      state,
-      template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate
-    });
-    const responseContent = await this._generateResponse(memory, context);
-    console.log(`Generating Response took ${Date.now() - start} ms`);
-    const responseMemory = {
-      id: stringToUuid6(`${memory.id}-voice-response-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      userId: this.runtime.agentId,
-      content: {
-        ...responseContent,
-        user: this.runtime.character.name,
-        inReplyTo: memory.id
-      },
-      roomId,
-      embedding: getEmbeddingZeroVector5()
-    };
-    const reply = (_c = responseMemory.content.text) == null ? void 0 : _c.trim();
-    if (reply) {
-      await this.runtime.messageManager.createMemory(responseMemory);
-    }
-    this.eventEmitter.emit("response", reply);
-    return reply;
   }
   /**
    * Handle User Message with streaming support
@@ -3869,25 +3383,19 @@ var SttTtsPlugin = class {
       this.runtime.ensureUserExists(
         userUuid,
         userId,
-        // Use full Twitter ID as username
         `Twitter User ${numericId}`,
         "twitter"
       ),
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId)
     ]).catch((error) => {
-      elizaLogger6.warn(
-        `Error when handling streaming for spaces error ${error} ignoring`
-      );
+      elizaLogger6.warn(`Error when handling streaming for spaces error ${error} ignoring`);
       return;
     });
     const memory = {
       id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
       agentId: this.runtime.agentId,
-      content: {
-        text: userText,
-        source: "twitter"
-      },
+      content: { text: userText, source: "twitter" },
       userId: userUuid,
       roomId,
       embedding: getEmbeddingZeroVector5(),
@@ -3907,10 +3415,6 @@ var SttTtsPlugin = class {
         }
       ),
       Promise.resolve()
-      // this.runtime.messageManager.createMemory(memory).catch(error => {
-      //   elizaLogger.warn(`Error when creating memories for twitter spaces ${error} ignoring`);
-      //   return;
-      // }),
     ]);
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
@@ -3920,23 +3424,9 @@ var SttTtsPlugin = class {
       state,
       template: twitterSpaceTemplate
     });
-    elizaLogger6.log("[SttTtsPlugin] Character info:", {
-      name: this.runtime.character.name,
-      system: this.runtime.character.system
-    });
-    const systemMessage = {
-      role: "system",
-      content: context
-    };
-    const userMessage = {
-      role: "user",
-      content: userText
-    };
+    const systemMessage = { role: "system", content: context };
+    const userMessage = { role: "user", content: userText };
     const messages = [...this.chatContext, systemMessage, userMessage];
-    const progressiveTimeout = null;
-    const minCharactersForProgressive = 15;
-    const progressiveDelay = 400;
-    const start = Date.now();
     if (!this.activeStreams.has(streamId) || ((_a = this.ttsAbortController) == null ? void 0 : _a.signal.aborted)) {
       elizaLogger6.log("[SttTtsPlugin] Stream was aborted before API call, cancelling");
       this.eventEmitter.emit("stream-end", streamId);
@@ -3951,7 +3441,6 @@ var SttTtsPlugin = class {
     let bufferedText = "";
     let potentialActionMarker = false;
     let detectedAction = "";
-    elizaLogger6.log("[SttTtsPlugin] Starting Grok streaming response processing");
     for await (const chunk of stream) {
       const content = ((_c = (_b = chunk.choices[0]) == null ? void 0 : _b.delta) == null ? void 0 : _c.content) || "";
       if (!content) continue;
@@ -3967,7 +3456,6 @@ var SttTtsPlugin = class {
           const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
           if (actionMatch) {
             detectedAction = actionMatch[1];
-            elizaLogger6.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
             const textBeforeAction = bufferedText.split("actionIs:")[0].trim();
             if (textBeforeAction) {
               this.eventEmitter.emit("stream-chunk", textBeforeAction, streamId);
@@ -3999,50 +3487,34 @@ var SttTtsPlugin = class {
         this.eventEmitter.emit("stream-chunk", bufferedText, streamId);
       }
     }
-    console.log(`Time took for completing LLM ${Date.now() - start}`);
     if (detectedAction) {
       elizaLogger6.log(`[SttTtsPlugin] Response contained action: ${detectedAction}`);
     }
     this.eventEmitter.emit("stream-end", streamId);
   }
   /**
-   * Generate Response
+   * Abort any ongoing TTS and streaming processes
    */
-  async _generateResponse(message, context) {
-    const { userId, roomId } = message;
-    const response = await generateMessageResponse3({
-      runtime: this.runtime,
-      context,
-      modelClass: ModelClass4.SMALL
-    });
-    response.source = "discord";
-    if (!response) {
-      elizaLogger6.error(
-        "[SttTtsPlugin] No response from generateMessageResponse"
-      );
-      return;
+  abortPreviousStreams() {
+    if (this.ttsAbortController) {
+      elizaLogger6.log("[SttTtsPlugin] Aborting previous TTS stream");
+      this.ttsAbortController.abort();
     }
-    await this.runtime.databaseAdapter.log({
-      body: { message, context, response },
-      userId,
-      roomId,
-      type: "response"
-    });
-    return response;
+    this.ttsAbortController = new AbortController();
+    this.activeStreams.clear();
+    this.currentStreamId = null;
   }
   /**
    * Should Ignore
    */
   async _shouldIgnore(message) {
     var _a;
-    elizaLogger6.debug("message.content: ", message.content);
     const messageStr = (_a = message == null ? void 0 : message.content) == null ? void 0 : _a.text;
     const messageLen = (messageStr == null ? void 0 : messageStr.length) ?? 0;
     if (messageLen < 3) {
       return true;
     }
     const loseInterestWords = [
-      // telling the bot to stop talking
       "shut up",
       "stop",
       "dont talk",
@@ -4053,7 +3525,6 @@ var SttTtsPlugin = class {
       "stfu",
       "stupid bot",
       "dumb bot",
-      // offensive words
       "fuck",
       "shit",
       "damn",
@@ -4063,12 +3534,10 @@ var SttTtsPlugin = class {
       "sex",
       "sexy"
     ];
-    if (messageLen < 50 && loseInterestWords.some(
-      (word) => {
-        var _a2;
-        return (_a2 = messageStr == null ? void 0 : messageStr.toLowerCase()) == null ? void 0 : _a2.includes(word);
-      }
-    )) {
+    if (messageLen < 50 && loseInterestWords.some((word) => {
+      var _a2;
+      return (_a2 = messageStr == null ? void 0 : messageStr.toLowerCase()) == null ? void 0 : _a2.includes(word);
+    })) {
       return true;
     }
     const ignoreWords = ["k", "ok", "bye", "lol", "nm", "uh"];
@@ -4081,55 +3550,27 @@ var SttTtsPlugin = class {
     return false;
   }
   /**
-   * Add a message (system, user or assistant) to the chat context.
-   * E.g. to store conversation history or inject a persona.
+   * Add a message to the chat context
    */
   addMessage(role, content) {
     this.chatContext.push({ role, content });
-    elizaLogger6.log(
-      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`
-    );
+    elizaLogger6.log(`[SttTtsPlugin] addMessage => role=${role}, content=${content}`);
   }
   /**
-   * Clear the chat context if needed.
+   * Clear the chat context
    */
   clearChatContext() {
     this.chatContext = [];
     elizaLogger6.log("[SttTtsPlugin] clearChatContext => done");
   }
   /**
-   * Enhanced analysis for detecting user interruptions in audio
-   * Uses a more sophisticated algorithm to detect speech onset
+   * Cleanup resources
    */
-  enhancedAnalyzeForInterruption(buffer) {
-    if (!this.isSpeaking) {
-      return false;
-    }
-    const ENERGY_THRESHOLD = 1e4;
-    const CONSECUTIVE_FRAMES_THRESHOLD = 5;
-    const FRAME_SIZE = 160;
-    let consecutiveHighEnergyFrames = 0;
-    for (let i = 0; i < buffer.length - FRAME_SIZE; i += FRAME_SIZE) {
-      let frameEnergy = 0;
-      for (let j = 0; j < FRAME_SIZE; j++) {
-        frameEnergy += Math.abs(buffer[i + j]);
-      }
-      frameEnergy = frameEnergy / FRAME_SIZE;
-      if (frameEnergy > ENERGY_THRESHOLD) {
-        consecutiveHighEnergyFrames++;
-        if (consecutiveHighEnergyFrames >= CONSECUTIVE_FRAMES_THRESHOLD) {
-          elizaLogger6.debug(
-            `[SttTtsPlugin] Interruption detected: energy=${frameEnergy}, consecutive frames=${consecutiveHighEnergyFrames}`
-          );
-          return true;
-        }
-      } else {
-        consecutiveHighEnergyFrames = 0;
-      }
-    }
-    return false;
-  }
   cleanup() {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.close();
+      elizaLogger6.log("[SttTtsPlugin] Deepgram WebSocket closed");
+    }
     if (this.ttsAbortController) {
       this.ttsAbortController.abort();
       this.ttsAbortController = null;
@@ -4137,50 +3578,7 @@ var SttTtsPlugin = class {
     this.activeStreams.clear();
     this.currentStreamId = null;
     this.eventEmitter.removeAllListeners();
-    if (this.userSpeakingTimer) {
-      clearTimeout(this.userSpeakingTimer);
-      this.userSpeakingTimer = null;
-    }
-    if (this.streamingInterval) {
-      clearInterval(this.streamingInterval);
-      this.streamingInterval = null;
-    }
-    this.pcmBuffers.clear();
-    this.volumeBuffers.clear();
-    this.audioBuffer = [];
     elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
-  }
-  async mergeAudioChunks(chunks) {
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const result = new Int16Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    let maxAmplitude = 0;
-    for (let i = 0; i < result.length; i++) {
-      const absValue = Math.abs(result[i]);
-      if (absValue > maxAmplitude) {
-        maxAmplitude = absValue;
-      }
-    }
-    elizaLogger6.debug(
-      `[SttTtsPlugin] Merged ${chunks.length} audio chunks, total samples: ${totalLength}, max amplitude: ${maxAmplitude}`
-    );
-    if (maxAmplitude < 5e3) {
-      const gainFactor = Math.min(3, 1e4 / Math.max(1, maxAmplitude));
-      elizaLogger6.debug(
-        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`
-      );
-      for (let i = 0; i < result.length; i++) {
-        result[i] = Math.max(
-          -32768,
-          Math.min(32767, Math.round(result[i] * gainFactor))
-        );
-      }
-    }
-    return result;
   }
 };
 

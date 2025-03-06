@@ -17,7 +17,8 @@ import {
   // @ts-ignore
   type SpeakerRequest,
 } from '@flooz-link/agent-twitter-client';
-import { SttTtsPlugin } from './plugins/SttTtsSpacesPlugin.ts';
+// import { SttTtsPlugin } from './plugins/SttTtsSpacesPlugin.ts';
+import { SttTtsPlugin } from './plugins/DeepgramStreamingClient.ts';
 import { SpaceParticipant } from '@flooz-link/agent-twitter-client';
 import { isEmpty, isNotEmpty } from './utils.ts';
 import { FloozTwitterSpaceDecisionOptions } from './types.ts';
