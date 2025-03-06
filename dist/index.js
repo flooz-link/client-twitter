@@ -3010,6 +3010,43 @@ var SttTtsPlugin = class {
   interruptAnalysisBuffer = new Float32Array(1024);
   interruptBufferIndex = 0;
   lastInterruptCheck = 0;
+  audioQueue = [];
+  isStreamingToJanus = false;
+  async processAudioQueue() {
+    if (this.isStreamingToJanus || this.audioQueue.length === 0) return;
+    this.isStreamingToJanus = true;
+    const sentence = this.audioQueue.shift();
+    if (sentence) {
+      await this.streamToJanus(sentence);
+    }
+    this.isStreamingToJanus = false;
+    if (this.audioQueue.length > 0) {
+      setTimeout(() => this.processAudioQueue(), 1e3);
+    }
+  }
+  streamToJanus(sentence) {
+    elizaLogger6.info("[SttTtsPlugin] Streaming to Janus:", sentence);
+    return new Promise((resolve) => setTimeout(resolve, 2e3));
+  }
+  handleSentence(sentence) {
+    this.audioQueue.push(sentence);
+    this.processAudioQueue();
+  }
+  convertInt16ToFloat32(int16Array) {
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768;
+    }
+    return float32Array;
+  }
+  addAudioChunk(userId, chunk) {
+    var _a;
+    if (!this.pcmBuffers.has(userId)) {
+      this.pcmBuffers.set(userId, []);
+    }
+    const float32Chunk = this.convertInt16ToFloat32(chunk);
+    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(float32Chunk);
+  }
   analyzeForInterruption(audio) {
     const audioLength = audio.length;
     if (audioLength < 512) return false;
@@ -3108,7 +3145,7 @@ var SttTtsPlugin = class {
       arr = [];
       this.pcmBuffers.set(data.userId, arr);
     }
-    arr.push(data.samples);
+    arr.push(this.convertInt16ToFloat32(data.samples));
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
         const chunks = this.pcmBuffers.get(data.userId) || [];
@@ -3149,52 +3186,6 @@ var SttTtsPlugin = class {
           }
         }
       });
-    }
-  }
-  /**
-   * Add audio chunk for a user
-   */
-  addAudioChunk(userId, chunk) {
-    var _a;
-    if (!this.pcmBuffers.has(userId)) {
-      this.pcmBuffers.set(userId, []);
-    }
-    const float32Chunk = new Float32Array(chunk.length);
-    for (let i = 0; i < chunk.length; i++) {
-      float32Chunk[i] = chunk[i] / 32768;
-    }
-    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(float32Chunk);
-  }
-  // /src/sttTtsPlugin.ts
-  async convertPcmToWavInMemory(pcmData, sampleRate) {
-    const numChannels = 1;
-    const byteRate = sampleRate * numChannels * 2;
-    const blockAlign = numChannels * 2;
-    const dataSize = pcmData.length * 2;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-    this.writeString(view, 0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    this.writeString(view, 8, "WAVE");
-    this.writeString(view, 12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, 16, true);
-    this.writeString(view, 36, "data");
-    view.setUint32(40, dataSize, true);
-    let offset = 44;
-    for (let i = 0; i < pcmData.length; i++, offset += 2) {
-      view.setInt16(offset, pcmData[i], true);
-    }
-    return buffer;
-  }
-  writeString(view, offset, text) {
-    for (let i = 0; i < text.length; i++) {
-      view.setUint8(offset + i, text.charCodeAt(i));
     }
   }
   /**
@@ -4068,6 +4059,37 @@ var SttTtsPlugin = class {
     this.ttsQueue = [];
     this.isSpeaking = false;
     this.volumeBuffers.clear();
+  }
+  async convertPcmToWavInMemory(pcmData, sampleRate) {
+    const numChannels = 1;
+    const byteRate = sampleRate * numChannels * 2;
+    const blockAlign = numChannels * 2;
+    const dataSize = pcmData.length * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    this.writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    this.writeString(view, 8, "WAVE");
+    this.writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    this.writeString(view, 36, "data");
+    view.setUint32(40, dataSize, true);
+    let offset = 44;
+    for (let i = 0; i < pcmData.length; i++, offset += 2) {
+      view.setInt16(offset, pcmData[i], true);
+    }
+    return buffer;
+  }
+  writeString(view, offset, text) {
+    for (let i = 0; i < text.length; i++) {
+      view.setUint8(offset + i, text.charCodeAt(i));
+    }
   }
 };
 

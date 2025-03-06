@@ -115,6 +115,51 @@ export class SttTtsPlugin implements Plugin {
   private interruptBufferIndex = 0;
   private lastInterruptCheck = 0;
 
+  private audioQueue: string[] = [];
+  private isStreamingToJanus = false;
+
+  private async processAudioQueue() {
+    if (this.isStreamingToJanus || this.audioQueue.length === 0) return;
+    this.isStreamingToJanus = true;
+    const sentence = this.audioQueue.shift();
+    if (sentence) {
+      await this.streamToJanus(sentence);
+    }
+    this.isStreamingToJanus = false;
+    if (this.audioQueue.length > 0) {
+      setTimeout(() => this.processAudioQueue(), 1000); // Add delay between streams
+    }
+  }
+
+  private streamToJanus(sentence: string) {
+    // Logic to stream sentence to Janus
+    elizaLogger.info('[SttTtsPlugin] Streaming to Janus:', sentence);
+    // Simulate streaming delay
+    return new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  private handleSentence(sentence: string) {
+    this.audioQueue.push(sentence);
+    this.processAudioQueue();
+  }
+
+
+  private convertInt16ToFloat32(int16Array: Int16Array): Float32Array {
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768;
+    }
+    return float32Array;
+  }
+
+  public addAudioChunk(userId: string, chunk: Int16Array): void {
+    if (!this.pcmBuffers.has(userId)) {
+      this.pcmBuffers.set(userId, []);
+    }
+    const float32Chunk = this.convertInt16ToFloat32(chunk);
+    this.pcmBuffers.get(userId)?.push(float32Chunk);
+  }
+
   private analyzeForInterruption(audio: Float32Array): boolean {
     // Simple algorithm based on volume and zero crossings rate
     const audioLength = audio.length;
@@ -249,7 +294,7 @@ export class SttTtsPlugin implements Plugin {
       arr = [];
       this.pcmBuffers.set(data.userId, arr);
     }
-    arr.push(data.samples);
+    arr.push(this.convertInt16ToFloat32(data.samples));
 
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
@@ -301,75 +346,6 @@ export class SttTtsPlugin implements Plugin {
           }
         }
       });
-    }
-  }
-
-  /**
-   * Add audio chunk for a user
-   */
-  public addAudioChunk(userId: string, chunk: Int16Array): void {
-    if (!this.pcmBuffers.has(userId)) {
-      this.pcmBuffers.set(userId, []);
-    }
-    
-    // Convert Int16Array to Float32Array
-    const float32Chunk = new Float32Array(chunk.length);
-    for (let i = 0; i < chunk.length; i++) {
-      // Normalize Int16 values (-32768 to 32767) to Float32 range (-1.0 to 1.0)
-      float32Chunk[i] = chunk[i] / 32768;
-    }
-    
-    this.pcmBuffers.get(userId)?.push(float32Chunk);
-  }
-
-  // /src/sttTtsPlugin.ts
-  private async convertPcmToWavInMemory(
-    pcmData: Int16Array,
-    sampleRate: number
-  ): Promise<ArrayBuffer> {
-    // number of channels
-    const numChannels = 1;
-    // byte rate = (sampleRate * numChannels * bitsPerSample/8)
-    const byteRate = sampleRate * numChannels * 2;
-    const blockAlign = numChannels * 2;
-    // data chunk size = pcmData.length * (bitsPerSample/8)
-    const dataSize = pcmData.length * 2;
-
-    // WAV header is 44 bytes
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-
-    // RIFF chunk descriptor
-    this.writeString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true); // file size - 8
-    this.writeString(view, 8, 'WAVE');
-
-    // fmt sub-chunk
-    this.writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
-    view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
-    view.setUint16(22, numChannels, true); // NumChannels
-    view.setUint32(24, sampleRate, true); // SampleRate
-    view.setUint32(28, byteRate, true); // ByteRate
-    view.setUint16(32, blockAlign, true); // BlockAlign
-    view.setUint16(34, 16, true); // BitsPerSample (16)
-
-    // data sub-chunk
-    this.writeString(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
-
-    // Write PCM samples
-    let offset = 44;
-    for (let i = 0; i < pcmData.length; i++, offset += 2) {
-      view.setInt16(offset, pcmData[i], true);
-    }
-
-    return buffer;
-  }
-
-  private writeString(view: DataView, offset: number, text: string) {
-    for (let i = 0; i < text.length; i++) {
-      view.setUint8(offset + i, text.charCodeAt(i));
     }
   }
 
@@ -1644,5 +1620,55 @@ export class SttTtsPlugin implements Plugin {
     this.ttsQueue = [];
     this.isSpeaking = false;
     this.volumeBuffers.clear();
+  }
+
+  private async convertPcmToWavInMemory(
+    pcmData: Int16Array,
+    sampleRate: number
+  ): Promise<ArrayBuffer> {
+    // number of channels
+    const numChannels = 1;
+    // byte rate = (sampleRate * numChannels * bitsPerSample/8)
+    const byteRate = sampleRate * numChannels * 2;
+    const blockAlign = numChannels * 2;
+    // data chunk size = pcmData.length * (bitsPerSample/8)
+    const dataSize = pcmData.length * 2;
+
+    // WAV header is 44 bytes
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    // RIFF chunk descriptor
+    this.writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true); // file size - 8
+    this.writeString(view, 8, 'WAVE');
+
+    // fmt sub-chunk
+    this.writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+    view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
+    view.setUint16(22, numChannels, true); // NumChannels
+    view.setUint32(24, sampleRate, true); // SampleRate
+    view.setUint32(28, byteRate, true); // ByteRate
+    view.setUint16(32, blockAlign, true); // BlockAlign
+    view.setUint16(34, 16, true); // BitsPerSample (16)
+
+    // data sub-chunk
+    this.writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // Write PCM samples
+    let offset = 44;
+    for (let i = 0; i < pcmData.length; i++, offset += 2) {
+      view.setInt16(offset, pcmData[i], true);
+    }
+
+    return buffer;
+  }
+
+  private writeString(view: DataView, offset: number, text: string) {
+    for (let i = 0; i < text.length; i++) {
+      view.setUint8(offset + i, text.charCodeAt(i));
+    }
   }
 }
