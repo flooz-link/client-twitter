@@ -25,7 +25,7 @@ export function extractAnswer(text: string): string {
   return text.slice(startIndex, endIndex);
 }
 
-type TwitterProfile = {
+export type TwitterProfile = {
   id: string;
   username: string;
   screenName: string;

@@ -14,7 +14,7 @@ import type {
   JanusClient,
   AudioDataWithUser,
 } from '@flooz-link/agent-twitter-client';
-import type { ClientBase } from '../base';
+import type { ClientBase, TwitterProfile } from '../base';
 import { twitterSpaceTemplate } from './templates';
 import { isEmpty } from '../utils';
 import { PassThrough } from 'stream';
@@ -77,12 +77,14 @@ export class SttTtsPlugin implements Plugin {
 
   private keepAlive: NodeJS.Timeout | null = null;
   deepgramApiKey: any;
+  private botProfile: TwitterProfile;
 
 
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
     elizaLogger.log('[SttTtsPlugin] init => Space fully ready. Subscribing to events.');
 
     this.space = params.space;
+    this.botProfile = params.pluginConfig?.user;
     this.janus = (this.space as any)?.janusClient as JanusClient | undefined;
 
     const config = params.pluginConfig as PluginConfig;
@@ -257,9 +259,22 @@ export class SttTtsPlugin implements Plugin {
       console.log("Sending audio data to Deepgram", data.samples.length);
       
       try {
-        // Since the audio data is already in Int16Array format, send it directly
-        // No need for conversion from Float32Array
-        this.socket.send(data.samples.buffer);
+        if (this.botProfile.id !== data.userId) {
+          console.log("Sending audio data to Deepgram", data.userId);
+          
+          // Check if buffer is empty or contains no voice
+          const energy = this.calculateEnergy(data.samples);
+          const isSilent = energy < 50; // Adjust this threshold based on your audio environment
+          
+          if (data.samples.length === 0 || isSilent) {
+            console.log("Skipping empty or silent buffer", { length: data.samples.length, energy });
+            return;
+          }
+          
+          // Since the audio data is already in Int16Array format, send it directly
+          // No need for conversion from Float32Array
+          this.socket.send(data.samples.buffer);
+        }
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }

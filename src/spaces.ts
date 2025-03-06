@@ -224,6 +224,7 @@ export class TwitterSpaceClient {
           sttTts.init({
             space: participant as unknown as Space,
             pluginConfig: {
+              user: this.client.profile,
               runtime: this.runtime,
               client: this.client,
               spaceId: this.spaceId,
