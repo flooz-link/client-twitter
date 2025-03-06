@@ -1204,16 +1204,17 @@ export class SttTtsPlugin implements Plugin {
           agentName: this.runtime.character.name,
         },
       ),
-      this.runtime.messageManager.createMemory(memory).catch(error => {
-        elizaLogger.warn(`Error when creating memories for twitter spaces ${error} ignoring`);
-        return;
-      }),
+      Promise.resolve()
+      // this.runtime.messageManager.createMemory(memory).catch(error => {
+      //   elizaLogger.warn(`Error when creating memories for twitter spaces ${error} ignoring`);
+      //   return;
+      // }),
     ]);
 
-    state = await this.runtime.updateRecentMessageState(state).catch(error => {
-      elizaLogger.warn(`Error when updating recent message state from spaces ${error} ignoring`);
-      return state;
-    });
+    // state = await this.runtime.updateRecentMessageState(state).catch(error => {
+    //   elizaLogger.warn(`Error when updating recent message state from spaces ${error} ignoring`);
+    //   return state;
+    // });
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
       return;
