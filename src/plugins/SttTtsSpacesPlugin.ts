@@ -82,14 +82,6 @@ export class SttTtsPlugin implements Plugin {
   }> = [];
 
   /**
-   * Map of user IDs to promises representing ongoing processing operations
-   * Used to prevent duplicate processing for the same user while allowing
-   * concurrent processing for different users
-   */
-  private processingLocks: Map<string, Promise<void>> = new Map();
-  private transcriptionService: ITranscriptionService;
-
-  /**
    * userId => arrayOfChunks (PCM Int16)
    */
   private pcmBuffers = new Map<string, Int16Array[]>();
@@ -115,6 +107,7 @@ export class SttTtsPlugin implements Plugin {
 
   private eventEmitter = new EventEmitter();
   private openai: OpenAI;
+  private transcriptionService: ITranscriptionService;
 
   onAttach(_space: Space) {
     elizaLogger.log('[SttTtsPlugin] onAttach => space was attached');
@@ -170,7 +163,6 @@ export class SttTtsPlugin implements Plugin {
     });
 
     this.volumeBuffers = new Map<string, number[]>();
-    this.processingLocks = new Map<string, Promise<void>>();
   }
 
   /**
@@ -308,25 +300,18 @@ export class SttTtsPlugin implements Plugin {
    * On speaker silence => flush STT => GPT => TTS => push to Janus
    */
   private async processAudio(userId: string): Promise<void> {
-    // Use non-blocking lock pattern with a Map of promises
-    if (!this.processingLocks) {
-      this.processingLocks = new Map<string, Promise<void>>();
-    }
-
-    // If already processing for this user, wait for it to complete
-    if (this.processingLocks.has(userId)) {
-      await this.processingLocks.get(userId);
+    // Since the agent is shared in a single Twitter space, we don't need per-user locks
+    // Instead, use a single isProcessingAudio flag for the entire plugin
+    if (this.isProcessingAudio) {
+      elizaLogger.log(
+        '[SttTtsPlugin] Already processing audio, skipping for user:',
+        userId,
+      );
       return;
     }
 
-    // Create a deferred promise to track completion
-    let resolveLock!: () => void;
-    const lockPromise = new Promise<void>((resolve) => {
-      resolveLock = resolve;
-    });
-
-    // Set the lock
-    this.processingLocks.set(userId, lockPromise);
+    // Set global processing flag
+    this.isProcessingAudio = true;
 
     try {
       elizaLogger.log(
@@ -334,9 +319,9 @@ export class SttTtsPlugin implements Plugin {
         userId,
       );
 
-      // Get chunks and clear only this user's buffer (more efficient)
+      // Get chunks and clear only this user's buffer
       const chunks = this.pcmBuffers.get(userId) || [];
-      this.pcmBuffers.delete(userId); // Only delete this user's buffer instead of clearing all
+      this.pcmBuffers.delete(userId);
 
       if (!chunks.length) {
         elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
@@ -347,22 +332,22 @@ export class SttTtsPlugin implements Plugin {
         `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`,
       );
 
-      // ---- Start parallel operations ----
+      // ---- Optimize parallel operations ----
 
       // 1. Start merging audio buffer (CPU-bound operation)
       const mergeBufferPromise = this.mergeAudioChunks(chunks);
 
       // 2. Do any non-dependent work here while CPU is busy with buffer merging
-      // For example, prepare any context needed for processing or clean up old resources
+      // Clean up resources for this user
       this.volumeBuffers.delete(userId);
 
-      // 3. Wait for buffer merging to complete and continue with dependent operations
+      // 3. Wait for buffer merging to complete
       const merged = await mergeBufferPromise;
 
-      // 4. Start audio optimization (CPU-bound) and WAV conversion (potentially I/O bound) in parallel
+      // 4. Optimize audio (downsample if needed)
       const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
-      // 7. Start WAV conversion
+      // 5. Convert to WAV format
       const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
         optimizedPcm === merged ? 48000 : 16000,
@@ -370,11 +355,10 @@ export class SttTtsPlugin implements Plugin {
 
       const start = Date.now();
 
-      // 10. Start transcription (I/O and CPU intensive)
+      // 6. Transcribe audio
       const sttText = await this.transcriptionService.transcribe(wavBuffer);
 
       console.log(`Transcription took: ${Date.now() - start} ms`);
-
       elizaLogger.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
 
       if (isEmpty(sttText?.trim())) {
@@ -389,94 +373,85 @@ export class SttTtsPlugin implements Plugin {
         `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
       );
 
-      // 13. Start getting the response while doing other preparations
-      // Set up streaming response handler
-      let accumulatedText = '';
-      const minChunkSize = 50; // Increased minimum characters for more natural speech
-      let currentChunk = '';
-      let isSpeaking = false;
-      let pendingChunks: string[] = [];
-      let processingTimer: NodeJS.Timeout | null = null;
+      // 7. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
+      // Create a TTS abort controller for this session
+      this.ttsAbortController = new AbortController();
+      const signal = this.ttsAbortController.signal;
 
-      // Helper function to determine if a text chunk forms a natural break point
+      // Track accumulated text for logging
+      let accumulatedText = '';
+      
+      // Buffer for accumulating text until we have enough for natural TTS
+      let ttsBuffer = '';
+      
+      // Minimum characters needed for natural speech synthesis
+      const minTtsChunkSize = 30;
+      
+      // Flag to track if TTS is currently processing
+      let isTtsProcessing = false;
+
+      // Helper function to determine if text forms a natural break point
       const isNaturalBreakPoint = (text: string): boolean => {
-        // Check for sentence endings or natural pauses
-        return (
-          /[.!?;:](\s|$)/.test(text) || // Sentence endings or strong pauses
-          (/[,](\s|$)/.test(text) && text.length > 30)
-        ); // Commas with sufficient context
+        return /[.!?;:](\s|$)/.test(text) || (/[,](\s|$)/.test(text) && text.length > 30);
       };
 
-      // Process chunks with a slight delay to allow for more complete thoughts
-      const processQueuedChunks = async () => {
-        if (pendingChunks.length === 0) return;
-
-        // Join pending chunks into a more natural speech unit
-        const textToSpeak = pendingChunks.join('');
-        pendingChunks = [];
-
-        // Add slight pauses for more natural speech rhythm
-        // Replace periods and other sentence endings with a period and a pause marker
-        const textWithPauses = textToSpeak
+      // Function to process TTS for accumulated text
+      const processTtsBuffer = async () => {
+        if (ttsBuffer.length === 0 || isTtsProcessing) return;
+        
+        const textToProcess = ttsBuffer;
+        ttsBuffer = '';
+        
+        // Add natural pauses for better speech rhythm
+        const textWithPauses = textToProcess
           .replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2')
           .replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
-
-        if (!isSpeaking) {
-          isSpeaking = true;
-          await this.speakText(textWithPauses);
-          isSpeaking = false;
-        } else {
-          this.ttsQueue.push(textWithPauses);
+        
+        isTtsProcessing = true;
+        
+        try {
+          // Stream directly to Janus with minimal buffering
+          await this.streamTtsToJanus(textWithPauses, signal);
+        } catch (error) {
+          if (error.name !== 'AbortError') {
+            elizaLogger.error('[SttTtsPlugin] TTS streaming error:', error);
+          }
+        } finally {
+          isTtsProcessing = false;
+          
+          // If we have more text buffered, process it immediately
+          if (ttsBuffer.length > 0) {
+            processTtsBuffer();
+          }
         }
       };
 
-      // Set up event listener for streaming response chunks
+      // Set up event listeners for the streaming response
       this.eventEmitter.once('stream-start', () => {
         elizaLogger.log('[SttTtsPlugin] Stream started for user:', userId);
       });
 
-      // Handle each chunk as it comes in
-      this.eventEmitter.on('stream-chunk', async (chunk: string) => {
-        if (isEmpty(chunk)) {
-          return;
-        }
-
+      // Handle each chunk as it comes in from Grok
+      this.eventEmitter.on('stream-chunk', (chunk: string) => {
+        if (isEmpty(chunk) || signal.aborted) return;
+        
+        // Add to accumulated text for logging
         accumulatedText += chunk;
-        currentChunk += chunk;
-
-        // Clear any existing processing timer
-        if (processingTimer) {
-          clearTimeout(processingTimer);
-          processingTimer = null;
-        }
-
-        // Process chunk when it reaches minimum size or contains natural break points
-        if (
-          currentChunk.length >= minChunkSize ||
-          isNaturalBreakPoint(currentChunk)
-        ) {
-          const chunkToProcess = currentChunk;
-          currentChunk = '';
-
-          // Add to pending chunks
-          pendingChunks.push(chunkToProcess);
-
-          // Set a timer to process chunks, allowing more text to accumulate
-          // This creates more natural speech by processing larger, more complete thoughts
-          processingTimer = setTimeout(processQueuedChunks, 300);
+        
+        // Add to TTS buffer
+        ttsBuffer += chunk;
+        
+        // Process TTS when we have enough text or hit a natural break point
+        if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
+          processTtsBuffer();
         }
       });
 
       // Clean up when stream ends
       this.eventEmitter.once('stream-end', () => {
-        // Process any remaining text
-        if (currentChunk.length > 0) {
-          pendingChunks.push(currentChunk);
-        }
-
-        // Process any final chunks immediately
-        if (pendingChunks.length > 0) {
-          processQueuedChunks();
+        // Process any remaining text in the buffer
+        if (ttsBuffer.length > 0) {
+          processTtsBuffer();
         }
 
         elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
@@ -490,14 +465,19 @@ export class SttTtsPlugin implements Plugin {
         this.eventEmitter.removeAllListeners('stream-end');
       });
 
-      // Start the streaming response
-      this.handleUserMessageStreaming(sttText, userId);
+      // Start the streaming response from Grok
+      await this.handleUserMessageStreaming(sttText, userId);
+      
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     } finally {
-      // Release the lock
-      this.processingLocks.delete(userId);
-      resolveLock();
+      // Clean up the TTS abort controller
+      if (this.ttsAbortController) {
+        this.ttsAbortController = null;
+      }
+      
+      // Release the global processing flag
+      this.isProcessingAudio = false;
     }
   }
 
