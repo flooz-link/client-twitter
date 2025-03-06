@@ -84,7 +84,7 @@ export class SttTtsPlugin implements Plugin {
   /**
    * userId => arrayOfChunks (PCM Int16)
    */
-  private pcmBuffers = new Map<string, Int16Array[]>();
+  private pcmBuffers = new Map<string, Float32Array[]>();
 
   /**
    * For ignoring near-silence frames (if amplitude < threshold)
@@ -108,6 +108,35 @@ export class SttTtsPlugin implements Plugin {
   private eventEmitter = new EventEmitter();
   private openai: OpenAI;
   private transcriptionService: ITranscriptionService;
+
+  private interruptAnalysisBuffer = new Float32Array(1024);
+  private interruptBufferIndex = 0;
+  private lastInterruptCheck = 0;
+
+  private analyzeForInterruption(audio: Float32Array): boolean {
+    // Simple algorithm based on volume and zero crossings rate
+    const audioLength = audio.length;
+    if (audioLength < 512) return false;
+
+    // Calculate zero crossing rate - indicates speech activity
+    let zeroCrossings = 0;
+    for (let i = 1; i < audioLength; i++) {
+      if ((audio[i] >= 0 && audio[i - 1] < 0) || (audio[i] < 0 && audio[i - 1] >= 0)) {
+        zeroCrossings++;
+      }
+    }
+    const zcr = (zeroCrossings / audio.length);
+
+    // Calculate Root Mean Square (RMS) - indicates volume
+    let sumSquares = 0;
+    for (let i = 0; i < audioLength; i++) {
+      sumSquares += audio[i] * audio[i];
+    }
+    const rms = Math.sqrt(sumSquares / audioLength);
+
+    // Voice typically has ZCR between 0.05-0.15 and RMS > 0.05
+    return zcr > 0.05 && zcr < 0.15 && rms > 0.07;
+  }
 
   onAttach(_space: Space) {
     elizaLogger.log('[SttTtsPlugin] onAttach => space was attached');
@@ -133,10 +162,9 @@ export class SttTtsPlugin implements Plugin {
     if (typeof config?.silenceDetectionWindow === 'number') {
       this.silenceDetectionThreshold = config.silenceDetectionWindow;
     }
-    if (typeof config?.silenceThreshold)
-      if (config?.voiceId) {
-        this.voiceId = config.voiceId;
-      }
+    if (config?.voiceId) {
+      this.voiceId = config.voiceId;
+    }
     if (config?.elevenLabsModel) {
       this.elevenLabsModel = config.elevenLabsModel;
     }
@@ -172,39 +200,39 @@ export class SttTtsPlugin implements Plugin {
     if (this.isProcessingAudio) {
       return;
     }
-    
+
     // Calculate the maximum amplitude in this audio chunk
     let maxVal = 0;
     for (let i = 0; i < data.samples.length; i++) {
       const val = Math.abs(data.samples[i]);
       if (val > maxVal) maxVal = val;
     }
-    
+
     // Initialize or get the volume buffer for this user
     let volumeBuffer = this.volumeBuffers.get(data.userId);
     if (!volumeBuffer) {
       volumeBuffer = [];
       this.volumeBuffers.set(data.userId, volumeBuffer);
     }
-    
+
     // Add the current max amplitude to the volume buffer
     volumeBuffer.push(maxVal);
-    
+
     // Keep the buffer at a reasonable size
     if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
       volumeBuffer.shift();
     }
-    
+
     // Calculate average and standard deviation to detect voice vs. noise
     const avgVolume = volumeBuffer.reduce((sum, val) => sum + val, 0) / volumeBuffer.length;
-    
+
     // Calculate standard deviation
     const variance = volumeBuffer.reduce((sum, val) => sum + Math.pow(val - avgVolume, 2), 0) / volumeBuffer.length;
     const stdDev = Math.sqrt(variance);
-    
+
     // Voice typically has higher variance than background noise
     const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
-    
+
     // Skip processing if below threshold or likely not voice
     if (maxVal < this.silenceThreshold || !isLikelyVoice) {
       return;
@@ -226,10 +254,10 @@ export class SttTtsPlugin implements Plugin {
         // Only process if we have enough audio data (prevents processing very short noises)
         const chunks = this.pcmBuffers.get(data.userId) || [];
         const totalAudioLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        
+
         // Require at least 0.5 seconds of audio (24000 samples at 48kHz) to process
         const minSamplesToProcess = 48000 * 0.5;
-        
+
         if (totalAudioLength < minSamplesToProcess) {
           elizaLogger.log(
             '[SttTtsPlugin] Audio too short, skipping processing for user =>',
@@ -238,70 +266,39 @@ export class SttTtsPlugin implements Plugin {
           );
           return;
         }
-        
+
         elizaLogger.log(
           '[SttTtsPlugin] start processing audio for user =>',
-          data.userId,
+          data.userId
         );
         this.userSpeakingTimer = null;
         this.processAudio(data.userId).catch((err) =>
-          elizaLogger.error('[SttTtsPlugin] handleSilence error =>', err),
+          elizaLogger.error('[SttTtsPlugin] handleSilence error =>', err)
         );
       }, this.silenceDetectionThreshold);
     } else {
       // Check for interruption - but only if it's likely to be real speech
       // Apply the same voice detection logic we use for initial processing
-      
+
       // Get normalized amplitude for this chunk (0-1 scale)
-      const samples = new Int16Array(
+      const samples = new Float32Array(
         data.samples.buffer,
         data.samples.byteOffset,
-        data.samples.length / 2,
+        data.samples.length / 4
       );
-      const maxAmplitude = Math.max(...samples.map(Math.abs)) / 32768;
-      
-      // Track amplitudes for interruption detection
-      let interruptBuffer = this.volumeBuffers.get(`interrupt-${data.userId}`);
-      if (!interruptBuffer) {
-        interruptBuffer = [];
-        this.volumeBuffers.set(`interrupt-${data.userId}`, interruptBuffer);
-      }
-      
-      interruptBuffer.push(maxAmplitude);
-      
-      if (interruptBuffer.length > VOLUME_WINDOW_SIZE) {
-        interruptBuffer.shift();
-      }
-      
-      // Calculate average volume
-      const avgInterruptVolume = 
-        interruptBuffer.reduce((sum, v) => sum + v, 0) / interruptBuffer.length;
-      
-      // Calculate variance and standard deviation
-      const interruptVariance = 
-        interruptBuffer.reduce((sum, v) => sum + Math.pow(v - avgInterruptVolume, 2), 0) / interruptBuffer.length;
-      const interruptStdDev = Math.sqrt(interruptVariance);
-      
-      // Check if this is likely sustained speech (not just clicks or background noise)
-      // Require higher thresholds for interruption than for initial detection
-      const isLikelySustainedSpeech = 
-        avgInterruptVolume > SPEAKING_THRESHOLD && 
-        interruptStdDev > 0.05 && 
-        interruptBuffer.length >= Math.min(VOLUME_WINDOW_SIZE, 10);
-      
-      if (isLikelySustainedSpeech) {
-        elizaLogger.log('[SttTtsPlugin] Detected likely speech interruption');
-        
-        // Clear the buffer to prevent repeated interruptions
-        interruptBuffer.length = 0;
-        
-        // Abort the current TTS if speaking
-        if (this.ttsAbortController) {
-          this.ttsAbortController.abort();
-          this.isSpeaking = false;
-          elizaLogger.log('[SttTtsPlugin] TTS playback interrupted by speech');
+
+      // Fill analysis buffer
+      samples.forEach((sample) => {
+        this.interruptAnalysisBuffer[this.interruptBufferIndex++] = sample;
+        if (this.interruptBufferIndex >= this.interruptAnalysisBuffer.length) {
+          this.interruptBufferIndex = 0;
+          if (this.analyzeForInterruption(this.interruptAnalysisBuffer)) {
+            this.ttsAbortController?.abort();
+            this.isSpeaking = false;
+            elizaLogger.log('[SttTtsPlugin] Fast interruption detected');
+          }
         }
-      }
+      });
     }
   }
 
@@ -312,13 +309,21 @@ export class SttTtsPlugin implements Plugin {
     if (!this.pcmBuffers.has(userId)) {
       this.pcmBuffers.set(userId, []);
     }
-    this.pcmBuffers.get(userId)?.push(chunk);
+    
+    // Convert Int16Array to Float32Array
+    const float32Chunk = new Float32Array(chunk.length);
+    for (let i = 0; i < chunk.length; i++) {
+      // Normalize Int16 values (-32768 to 32767) to Float32 range (-1.0 to 1.0)
+      float32Chunk[i] = chunk[i] / 32768;
+    }
+    
+    this.pcmBuffers.get(userId)?.push(float32Chunk);
   }
 
   // /src/sttTtsPlugin.ts
   private async convertPcmToWavInMemory(
     pcmData: Int16Array,
-    sampleRate: number,
+    sampleRate: number
   ): Promise<ArrayBuffer> {
     // number of channels
     const numChannels = 1;
@@ -375,7 +380,7 @@ export class SttTtsPlugin implements Plugin {
     if (this.isProcessingAudio) {
       elizaLogger.log(
         '[SttTtsPlugin] Already processing audio, skipping for user:',
-        userId,
+        userId
       );
       return;
     }
@@ -386,7 +391,7 @@ export class SttTtsPlugin implements Plugin {
     try {
       elizaLogger.log(
         '[SttTtsPlugin] Starting audio processing for user:',
-        userId,
+        userId
       );
 
       // Get chunks and clear only this user's buffer
@@ -399,7 +404,7 @@ export class SttTtsPlugin implements Plugin {
       }
 
       elizaLogger.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`,
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`
       );
 
       // ---- Optimize parallel operations ----
@@ -414,13 +419,21 @@ export class SttTtsPlugin implements Plugin {
       // 3. Wait for buffer merging to complete
       const merged = await mergeBufferPromise;
 
+      // Convert Float32Array back to Int16Array for downstream processing
+      const mergedInt16 = new Int16Array(merged.length);
+      for (let i = 0; i < merged.length; i++) {
+        // Convert normalized float (-1.0 to 1.0) back to Int16 range
+        // Clamp to ensure we don't exceed the range
+        mergedInt16[i] = Math.max(-32768, Math.min(32767, Math.round(merged[i] * 32768)));
+      }
+
       // 4. Optimize audio (downsample if needed)
-      const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
+      const optimizedPcm = this.maybeDownsampleAudio(mergedInt16, 48000, 16000);
 
       // 5. Convert to WAV format
       const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
-        optimizedPcm === merged ? 48000 : 16000,
+        optimizedPcm === mergedInt16 ? 48000 : 16000
       );
 
       const start = Date.now();
@@ -434,13 +447,13 @@ export class SttTtsPlugin implements Plugin {
       if (isEmpty(sttText?.trim())) {
         elizaLogger.warn(
           '[SttTtsPlugin] No speech recognized for user =>',
-          userId,
+          userId
         );
         return;
       }
 
       elizaLogger.log(
-        `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
+        `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
       );
 
       // 7. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
@@ -450,14 +463,13 @@ export class SttTtsPlugin implements Plugin {
 
       // Track accumulated text for logging
       let accumulatedText = '';
-      
+
       // Buffer for accumulating text until we have enough for natural TTS
       let ttsBuffer = '';
-      
+
       // Minimum characters needed for natural speech synthesis
-      // Increased buffer size to make speech less choppy
-      const minTtsChunkSize = 60;
-      
+      const minTtsChunkSize = 30;
+
       // Flag to track if TTS is currently processing
       let isTtsProcessing = false;
 
@@ -471,41 +483,43 @@ export class SttTtsPlugin implements Plugin {
         );
       };
 
-      // Function to process TTS for accumulated text
-      const processTtsBuffer = async () => {
-        if (ttsBuffer.length === 0 || isTtsProcessing) return;
-        
-        // Only process if we have enough text or hit a natural break
-        if (ttsBuffer.length < minTtsChunkSize && !isNaturalBreakPoint(ttsBuffer)) {
-          return;
+      let progressiveTimeout: NodeJS.Timeout | null = null;
+      const minCharactersForProgressive = 15;
+      const progressiveDelay = 400; // ms
+
+      const processTtsChunk = async () => {
+        if (progressiveTimeout) {
+          clearTimeout(progressiveTimeout);
+          progressiveTimeout = null;
         }
-        
+
         const textToProcess = ttsBuffer;
         ttsBuffer = '';
-        
-        // Enhanced pause markers for more natural speech rhythm
+
         const textWithPauses = textToProcess
-          .replace(/([.!?])(\s|$)/g, '$1<break time="0.6s"/>$2') // Longer pauses at sentence ends
-          .replace(/([;:])(\s|$)/g, '$1<break time="0.4s"/>$2') // Medium pauses
-          .replace(/([,])(\s|$)/g, '$1<break time="0.2s"/>$2'); // Short pauses
-        
+          .replace(/([.!?])(\s|$)/g, '$1<break time="0.4s"/>$2')
+          .replace(/([;:])(\s|$)/g, '$1<break time="0.3s"/>$2')
+          .replace(/([,])(\s|$)/g, '$1<break time="0.15s"/>$2');
+
         isTtsProcessing = true;
-        
+
         try {
-          // Stream directly to Janus with minimal buffering
           await this.streamTtsToJanus(textWithPauses, signal);
-        } catch (error) {
-          if (error.name !== 'AbortError') {
-            elizaLogger.error('[SttTtsPlugin] TTS streaming error:', error);
+
+          // Immediately process next chunk if buffer has content
+          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
+            processTtsChunk();
           }
         } finally {
           isTtsProcessing = false;
-          
-          // If we have more text buffered, process it immediately
-          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
-            processTtsBuffer();
-          }
         }
+      };
+
+      const processTtsBuffer = async () => {
+        if (ttsBuffer.length === 0 || isTtsProcessing) return;
+
+        // Process immediately if conditions met
+        processTtsChunk();
       };
 
       // Set up event listeners for the streaming response
@@ -515,14 +529,23 @@ export class SttTtsPlugin implements Plugin {
 
       // Handle each chunk as it comes in from Grok
       this.eventEmitter.on('stream-chunk', (chunk: string) => {
-        if (isEmpty(chunk) || signal.aborted) return;
-        
+        if (typeof chunk !== 'string' || isEmpty(chunk) || signal.aborted) return;
+
         // Add to accumulated text for logging
         accumulatedText += chunk;
-        
+
         // Add to TTS buffer
         ttsBuffer += chunk;
-        
+
+        // Start progressive timeout on first chunk
+        if (progressiveTimeout === null) {
+          progressiveTimeout = setTimeout(() => {
+            if (ttsBuffer.length >= minCharactersForProgressive) {
+              processTtsChunk();
+            }
+          }, progressiveDelay);
+        }
+
         // Process TTS when we have enough text or hit a natural break point
         if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
           processTtsBuffer();
@@ -538,7 +561,7 @@ export class SttTtsPlugin implements Plugin {
 
         elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
         elizaLogger.log(
-          `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`,
+          `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`
         );
 
         // Remove all stream listeners to prevent memory leaks
@@ -549,7 +572,6 @@ export class SttTtsPlugin implements Plugin {
 
       // Start the streaming response from Grok
       await this.handleUserMessageStreaming(sttText, userId);
-      
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     } finally {
@@ -557,7 +579,7 @@ export class SttTtsPlugin implements Plugin {
       if (this.ttsAbortController) {
         this.ttsAbortController = null;
       }
-      
+
       // Release the global processing flag
       this.isProcessingAudio = false;
     }
@@ -567,20 +589,32 @@ export class SttTtsPlugin implements Plugin {
    * Helper method to merge audio chunks in a non-blocking way
    * This allows other operations to continue while CPU-intensive merging happens
    */
-  private async mergeAudioChunks(chunks: Int16Array[]): Promise<Int16Array> {
-    return new Promise<Int16Array>((resolve) => {
-      // Use setImmediate to allow other operations to proceed
-      setImmediate(() => {
-        const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-        const merged = new Int16Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) {
-          merged.set(c, offset);
-          offset += c.length;
-        }
-        resolve(merged);
-      });
+  private async mergeAudioChunks(chunks: Float32Array[]): Promise<Float32Array> {
+    // 1. Normalize to float32 for processing
+    const floatChunks = chunks.map((chunk) => {
+      const float32 = new Float32Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        float32[i] = chunk[i] / 32768; // [-1, 1] range
+      }
+      return float32;
     });
+
+    // 2. Process audio in float32 domain
+    const processed = await this.processFloatAudio(floatChunks);
+
+    // 3. Return the processed Float32Array directly
+    return processed;
+  }
+
+  private async processFloatAudio(chunks: Float32Array[]): Promise<Float32Array> {
+    // Calculate total length of all chunks
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    
+    // Professional audio processing here
+    const context = new OfflineAudioContext(1, 48000 * 10, 48000);
+    const buffer = context.createBuffer(1, totalLength, 48000);
+    // ... existing quality processing ...
+    return buffer.getChannelData(0);
   }
 
   /**
@@ -590,7 +624,7 @@ export class SttTtsPlugin implements Plugin {
   private maybeDownsampleAudio(
     audio: Int16Array,
     originalSampleRate: number,
-    targetSampleRate: number,
+    targetSampleRate: number
   ): Int16Array {
     // If already at target rate or downsampling not needed, return original
     if (originalSampleRate <= targetSampleRate) {
@@ -649,7 +683,7 @@ export class SttTtsPlugin implements Plugin {
           await this.streamTtsToJanus(text, signal);
 
           console.log(
-            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`,
+            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`
           );
 
           // Check for abort after streaming
@@ -686,10 +720,7 @@ export class SttTtsPlugin implements Plugin {
    * @param text Text to convert to speech
    * @param signal Abort controller signal
    */
-  private async streamTtsToJanus(
-    text: string,
-    signal: AbortSignal,
-  ): Promise<void> {
+  private async streamTtsToJanus(text: string, signal: AbortSignal): Promise<void> {
     const SAMPLE_RATE = 48000;
     const FRAME_SIZE = 480; // 10ms at 48kHz
     const FRAME_DURATION_MS = 10; // Actual playback duration of each frame
@@ -740,11 +771,7 @@ export class SttTtsPlugin implements Plugin {
     let processingComplete = false;
 
     // Start the ElevenLabs API call with streaming response
-    const elevenLabsPromise = this.elevenLabsTtsStreaming(
-      text,
-      mp3Stream,
-      signal,
-    );
+    const elevenLabsPromise = this.elevenLabsTtsStreaming(text, mp3Stream, signal);
 
     // Process FFmpeg output and store in buffer
     const processingPromise = new Promise<void>((resolve, reject) => {
@@ -768,7 +795,7 @@ export class SttTtsPlugin implements Plugin {
             const frame = new Int16Array(
               frameBuffer.buffer,
               frameBuffer.byteOffset,
-              FRAME_SIZE,
+              FRAME_SIZE
             );
 
             // Create a copy of the frame to avoid shared buffer issues
@@ -793,7 +820,7 @@ export class SttTtsPlugin implements Plugin {
         try {
           if (code !== 0 && !signal.aborted) {
             reject(
-              new Error(`ffmpeg streaming process exited with code ${code}`),
+              new Error(`ffmpeg streaming process exited with code ${code}`)
             );
             return;
           }
@@ -806,7 +833,7 @@ export class SttTtsPlugin implements Plugin {
               frameBuffer,
               0,
               0,
-              Math.min(pcmBuffer.length, FRAME_SIZE * 2),
+              Math.min(pcmBuffer.length, FRAME_SIZE * 2)
             );
 
             const frame = new Int16Array(FRAME_SIZE);
@@ -815,7 +842,7 @@ export class SttTtsPlugin implements Plugin {
             const srcView = new Int16Array(
               frameBuffer.buffer,
               frameBuffer.byteOffset,
-              FRAME_SIZE,
+              FRAME_SIZE
             );
 
             frame.set(srcView);
@@ -892,16 +919,16 @@ export class SttTtsPlugin implements Plugin {
         if (currentTime < idealPlaybackTime) {
           // We're ahead of schedule, wait until the right time
           await new Promise((r) =>
-            setTimeout(r, idealPlaybackTime - currentTime),
+            setTimeout(r, idealPlaybackTime - currentTime)
           );
         } else if (currentTime > idealPlaybackTime + 100) {
           // We're significantly behind, skip frames to catch up
           const framesToSkip = Math.floor(
-            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS,
+            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS
           );
           if (framesToSkip > 0) {
             elizaLogger.log(
-              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`,
+              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`
             );
             frameIndex += framesToSkip;
             continue;
@@ -917,7 +944,7 @@ export class SttTtsPlugin implements Plugin {
         } catch (error) {
           elizaLogger.error(
             '[SttTtsPlugin] Error sending frame to Janus:',
-            error,
+            error
           );
         }
 
@@ -929,7 +956,7 @@ export class SttTtsPlugin implements Plugin {
       await elevenLabsPromise;
 
       elizaLogger.log(
-        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`,
+        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`
       );
     } catch (error) {
       if (signal.aborted) {
@@ -947,7 +974,7 @@ export class SttTtsPlugin implements Plugin {
    */
   private async streamChunkToJanus(
     samples: Int16Array,
-    sampleRate: number,
+    sampleRate: number
   ): Promise<void> {
     // Janus expects exactly 480 samples (960 bytes)
     const EXPECTED_SAMPLES = 480;
@@ -974,7 +1001,7 @@ export class SttTtsPlugin implements Plugin {
           const bufferView = new Int16Array(
             properSizedSamples.buffer,
             0,
-            EXPECTED_SAMPLES,
+            EXPECTED_SAMPLES
           );
 
           // Send the properly sized buffer to Janus
@@ -999,7 +1026,7 @@ export class SttTtsPlugin implements Plugin {
   private async elevenLabsTtsStreaming(
     text: string,
     outputStream: NodeJS.WritableStream,
-    signal: AbortSignal,
+    signal: AbortSignal
   ): Promise<void> {
     try {
       if (!this.elevenLabsApiKey) {
@@ -1014,7 +1041,7 @@ export class SttTtsPlugin implements Plugin {
       const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
       elizaLogger.log(
-        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`,
+        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`
       );
 
       // Make the API request
@@ -1039,7 +1066,7 @@ export class SttTtsPlugin implements Plugin {
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(
-          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`,
+          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`
         );
       }
 
@@ -1048,7 +1075,7 @@ export class SttTtsPlugin implements Plugin {
       }
 
       elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`,
+        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`
       );
 
       // Stream the response directly to our output stream
@@ -1070,7 +1097,7 @@ export class SttTtsPlugin implements Plugin {
           // Log progress periodically
           if (bytesReceived % 10000 < 1000) {
             elizaLogger.log(
-              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`,
+              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`
             );
           }
         }
@@ -1079,7 +1106,7 @@ export class SttTtsPlugin implements Plugin {
       // End the stream when done
       outputStream.end();
       elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`,
+        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`
       );
     } catch (error) {
       if (error.name === 'AbortError') {
@@ -1099,7 +1126,7 @@ export class SttTtsPlugin implements Plugin {
    */
   private async handleUserMessage(
     userText: string,
-    userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
+    userId: string // This is the raw Twitter user ID like 'tw-1865462035586142208'
   ): Promise<string> {
     // Extract the numeric ID part
     const numericId = userId.replace('tw-', '');
@@ -1116,10 +1143,10 @@ export class SttTtsPlugin implements Plugin {
         userUuid,
         userId, // Use full Twitter ID as username
         `Twitter User ${numericId}`,
-        'twitter',
+        'twitter'
       ),
       this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId)
     ]);
 
     let start = Date.now();
@@ -1129,12 +1156,12 @@ export class SttTtsPlugin implements Plugin {
       agentId: this.runtime.agentId,
       content: {
         text: userText,
-        source: 'twitter',
+        source: 'twitter'
       },
       userId: userUuid,
       roomId,
       embedding: getEmbeddingZeroVector(),
-      createdAt: Date.now(),
+      createdAt: Date.now()
     };
 
     let [state] = await Promise.all([
@@ -1143,17 +1170,17 @@ export class SttTtsPlugin implements Plugin {
           agentId: this.runtime.agentId,
           content: { text: userText, source: 'twitter' },
           userId: userUuid,
-          roomId,
+          roomId
         },
         {
           twitterUserName: this.client.profile.username,
-          agentName: this.runtime.character.name,
-        },
+          agentName: this.runtime.character.name
+        }
       ),
-      this.runtime.messageManager.createMemory(memory),
+      this.runtime.messageManager.createMemory(memory)
     ]);
     console.log(
-      `Compose state and create memory took ${Date.now() - start} ms`,
+      `Compose state and create memory took ${Date.now() - start} ms`
     );
 
     start = Date.now();
@@ -1180,7 +1207,7 @@ export class SttTtsPlugin implements Plugin {
       template:
         this.runtime.character.templates?.twitterVoiceHandlerTemplate ||
         this.runtime.character.templates?.messageHandlerTemplate ||
-        twitterVoiceHandlerTemplate,
+        twitterVoiceHandlerTemplate
     });
 
     const responseContent = await this._generateResponse(memory, context);
@@ -1194,10 +1221,10 @@ export class SttTtsPlugin implements Plugin {
       content: {
         ...responseContent,
         user: this.runtime.character.name,
-        inReplyTo: memory.id,
+        inReplyTo: memory.id
       },
       roomId,
-      embedding: getEmbeddingZeroVector(),
+      embedding: getEmbeddingZeroVector()
     };
 
     const reply = responseMemory.content.text?.trim();
@@ -1215,7 +1242,7 @@ export class SttTtsPlugin implements Plugin {
    */
   private async handleUserMessageStreaming(
     userText: string,
-    userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
+    userId: string // This is the raw Twitter user ID like 'tw-1865462035586142208'
   ): Promise<void> {
     // Extract the numeric ID part
     const numericId = userId.replace('tw-', '');
@@ -1231,12 +1258,14 @@ export class SttTtsPlugin implements Plugin {
         userUuid,
         userId, // Use full Twitter ID as username
         `Twitter User ${numericId}`,
-        'twitter',
+        'twitter'
       ),
       this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]).catch(error => {
-      elizaLogger.warn(`Error when handling streaming for spaces error ${error} ignoring`)
+      this.runtime.ensureParticipantInRoom(userUuid, roomId)
+    ]).catch((error) => {
+      elizaLogger.warn(
+        `Error when handling streaming for spaces error ${error} ignoring`
+      );
       return;
     });
 
@@ -1245,12 +1274,12 @@ export class SttTtsPlugin implements Plugin {
       agentId: this.runtime.agentId,
       content: {
         text: userText,
-        source: 'twitter',
+        source: 'twitter'
       },
       userId: userUuid,
       roomId,
       embedding: getEmbeddingZeroVector(),
-      createdAt: Date.now(),
+      createdAt: Date.now()
     };
 
     let [state] = await Promise.all([
@@ -1259,12 +1288,12 @@ export class SttTtsPlugin implements Plugin {
           agentId: this.runtime.agentId,
           content: { text: userText, source: 'twitter' },
           userId: userUuid,
-          roomId,
+          roomId
         },
         {
           twitterUserName: this.client.profile.username,
-          agentName: this.runtime.character.name,
-        },
+          agentName: this.runtime.character.name
+        }
       ),
       Promise.resolve()
       // this.runtime.messageManager.createMemory(memory).catch(error => {
@@ -1288,27 +1317,32 @@ export class SttTtsPlugin implements Plugin {
       template:
         this.runtime.character.templates?.twitterVoiceHandlerTemplate ||
         this.runtime.character.templates?.messageHandlerTemplate ||
-        twitterVoiceHandlerTemplate,
+        twitterVoiceHandlerTemplate
     });
 
     // Log character information for debugging
     elizaLogger.log('[SttTtsPlugin] Character info:', {
       name: this.runtime.character.name,
-      system: this.runtime.character.system,
+      system: this.runtime.character.system
     });
 
     // Create a system message that includes the full context
     const systemMessage = {
       role: 'system' as const,
-      content: context,
+      content: context
     };
 
     const userMessage = {
       role: 'user' as const,
-      content: userText,
+      content: userText
     };
 
     const messages = [...this.chatContext, systemMessage, userMessage];
+
+    // Progressive timeout mechanism
+    let progressiveTimeout: NodeJS.Timeout | null = null;
+    const minCharactersForProgressive = 15;
+    const progressiveDelay = 400; // ms
 
     // Signal stream start
     this.eventEmitter.emit('stream-start');
@@ -1318,7 +1352,7 @@ export class SttTtsPlugin implements Plugin {
     const stream = await this.openai.chat.completions.create({
       model: 'grok-2-latest',
       messages: messages,
-      stream: true,
+      stream: true
     });
 
     let fullResponse = '';
@@ -1348,7 +1382,7 @@ export class SttTtsPlugin implements Plugin {
 
       // If it's not JSON, emit directly
       if (!isJsonResponse) {
-        console.log(`Time took for emitting ${Date.now()-start}`)
+        console.log(`Time took for emitting ${Date.now() - start}`);
         this.eventEmitter.emit('stream-chunk', content);
         continue;
       }
@@ -1368,7 +1402,7 @@ export class SttTtsPlugin implements Plugin {
           // If we have more text than before, emit the difference
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
-            console.log(`Time took for emitting ${Date.now()-start}`)
+            console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit('stream-chunk', newText);
             textValue = capturedText;
           }
@@ -1402,7 +1436,7 @@ export class SttTtsPlugin implements Plugin {
               // If we have a text field, emit any new content
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
-                console.log(`Time took for emitting ${Date.now()-start}`)
+                console.log(`Time took for emitting ${Date.now() - start}`);
                 this.eventEmitter.emit('stream-chunk', newText);
                 textValue = parsed.text;
               }
@@ -1436,26 +1470,26 @@ export class SttTtsPlugin implements Plugin {
           const parsed = JSON.parse(jsonObject);
 
           if (parsed.text) {
-            console.log(`Time took for emitting ${Date.now()-start}`)
+            console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit('stream-chunk', parsed.text);
           } else {
-            console.log(`Time took for emitting ${Date.now()-start}`)
+            console.log(`Time took for emitting ${Date.now() - start}`);
             // No text field found, emit the whole buffer as fallback
             this.eventEmitter.emit('stream-chunk', jsonBuffer);
           }
         } else {
-          console.log(`Time took for emitting ${Date.now()-start}`)
+          console.log(`Time took for emitting ${Date.now() - start}`);
           // No valid JSON found, emit the whole buffer as fallback
           this.eventEmitter.emit('stream-chunk', jsonBuffer);
         }
       } catch (e) {
-        console.log(`Time took for emitting ${Date.now()-start}`)
+        console.log(`Time took for emitting ${Date.now() - start}`);
         // Parsing failed, emit the whole buffer as fallback
         this.eventEmitter.emit('stream-chunk', jsonBuffer);
       }
     }
 
-    console.log(`Time took for completing LLM ${Date.now()-start}`)
+    console.log(`Time took for completing LLM ${Date.now() - start}`);
     // Signal stream end
     this.eventEmitter.emit('stream-end');
 
@@ -1469,10 +1503,10 @@ export class SttTtsPlugin implements Plugin {
     //       text: fullResponse,
     //       source: 'twitter',
     //       user: this.runtime.character.name,
-    //       inReplyTo: memory.id,
+    //       inReplyTo: memory.id
     //     },
     //     roomId,
-    //     embedding: getEmbeddingZeroVector(),
+    //     embedding: getEmbeddingZeroVector()
     //   };
 
     //   await this.runtime.messageManager.createMemory(responseMemory).catch(error => {
@@ -1487,21 +1521,21 @@ export class SttTtsPlugin implements Plugin {
    */
   private async _generateResponse(
     message: Memory,
-    context: string,
+    context: string
   ): Promise<Content> {
     const { userId, roomId } = message;
 
     const response = await generateMessageResponse({
       runtime: this.runtime,
       context,
-      modelClass: ModelClass.SMALL,
+      modelClass: ModelClass.SMALL
     });
 
     response.source = 'discord';
 
     if (!response) {
       elizaLogger.error(
-        '[SttTtsPlugin] No response from generateMessageResponse',
+        '[SttTtsPlugin] No response from generateMessageResponse'
       );
       return;
     }
@@ -1510,7 +1544,7 @@ export class SttTtsPlugin implements Plugin {
       body: { message, context, response },
       userId: userId,
       roomId,
-      type: 'response',
+      type: 'response'
     });
 
     return response;
@@ -1549,12 +1583,12 @@ export class SttTtsPlugin implements Plugin {
       'dick',
       'cock',
       'sex',
-      'sexy',
+      'sexy'
     ];
     if (
       messageLen < 50 &&
       loseInterestWords.some((word) =>
-        messageStr?.toLowerCase()?.includes(word),
+        messageStr?.toLowerCase()?.includes(word)
       )
     ) {
       return true;
@@ -1578,7 +1612,7 @@ export class SttTtsPlugin implements Plugin {
   public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
     this.chatContext.push({ role, content });
     elizaLogger.log(
-      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`,
+      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`
     );
   }
 

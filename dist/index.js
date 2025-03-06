@@ -2971,7 +2971,6 @@ import { PassThrough } from "stream";
 import { EventEmitter as EventEmitter2 } from "events";
 import OpenAI from "openai";
 var VOLUME_WINDOW_SIZE = 100;
-var SPEAKING_THRESHOLD = 0.05;
 var SttTtsPlugin = class {
   name = "SttTtsPlugin";
   description = "Speech-to-text (OpenAI) + conversation + TTS (ElevenLabs)";
@@ -3008,6 +3007,26 @@ var SttTtsPlugin = class {
   eventEmitter = new EventEmitter2();
   openai;
   transcriptionService;
+  interruptAnalysisBuffer = new Float32Array(1024);
+  interruptBufferIndex = 0;
+  lastInterruptCheck = 0;
+  analyzeForInterruption(audio) {
+    const audioLength = audio.length;
+    if (audioLength < 512) return false;
+    let zeroCrossings = 0;
+    for (let i = 1; i < audioLength; i++) {
+      if (audio[i] >= 0 && audio[i - 1] < 0 || audio[i] < 0 && audio[i - 1] >= 0) {
+        zeroCrossings++;
+      }
+    }
+    const zcr = zeroCrossings / audio.length;
+    let sumSquares = 0;
+    for (let i = 0; i < audioLength; i++) {
+      sumSquares += audio[i] * audio[i];
+    }
+    const rms = Math.sqrt(sumSquares / audioLength);
+    return zcr > 0.05 && zcr < 0.15 && rms > 0.07;
+  }
   onAttach(_space) {
     elizaLogger6.log("[SttTtsPlugin] onAttach => space was attached");
   }
@@ -3030,10 +3049,8 @@ var SttTtsPlugin = class {
     if (typeof (config == null ? void 0 : config.silenceDetectionWindow) === "number") {
       this.silenceDetectionThreshold = config.silenceDetectionWindow;
     }
-    if (typeof (config == null ? void 0 : config.silenceThreshold)) {
-      if (config == null ? void 0 : config.voiceId) {
-        this.voiceId = config.voiceId;
-      }
+    if (config == null ? void 0 : config.voiceId) {
+      this.voiceId = config.voiceId;
     }
     if (config == null ? void 0 : config.elevenLabsModel) {
       this.elevenLabsModel = config.elevenLabsModel;
@@ -3067,7 +3084,20 @@ var SttTtsPlugin = class {
       const val = Math.abs(data.samples[i]);
       if (val > maxVal) maxVal = val;
     }
-    if (maxVal < this.silenceThreshold) {
+    let volumeBuffer = this.volumeBuffers.get(data.userId);
+    if (!volumeBuffer) {
+      volumeBuffer = [];
+      this.volumeBuffers.set(data.userId, volumeBuffer);
+    }
+    volumeBuffer.push(maxVal);
+    if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
+      volumeBuffer.shift();
+    }
+    const avgVolume = volumeBuffer.reduce((sum, val) => sum + val, 0) / volumeBuffer.length;
+    const variance = volumeBuffer.reduce((sum, val) => sum + Math.pow(val - avgVolume, 2), 0) / volumeBuffer.length;
+    const stdDev = Math.sqrt(variance);
+    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
+    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
       return;
     }
     if (this.userSpeakingTimer) {
@@ -3081,6 +3111,17 @@ var SttTtsPlugin = class {
     arr.push(data.samples);
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
+        const chunks = this.pcmBuffers.get(data.userId) || [];
+        const totalAudioLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const minSamplesToProcess = 48e3 * 0.5;
+        if (totalAudioLength < minSamplesToProcess) {
+          elizaLogger6.log(
+            "[SttTtsPlugin] Audio too short, skipping processing for user =>",
+            data.userId,
+            `(${totalAudioLength} samples)`
+          );
+          return;
+        }
         elizaLogger6.log(
           "[SttTtsPlugin] start processing audio for user =>",
           data.userId
@@ -3091,30 +3132,23 @@ var SttTtsPlugin = class {
         );
       }, this.silenceDetectionThreshold);
     } else {
-      let volumeBuffer = this.volumeBuffers.get(data.userId);
-      if (!volumeBuffer) {
-        volumeBuffer = [];
-        this.volumeBuffers.set(data.userId, volumeBuffer);
-      }
-      const samples = new Int16Array(
+      const samples = new Float32Array(
         data.samples.buffer,
         data.samples.byteOffset,
-        data.samples.length / 2
+        data.samples.length / 4
       );
-      const maxAmplitude = Math.max(...samples.map(Math.abs)) / 32768;
-      volumeBuffer.push(maxAmplitude);
-      if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
-        volumeBuffer.shift();
-      }
-      const avgVolume = volumeBuffer.reduce((sum, v) => sum + v, 0) / VOLUME_WINDOW_SIZE;
-      if (avgVolume > SPEAKING_THRESHOLD) {
-        volumeBuffer.length = 0;
-        if (this.ttsAbortController) {
-          this.ttsAbortController.abort();
-          this.isSpeaking = false;
-          elizaLogger6.log("[SttTtsPlugin] TTS playback interrupted");
+      samples.forEach((sample) => {
+        var _a;
+        this.interruptAnalysisBuffer[this.interruptBufferIndex++] = sample;
+        if (this.interruptBufferIndex >= this.interruptAnalysisBuffer.length) {
+          this.interruptBufferIndex = 0;
+          if (this.analyzeForInterruption(this.interruptAnalysisBuffer)) {
+            (_a = this.ttsAbortController) == null ? void 0 : _a.abort();
+            this.isSpeaking = false;
+            elizaLogger6.log("[SttTtsPlugin] Fast interruption detected");
+          }
         }
-      }
+      });
     }
   }
   /**
@@ -3125,7 +3159,11 @@ var SttTtsPlugin = class {
     if (!this.pcmBuffers.has(userId)) {
       this.pcmBuffers.set(userId, []);
     }
-    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(chunk);
+    const float32Chunk = new Float32Array(chunk.length);
+    for (let i = 0; i < chunk.length; i++) {
+      float32Chunk[i] = chunk[i] / 32768;
+    }
+    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(float32Chunk);
   }
   // /src/sttTtsPlugin.ts
   async convertPcmToWavInMemory(pcmData, sampleRate) {
@@ -3188,10 +3226,14 @@ var SttTtsPlugin = class {
       const mergeBufferPromise = this.mergeAudioChunks(chunks);
       this.volumeBuffers.delete(userId);
       const merged = await mergeBufferPromise;
-      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
+      const mergedInt16 = new Int16Array(merged.length);
+      for (let i = 0; i < merged.length; i++) {
+        mergedInt16[i] = Math.max(-32768, Math.min(32767, Math.round(merged[i] * 32768)));
+      }
+      const optimizedPcm = this.maybeDownsampleAudio(mergedInt16, 48e3, 16e3);
       const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
-        optimizedPcm === merged ? 48e3 : 16e3
+        optimizedPcm === mergedInt16 ? 48e3 : 16e3
       );
       const start = Date.now();
       const sttText = await this.transcriptionService.transcribe(wavBuffer);
@@ -3214,34 +3256,49 @@ var SttTtsPlugin = class {
       const minTtsChunkSize = 30;
       let isTtsProcessing = false;
       const isNaturalBreakPoint = (text) => {
-        return /[.!?;:](\s|$)/.test(text) || /[,](\s|$)/.test(text) && text.length > 30;
+        return /[.!?](\s|$)/.test(text) || // Strong sentence endings
+        /[;:](\s|$)/.test(text) && text.length > 40 || // Medium pauses with sufficient context
+        /[,](\s|$)/.test(text) && text.length > 80;
       };
-      const processTtsBuffer = async () => {
-        if (ttsBuffer.length === 0 || isTtsProcessing) return;
+      let progressiveTimeout = null;
+      const minCharactersForProgressive = 15;
+      const progressiveDelay = 400;
+      const processTtsChunk = async () => {
+        if (progressiveTimeout) {
+          clearTimeout(progressiveTimeout);
+          progressiveTimeout = null;
+        }
         const textToProcess = ttsBuffer;
         ttsBuffer = "";
-        const textWithPauses = textToProcess.replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2').replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
+        const textWithPauses = textToProcess.replace(/([.!?])(\s|$)/g, '$1<break time="0.4s"/>$2').replace(/([;:])(\s|$)/g, '$1<break time="0.3s"/>$2').replace(/([,])(\s|$)/g, '$1<break time="0.15s"/>$2');
         isTtsProcessing = true;
         try {
           await this.streamTtsToJanus(textWithPauses, signal);
-        } catch (error) {
-          if (error.name !== "AbortError") {
-            elizaLogger6.error("[SttTtsPlugin] TTS streaming error:", error);
+          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
+            processTtsChunk();
           }
         } finally {
           isTtsProcessing = false;
-          if (ttsBuffer.length > 0) {
-            processTtsBuffer();
-          }
         }
+      };
+      const processTtsBuffer = async () => {
+        if (ttsBuffer.length === 0 || isTtsProcessing) return;
+        processTtsChunk();
       };
       this.eventEmitter.once("stream-start", () => {
         elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
       });
       this.eventEmitter.on("stream-chunk", (chunk) => {
-        if (isEmpty(chunk) || signal.aborted) return;
+        if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted) return;
         accumulatedText += chunk;
         ttsBuffer += chunk;
+        if (progressiveTimeout === null) {
+          progressiveTimeout = setTimeout(() => {
+            if (ttsBuffer.length >= minCharactersForProgressive) {
+              processTtsChunk();
+            }
+          }, progressiveDelay);
+        }
         if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
           processTtsBuffer();
         }
@@ -3273,18 +3330,21 @@ var SttTtsPlugin = class {
    * This allows other operations to continue while CPU-intensive merging happens
    */
   async mergeAudioChunks(chunks) {
-    return new Promise((resolve) => {
-      setImmediate(() => {
-        const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-        const merged = new Int16Array(totalLen);
-        let offset = 0;
-        for (const c of chunks) {
-          merged.set(c, offset);
-          offset += c.length;
-        }
-        resolve(merged);
-      });
+    const floatChunks = chunks.map((chunk) => {
+      const float32 = new Float32Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        float32[i] = chunk[i] / 32768;
+      }
+      return float32;
     });
+    const processed = await this.processFloatAudio(floatChunks);
+    return processed;
+  }
+  async processFloatAudio(chunks) {
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const context = new OfflineAudioContext(1, 48e3 * 10, 48e3);
+    const buffer = context.createBuffer(1, totalLength, 48e3);
+    return buffer.getChannelData(0);
   }
   /**
    * Downsample audio if needed for Whisper
@@ -3400,11 +3460,7 @@ var SttTtsPlugin = class {
     mp3Stream.pipe(ffmpeg.stdin);
     const audioBuffer = [];
     let processingComplete = false;
-    const elevenLabsPromise = this.elevenLabsTtsStreaming(
-      text,
-      mp3Stream,
-      signal
-    );
+    const elevenLabsPromise = this.elevenLabsTtsStreaming(text, mp3Stream, signal);
     const processingPromise = new Promise((resolve, reject) => {
       let pcmBuffer = Buffer.alloc(0);
       ffmpeg.stdout.on("data", (chunk) => {
@@ -3753,7 +3809,9 @@ var SttTtsPlugin = class {
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId)
     ]).catch((error) => {
-      elizaLogger6.warn(`Error when handling streaming for spaces error ${error} ignoring`);
+      elizaLogger6.warn(
+        `Error when handling streaming for spaces error ${error} ignoring`
+      );
       return;
     });
     const memory = {
@@ -3808,6 +3866,9 @@ var SttTtsPlugin = class {
       content: userText
     };
     const messages = [...this.chatContext, systemMessage, userMessage];
+    let progressiveTimeout = null;
+    const minCharactersForProgressive = 15;
+    const progressiveDelay = 400;
     this.eventEmitter.emit("stream-start");
     const start = Date.now();
     const stream = await this.openai.chat.completions.create({
