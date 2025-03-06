@@ -3056,72 +3056,18 @@ var SttTtsPlugin = class {
     });
     this.volumeBuffers = /* @__PURE__ */ new Map();
   }
-  async processAudioQueue() {
-    if (this.audioBuffer.length === 0) return;
-    const chunk = this.audioBuffer.shift();
-    if (chunk) {
-      await this.streamToJanus(chunk);
-    }
-    this.checkAndStopStreaming();
-    if (this.audioBuffer.length > 0) {
-      setTimeout(() => this.processAudioQueue(), 200);
-    }
-  }
-  checkAndStopStreaming() {
-    if (this.audioBuffer.length === 0) {
-      this.stopStreamingToJanus();
-    }
-  }
-  streamToJanus(chunk) {
-    if (this.janus && chunk.length > 0) {
-      try {
-        const sampleRate = 48e3;
-        this.janus.pushLocalAudio(chunk, sampleRate);
-        elizaLogger6.debug(`[SttTtsPlugin] Streaming Int16Array chunk to Janus: ${chunk.length} samples`);
-      } catch (error) {
-        elizaLogger6.error("[SttTtsPlugin] Error streaming to Janus:", error);
-      }
-    } else {
-      elizaLogger6.warn("[SttTtsPlugin] Cannot stream to Janus: janus not initialized or empty chunk");
-    }
-    return new Promise((resolve) => setTimeout(resolve, 200));
-  }
   /**
-   * Adds an audio chunk for a specific user to the processing buffer
-   * 
-   * This method provides a public API for external components to add audio data
-   * to the plugin's processing pipeline. While the plugin primarily receives audio
-   * through the handleAudioData method (called by event handlers), this method
-   * allows for direct programmatic addition of audio chunks.
-   * 
-   * The audio chunks are stored in the pcmBuffers map, indexed by userId,
-   * and will be processed when silence is detected or the buffer reaches
-   * a sufficient size.
-   * 
-   * @param userId - The unique identifier for the user who generated the audio
-   * @param chunk - The audio data as an Int16Array (PCM format)
+   * Public method to queue a TTS request
    */
-  addAudioChunk(userId, chunk) {
-    var _a;
-    if (!this.pcmBuffers.has(userId)) {
-      this.pcmBuffers.set(userId, []);
-    }
-    (_a = this.pcmBuffers.get(userId)) == null ? void 0 : _a.push(chunk);
-    this.audioBuffer.push(chunk);
-    this.startStreamingToJanus();
-  }
-  startStreamingToJanus() {
-    if (this.streamingInterval) return;
-    this.streamingInterval = setInterval(() => {
-      if (this.audioBuffer.length > 0) {
-        this.processAudioQueue();
-      }
-    }, 200);
-  }
-  stopStreamingToJanus() {
-    if (this.streamingInterval) {
-      clearInterval(this.streamingInterval);
-      this.streamingInterval = null;
+  async speakText(text) {
+    this.ttsQueue.push(text);
+    if (!this.isSpeaking) {
+      this.isSpeaking = true;
+      this.processTtsQueue().catch((err) => {
+        elizaLogger6.error("[SttTtsPlugin] processTtsQueue error =>", err);
+      }).then((res) => {
+        return res;
+      });
     }
   }
   /**
@@ -3204,6 +3150,38 @@ var SttTtsPlugin = class {
           }
         }
       });
+    }
+  }
+  /**
+  * Process the TTS queue with streaming optimizations
+  */
+  async processTtsQueue() {
+    try {
+      while (this.ttsQueue.length > 0) {
+        const text = this.ttsQueue.shift();
+        if (!text) continue;
+        this.ttsAbortController = new AbortController();
+        const { signal } = this.ttsAbortController;
+        const startTime = Date.now();
+        try {
+          await this.streamTtsToJanus(text, signal);
+          console.log(
+            `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`
+          );
+          if (signal.aborted) {
+            console.log("[SttTtsPlugin] TTS streaming was interrupted");
+            return;
+          }
+        } catch (err) {
+          console.error("[SttTtsPlugin] TTS streaming error =>", err);
+        } finally {
+          this.ttsAbortController = null;
+        }
+      }
+    } catch (error) {
+      console.error("[SttTtsPlugin] Queue processing error =>", error);
+    } finally {
+      this.isSpeaking = false;
     }
   }
   /**
@@ -3942,7 +3920,6 @@ var SttTtsPlugin = class {
         }
       }
       if (!isJsonResponse) {
-        console.log(`Time took for emitting ${Date.now() - start}`);
         this.eventEmitter.emit("stream-chunk", content);
         continue;
       }

@@ -165,82 +165,27 @@ export class SttTtsPlugin implements Plugin {
     this.volumeBuffers = new Map<string, number[]>();
   }
 
-  private async processAudioQueue() {
-    if (this.audioBuffer.length === 0) return;
-    const chunk = this.audioBuffer.shift();
-    if (chunk) {
-      await this.streamToJanus(chunk);
-    }
-    this.checkAndStopStreaming();
-    if (this.audioBuffer.length > 0) {
-      setTimeout(() => this.processAudioQueue(), 200); // Add delay between streams
-    }
-  }
 
-  private checkAndStopStreaming() {
-    if (this.audioBuffer.length === 0) {
-      this.stopStreamingToJanus();
-    }
-  }
 
-  private streamToJanus(chunk: Int16Array) {
-    // Push the audio chunk to Janus
-    if (this.janus && chunk.length > 0) {
-      try {
-        // Default to 48kHz sample rate if not specified
-        const sampleRate = 48000;
-        this.janus.pushLocalAudio(chunk, sampleRate);
-        elizaLogger.debug(`[SttTtsPlugin] Streaming Int16Array chunk to Janus: ${chunk.length} samples`);
-      } catch (error) {
-        elizaLogger.error('[SttTtsPlugin] Error streaming to Janus:', error);
-      }
-    } else {
-      elizaLogger.warn('[SttTtsPlugin] Cannot stream to Janus: janus not initialized or empty chunk');
-    }
-    
-    // Simulate streaming delay to prevent overwhelming the server
-    return new Promise((resolve) => setTimeout(resolve, 200));
-  }
 
   /**
-   * Adds an audio chunk for a specific user to the processing buffer
-   * 
-   * This method provides a public API for external components to add audio data
-   * to the plugin's processing pipeline. While the plugin primarily receives audio
-   * through the handleAudioData method (called by event handlers), this method
-   * allows for direct programmatic addition of audio chunks.
-   * 
-   * The audio chunks are stored in the pcmBuffers map, indexed by userId,
-   * and will be processed when silence is detected or the buffer reaches
-   * a sufficient size.
-   * 
-   * @param userId - The unique identifier for the user who generated the audio
-   * @param chunk - The audio data as an Int16Array (PCM format)
+   * Public method to queue a TTS request
    */
-  public addAudioChunk(userId: string, chunk: Int16Array): void {
-    if (!this.pcmBuffers.has(userId)) {
-      this.pcmBuffers.set(userId, []);
-    }
-    this.pcmBuffers.get(userId)?.push(chunk);
-    this.audioBuffer.push(chunk);
-    this.startStreamingToJanus();
-  }
-
-  private startStreamingToJanus() {
-    if (this.streamingInterval) return;
-    this.streamingInterval = setInterval(() => {
-      if (this.audioBuffer.length > 0) {
-        this.processAudioQueue();
-      }
-    }, 200); // Stream every 200ms
-  }
-
-  private stopStreamingToJanus() {
-    if (this.streamingInterval) {
-      clearInterval(this.streamingInterval);
-      this.streamingInterval = null;
+  public async speakText(text: string): Promise<void> {
+    this.ttsQueue.push(text);
+    if (!this.isSpeaking) {
+      this.isSpeaking = true;
+      this.processTtsQueue()
+        .catch((err) => {
+          elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
+        })
+        .then((res) => {
+          return res;
+        });
     }
   }
+  
+
 
   /**
    * Called whenever we receive PCM from a speaker
@@ -358,6 +303,48 @@ export class SttTtsPlugin implements Plugin {
       });
     }
   }
+
+    /**
+   * Process the TTS queue with streaming optimizations
+   */
+    private async processTtsQueue(): Promise<void> {
+      try {
+        while (this.ttsQueue.length > 0) {
+          const text = this.ttsQueue.shift();
+          if (!text) continue;
+  
+          // Create a new abort controller for this specific TTS task
+          this.ttsAbortController = new AbortController();
+          const { signal } = this.ttsAbortController;
+  
+          const startTime = Date.now();
+  
+          try {
+            // Use the new streaming pipeline instead of the sequential approach
+            await this.streamTtsToJanus(text, signal);
+  
+            console.log(
+              `[SttTtsPlugin] Total TTS streaming took: ${Date.now() - startTime}ms`,
+            );
+  
+            // Check for abort after streaming
+            if (signal.aborted) {
+              console.log('[SttTtsPlugin] TTS streaming was interrupted');
+              return;
+            }
+          } catch (err) {
+            console.error('[SttTtsPlugin] TTS streaming error =>', err);
+          } finally {
+            // Clean up the AbortController
+            this.ttsAbortController = null;
+          }
+        }
+      } catch (error) {
+        console.error('[SttTtsPlugin] Queue processing error =>', error);
+      } finally {
+        this.isSpeaking = false;
+      }
+    }
 
   /**
    * On speaker silence => flush STT => GPT => TTS => push to Janus
@@ -1453,7 +1440,6 @@ export class SttTtsPlugin implements Plugin {
 
       // If it's not JSON, emit directly
       if (!isJsonResponse) {
-        console.log(`Time took for emitting ${Date.now() - start}`);
         this.eventEmitter.emit('stream-chunk', content);
         continue;
       }
