@@ -21,7 +21,7 @@ import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
-import { createClient, Deepgram, DeepgramClient } from '@deepgram/sdk';
+import { createClient, Deepgram, DeepgramClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -64,6 +64,8 @@ export class SttTtsPlugin implements Plugin {
   private interruptionThreshold = 3000; // Energy threshold for detecting speech (configurable)
   private consecutiveFramesForInterruption = 5; // Number of consecutive frames to confirm interruption (e.g., 5 frames of 10ms each)
   private interruptionCounter = 0; // Counter for consecutive high-energy frames
+
+  private keepAlive: NodeJS.Timeout | null = null;
 
 
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
@@ -109,6 +111,50 @@ export class SttTtsPlugin implements Plugin {
       punctuate: true,
       smart_format: true,
       model: "nova",
+    });
+
+
+    if (this.keepAlive) clearInterval(this.keepAlive);
+    this.keepAlive = setInterval(() => {
+      console.log("deepgram: keepalive");
+      this.socket.keepAlive();
+    }, 10 * 1000);
+  
+
+    this.socket.addListener(LiveTranscriptionEvents.Open, async () => {
+      console.log("deepgram: connected");
+  
+      this.socket.addListener(LiveTranscriptionEvents.Transcript, (data) => {
+        console.log("deepgram: packet received");
+        console.log("deepgram: transcript received");
+        console.log("socket: transcript sent to client");
+        if (data && this.lastSpeaker) {
+          this.handleTranscription(data, data.is_final, this.lastSpeaker);
+        }
+      });
+  
+      this.socket.addListener(LiveTranscriptionEvents.Close, async () => {
+        console.log("deepgram: disconnected");
+        clearInterval(this.keepAlive);
+        this.socket.finish();
+      });
+  
+      this.socket.addListener(LiveTranscriptionEvents.Error, async (error) => {
+        console.log("deepgram: error received");
+        console.error(error);
+      });
+  
+      this.socket.addListener(LiveTranscriptionEvents.Warning, async (warning) => {
+        console.log("deepgram: warning received");
+        console.warn(warning);
+      });
+  
+      this.socket.addListener(LiveTranscriptionEvents.Metadata, (data) => {
+        console.log("deepgram: packet received");
+        console.log("deepgram: metadata received");
+        console.log("ws: metadata sent to client");
+        this.eventEmitter.emit('metadata', data);
+      });
     });
 
     // Handle Deepgram transcriptions
