@@ -774,12 +774,8 @@ export class SttTtsPlugin implements Plugin {
             // Add natural pauses at punctuation to make speech sound more natural
             // Further reduced pause durations to improve latency
             const textWithPauses = textToProcess
-              .replace(/\.\s+/g, '. <break time="100ms"/> ')
-              .replace(/\?\s+/g, '? <break time="100ms"/> ')
-              .replace(/!\s+/g, '! <break time="100ms"/> ')
-              .replace(/:\s+/g, ': <break time="80ms"/> ')
-              .replace(/;\s+/g, '; <break time="80ms"/> ')
-              .replace(/,\s+/g, ', <break time="30ms"/> ');
+              .replace(/\.\s+/g, '. <break time="50ms"/> ')
+              .replace(/,\s+/g, ', <break time="10ms"/> ');
 
             elizaLogger.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? '...' : ''}"`);
 
