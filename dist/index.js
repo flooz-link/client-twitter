@@ -2965,6 +2965,36 @@ var twitterVoiceHandlerTemplate = `# Task: Generate conversational voice dialog 
 
     # Instructions: Write the next message for {{agentName}}. Include an optional action if appropriate. {{actionNames}}
     ` + messageCompletionFooter3;
+var twitterSpaceTemplate = `# Task: Generate conversational voice dialog for {{agentName}}.
+
+You are in a twitter space, so keeps short and concise.
+Do not create lenghty and repeatitive answers.
+**Important!**
+As you are in a twitter space, your answers will be streamed, hence try to avoid really long answers or really long pauses in your responses.
+
+About {{agentName}}:
+{{bio}}
+
+# Attachments
+{{attachments}}
+
+# Capabilities
+Note that {{agentName}} is capable of multiple tasks but in the context of spaces, can only listen and respond in audio.
+
+{{actions}}
+
+{{messageDirections}}
+
+{{recentMessages}}
+
+# Instructions: Write the next message for {{agentName}}. Include an optional action if appropriate. {{actionNames}}
+    
+Response format should be formatted in a valid JSON block like this:
+\`\`\`json
+{ "user": "{{agentName}}", "text": "<string>", "action": "<string>" }
+\`\`\`
+
+The \u201Caction\u201D field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.`;
 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { PassThrough } from "stream";
@@ -3153,8 +3183,8 @@ var SttTtsPlugin = class {
     }
   }
   /**
-  * Process the TTS queue with streaming optimizations
-  */
+   * Process the TTS queue with streaming optimizations
+   */
   async processTtsQueue() {
     try {
       while (this.ttsQueue.length > 0) {
@@ -3221,6 +3251,22 @@ var SttTtsPlugin = class {
     mp3Stream.pipe(ffmpeg.stdin);
     const audioBuffer = [];
     let processingComplete = false;
+    let isInterrupted = false;
+    if (signal.aborted) {
+      mp3Stream.end();
+      return;
+    }
+    const abortListener = () => {
+      isInterrupted = true;
+      elizaLogger6.log("[SttTtsPlugin] TTS streaming interrupted - cleaning up resources");
+      mp3Stream.end();
+      if (ffmpeg && !ffmpeg.killed) {
+        ffmpeg.kill("SIGTERM");
+      }
+      audioBuffer.length = 0;
+      processingComplete = true;
+    };
+    signal.addEventListener("abort", abortListener);
     const elevenLabsPromise = this.elevenLabsTtsStreaming(
       text,
       mp3Stream,
@@ -3230,7 +3276,7 @@ var SttTtsPlugin = class {
       let pcmBuffer = Buffer.alloc(0);
       ffmpeg.stdout.on("data", (chunk) => {
         try {
-          if (signal.aborted) return;
+          if (isInterrupted || signal.aborted) return;
           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
           while (pcmBuffer.length >= FRAME_SIZE * 2) {
             const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
@@ -3242,7 +3288,9 @@ var SttTtsPlugin = class {
             );
             const frameCopy = new Int16Array(FRAME_SIZE);
             frameCopy.set(frame);
-            audioBuffer.push(frameCopy);
+            if (!isInterrupted && !signal.aborted) {
+              audioBuffer.push(frameCopy);
+            }
           }
         } catch (error) {
           reject(error);
@@ -3255,13 +3303,13 @@ var SttTtsPlugin = class {
       });
       ffmpeg.on("close", (code) => {
         try {
-          if (code !== 0 && !signal.aborted) {
+          if (code !== 0 && !signal.aborted && !isInterrupted) {
             reject(
               new Error(`ffmpeg streaming process exited with code ${code}`)
             );
             return;
           }
-          if (pcmBuffer.length > 0 && !signal.aborted) {
+          if (pcmBuffer.length > 0 && !signal.aborted && !isInterrupted) {
             const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
             pcmBuffer.copy(
               frameBuffer,
@@ -3296,7 +3344,7 @@ var SttTtsPlugin = class {
         // Also wait for a minimum buffer to build up before starting playback
         new Promise((resolve) => {
           const checkBuffer = () => {
-            if (audioBuffer.length > 10 || signal.aborted) {
+            if (audioBuffer.length > 10 || signal.aborted || isInterrupted) {
               resolve();
             } else {
               setTimeout(checkBuffer, 50);
@@ -3307,11 +3355,11 @@ var SttTtsPlugin = class {
       ]);
       let frameIndex = 0;
       const startTime = Date.now();
-      while ((frameIndex < audioBuffer.length || !processingComplete) && !signal.aborted) {
+      while ((frameIndex < audioBuffer.length || !processingComplete) && !signal.aborted && !isInterrupted) {
         if (frameIndex >= audioBuffer.length && !processingComplete) {
           await new Promise((resolve) => {
             const waitForMoreFrames = () => {
-              if (frameIndex < audioBuffer.length || processingComplete || signal.aborted) {
+              if (frameIndex < audioBuffer.length || processingComplete || signal.aborted || isInterrupted) {
                 resolve();
               } else {
                 setTimeout(waitForMoreFrames, 20);
@@ -3319,7 +3367,7 @@ var SttTtsPlugin = class {
             };
             waitForMoreFrames();
           });
-          if (frameIndex >= audioBuffer.length) {
+          if (frameIndex >= audioBuffer.length || signal.aborted || isInterrupted) {
             break;
           }
         }
@@ -3341,6 +3389,10 @@ var SttTtsPlugin = class {
             continue;
           }
         }
+        if (signal.aborted || isInterrupted) {
+          elizaLogger6.log("[SttTtsPlugin] Streaming interrupted during frame playback");
+          break;
+        }
         const frame = audioBuffer[frameIndex];
         try {
           await this.streamChunkToJanus(frame, SAMPLE_RATE);
@@ -3352,18 +3404,27 @@ var SttTtsPlugin = class {
         }
         frameIndex++;
       }
-      await processingPromise;
-      await elevenLabsPromise;
-      elizaLogger6.log(
-        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`
-      );
+      if (signal.aborted || isInterrupted) {
+        elizaLogger6.log("[SttTtsPlugin] Audio streaming was interrupted before completion");
+      } else if (!isInterrupted) {
+        await processingPromise;
+        await elevenLabsPromise;
+        elizaLogger6.log(
+          `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`
+        );
+      }
     } catch (error) {
-      if (signal.aborted) {
+      if (signal.aborted || isInterrupted) {
         elizaLogger6.log("[SttTtsPlugin] Audio streaming aborted");
       } else {
         elizaLogger6.error("[SttTtsPlugin] Audio streaming error:", error);
       }
       throw error;
+    } finally {
+      signal.removeEventListener("abort", abortListener);
+      if (ffmpeg && !ffmpeg.killed) {
+        ffmpeg.kill("SIGTERM");
+      }
     }
   }
   /**
@@ -3829,7 +3890,7 @@ var SttTtsPlugin = class {
    * Handle User Message with streaming support
    */
   async handleUserMessageStreaming(userText, userId) {
-    var _a, _b, _c, _d;
+    var _a, _b;
     const numericId = userId.replace("tw-", "");
     const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
     const userUuid = stringToUuid6(`twitter-user-${numericId}`);
@@ -3886,7 +3947,7 @@ var SttTtsPlugin = class {
     }
     const context = composeContext4({
       state,
-      template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate
+      template: twitterSpaceTemplate
     });
     elizaLogger6.log("[SttTtsPlugin] Character info:", {
       name: this.runtime.character.name,
@@ -3916,7 +3977,7 @@ var SttTtsPlugin = class {
     let isJsonResponse = false;
     let textValue = "";
     for await (const chunk of stream) {
-      const content = ((_d = (_c = chunk.choices[0]) == null ? void 0 : _c.delta) == null ? void 0 : _d.content) || "";
+      const content = ((_b = (_a = chunk.choices[0]) == null ? void 0 : _a.delta) == null ? void 0 : _b.content) || "";
       if (!content) continue;
       fullResponse += content;
       if (!isJsonResponse && jsonBuffer.length < 30) {
