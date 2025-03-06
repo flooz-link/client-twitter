@@ -3112,8 +3112,7 @@ var SttTtsPlugin = class {
       `[SttTtsPlugin] Received audio data for user=${data.userId}, samples length=${data.samples.length}`
     );
     if (this.isProcessingAudio) {
-      elizaLogger6.debug("[SttTtsPlugin] Currently processing audio, skipping this chunk");
-      return;
+      elizaLogger6.debug("[SttTtsPlugin] Currently processing audio, but still collecting this chunk");
     }
     let maxVal = 0;
     let sumVal = 0;
@@ -3461,7 +3460,8 @@ var SttTtsPlugin = class {
       this.currentStreamId = streamId;
       this.activeStreams.add(streamId);
       elizaLogger6.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
-      const chunks = this.pcmBuffers.get(userId) || [];
+      const userPcmBuffers = this.pcmBuffers.get(userId) || [];
+      const chunks = [...userPcmBuffers];
       this.pcmBuffers.delete(userId);
       if (!chunks.length) {
         elizaLogger6.warn("[SttTtsPlugin] No audio chunks for user =>", userId);

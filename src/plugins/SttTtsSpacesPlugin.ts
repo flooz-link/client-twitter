@@ -201,9 +201,12 @@ export class SttTtsPlugin implements Plugin {
       `samples length=${data.samples.length}`
     );
 
+    // CRITICAL FIX: Don't skip audio chunks when processing audio
+    // This was causing the race condition where chunks were being lost
+    // We'll still log it but continue processing
     if (this.isProcessingAudio) {
-      elizaLogger.debug('[SttTtsPlugin] Currently processing audio, skipping this chunk');
-      return;
+      elizaLogger.debug('[SttTtsPlugin] Currently processing audio, but still collecting this chunk');
+      // Don't return here - continue to process this chunk
     }
 
     // Calculate the maximum amplitude in this audio chunk
@@ -709,8 +712,12 @@ export class SttTtsPlugin implements Plugin {
 
       elizaLogger.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
 
-      // Get chunks and clear only this user's buffer
-      const chunks = this.pcmBuffers.get(userId) || [];
+      // CRITICAL FIX: Make a copy of the chunks before clearing the buffer
+      // This prevents race conditions where new audio data might be added while we're processing
+      const userPcmBuffers = this.pcmBuffers.get(userId) || [];
+      const chunks = [...userPcmBuffers]; // Create a copy of the array
+      
+      // Only clear the buffer AFTER we've made a copy
       this.pcmBuffers.delete(userId);
 
       if (!chunks.length) {
