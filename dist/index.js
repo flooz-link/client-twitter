@@ -3013,6 +3013,7 @@ var SttTtsPlugin = class {
   volumeBuffers;
   ttsAbortController = null;
   eventEmitter = new EventEmitter2();
+  openai;
   onAttach(_space) {
     elizaLogger6.log("[SttTtsPlugin] onAttach => space was attached");
   }
@@ -3046,12 +3047,18 @@ var SttTtsPlugin = class {
     if (config == null ? void 0 : config.chatContext) {
       this.chatContext = config.chatContext;
     }
-    if (config == null ? void 0 : config.grokApiKey) {
-      this.grokApiKey = config == null ? void 0 : config.grokApiKey;
+    this.grokApiKey = (config == null ? void 0 : config.grokApiKey) ?? this.runtime.getSetting("GROK_API_KEY");
+    this.grokBaseUrl = (config == null ? void 0 : config.grokBaseUrl) ?? this.runtime.getSetting("GROK_BASE_URL") ?? "https://api.x.ai/v1";
+    if (isEmpty(this.grokApiKey)) {
+      throw new Error("Grok API key is required");
     }
-    if (config == null ? void 0 : config.grokBaseUrl) {
-      this.grokBaseUrl = config == null ? void 0 : config.grokBaseUrl;
+    if (isEmpty(this.grokBaseUrl)) {
+      throw new Error("Grok base URL is required");
     }
+    this.openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl
+    });
     this.volumeBuffers = /* @__PURE__ */ new Map();
     this.processingLocks = /* @__PURE__ */ new Map();
   }
@@ -3176,7 +3183,6 @@ var SttTtsPlugin = class {
     });
     this.processingLocks.set(userId, lockPromise);
     try {
-      const start = Date.now();
       elizaLogger6.log(
         "[SttTtsPlugin] Starting audio processing for user:",
         userId
@@ -3193,16 +3199,13 @@ var SttTtsPlugin = class {
       const mergeBufferPromise = this.mergeAudioChunks(chunks);
       this.volumeBuffers.delete(userId);
       const merged = await mergeBufferPromise;
-      console.log(`PCM merging took: ${Date.now() - start} ms`);
       const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
-      const wavBufferPromise = this.convertPcmToWavInMemory(
+      const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
         optimizedPcm === merged ? 48e3 : 16e3
       );
-      const wavBuffer = await wavBufferPromise;
-      console.log(`Convert Wav took: ${Date.now() - start} ms`);
-      const transcriptionPromise = this.transcriptionService.transcribe(wavBuffer);
-      const sttText = await transcriptionPromise;
+      const start = Date.now();
+      const sttText = await this.transcriptionService.transcribe(wavBuffer);
       console.log(`Transcription took: ${Date.now() - start} ms`);
       elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
       if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
@@ -3216,9 +3219,28 @@ var SttTtsPlugin = class {
         `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
       );
       let accumulatedText = "";
-      let minChunkSize = 20;
+      const minChunkSize = 50;
       let currentChunk = "";
       let isSpeaking = false;
+      let pendingChunks = [];
+      let processingTimer = null;
+      const isNaturalBreakPoint = (text) => {
+        return /[.!?;:](\s|$)/.test(text) || // Sentence endings or strong pauses
+        /[,](\s|$)/.test(text) && text.length > 30;
+      };
+      const processQueuedChunks = async () => {
+        if (pendingChunks.length === 0) return;
+        const textToSpeak = pendingChunks.join("");
+        pendingChunks = [];
+        const textWithPauses = textToSpeak.replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2').replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
+        if (!isSpeaking) {
+          isSpeaking = true;
+          await this.speakText(textWithPauses);
+          isSpeaking = false;
+        } else {
+          this.ttsQueue.push(textWithPauses);
+        }
+      };
       this.eventEmitter.once("stream-start", () => {
         elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
       });
@@ -3228,24 +3250,28 @@ var SttTtsPlugin = class {
         }
         accumulatedText += chunk;
         currentChunk += chunk;
-        if (currentChunk.length >= minChunkSize || /[.!?](\s|$)/.test(currentChunk)) {
+        if (processingTimer) {
+          clearTimeout(processingTimer);
+          processingTimer = null;
+        }
+        if (currentChunk.length >= minChunkSize || isNaturalBreakPoint(currentChunk)) {
           const chunkToProcess = currentChunk;
           currentChunk = "";
-          if (!isSpeaking) {
-            isSpeaking = true;
-            await this.speakText(chunkToProcess);
-            isSpeaking = false;
-          } else {
-            this.ttsQueue.push(chunkToProcess);
-          }
+          pendingChunks.push(chunkToProcess);
+          processingTimer = setTimeout(processQueuedChunks, 300);
         }
       });
       this.eventEmitter.once("stream-end", () => {
         if (currentChunk.length > 0) {
-          this.ttsQueue.push(currentChunk);
+          pendingChunks.push(currentChunk);
+        }
+        if (pendingChunks.length > 0) {
+          processQueuedChunks();
         }
         elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
-        elizaLogger6.log(`[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`);
+        elizaLogger6.log(
+          `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`
+        );
         this.eventEmitter.removeAllListeners("stream-chunk");
         this.eventEmitter.removeAllListeners("stream-start");
         this.eventEmitter.removeAllListeners("stream-end");
@@ -3300,11 +3326,9 @@ var SttTtsPlugin = class {
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
-      const start = Date.now();
       this.processTtsQueue().catch((err) => {
         elizaLogger6.error("[SttTtsPlugin] processTtsQueue error =>", err);
       }).then((res) => {
-        console.log(`Voice took ${Date.now() - start}`);
         return res;
       });
     }
@@ -3558,14 +3582,8 @@ var SttTtsPlugin = class {
             0,
             EXPECTED_SAMPLES
           );
-          console.log(
-            `[SttTtsPlugin] Sending audio frame: ${bufferView.length} samples, ${bufferView.buffer.byteLength} bytes`
-          );
           (_a = this.janus) == null ? void 0 : _a.pushLocalAudio(bufferView, sampleRate);
         } else {
-          console.log(
-            `[SttTtsPlugin] Sending audio frame: ${samples.length} samples, ${samples.buffer.byteLength} bytes`
-          );
           (_b = this.janus) == null ? void 0 : _b.pushLocalAudio(samples, sampleRate);
         }
         resolve();
@@ -3736,14 +3754,73 @@ var SttTtsPlugin = class {
    * Handle User Message with streaming support
    */
   async handleUserMessageStreaming(userText, userId) {
-    var _a, _b;
-    const openai = new OpenAI({
-      apiKey: this.grokApiKey,
-      baseURL: this.grokBaseUrl
+    var _a, _b, _c, _d;
+    const numericId = userId.replace("tw-", "");
+    const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
+    const userUuid = stringToUuid6(`twitter-user-${numericId}`);
+    await Promise.all([
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId,
+        // Use full Twitter ID as username
+        `Twitter User ${numericId}`,
+        "twitter"
+      ),
+      this.runtime.ensureRoomExists(roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId)
+    ]).catch((error) => {
+      elizaLogger6.warn(`Error when handling streaming for spaces error ${error} ignoring`);
+      return;
+    });
+    const memory = {
+      id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
+      agentId: this.runtime.agentId,
+      content: {
+        text: userText,
+        source: "twitter"
+      },
+      userId: userUuid,
+      roomId,
+      embedding: getEmbeddingZeroVector5(),
+      createdAt: Date.now()
+    };
+    let [state] = await Promise.all([
+      this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: userText, source: "twitter" },
+          userId: userUuid,
+          roomId
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name
+        }
+      ),
+      this.runtime.messageManager.createMemory(memory).catch((error) => {
+        elizaLogger6.warn(`Error when creating memories for twitter spaces ${error} ignoring`);
+        return;
+      })
+    ]);
+    state = await this.runtime.updateRecentMessageState(state).catch((error) => {
+      elizaLogger6.warn(`Error when updating recent message state from spaces ${error} ignoring`);
+      return state;
+    });
+    const shouldIgnore = await this._shouldIgnore(memory);
+    if (shouldIgnore) {
+      return;
+    }
+    const context = composeContext4({
+      state,
+      template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate
+    });
+    elizaLogger6.log("[SttTtsPlugin] Character info:", {
+      name: this.runtime.character.name,
+      system: this.runtime.character.system
     });
     const systemMessage = {
       role: "system",
-      content: this.runtime.character.system
+      content: context
     };
     const userMessage = {
       role: "user",
@@ -3751,36 +3828,100 @@ var SttTtsPlugin = class {
     };
     const messages = [...this.chatContext, systemMessage, userMessage];
     this.eventEmitter.emit("stream-start");
-    const stream = await openai.chat.completions.create({
+    const start = Date.now();
+    const stream = await this.openai.chat.completions.create({
       model: "grok-2-latest",
       messages,
       stream: true
     });
     let fullResponse = "";
+    let jsonBuffer = "";
+    let isJsonResponse = false;
+    let textValue = "";
     for await (const chunk of stream) {
-      const content = ((_b = (_a = chunk.choices[0]) == null ? void 0 : _a.delta) == null ? void 0 : _b.content) || "";
-      if (content) {
-        fullResponse += content;
+      const content = ((_d = (_c = chunk.choices[0]) == null ? void 0 : _c.delta) == null ? void 0 : _d.content) || "";
+      if (!content) continue;
+      fullResponse += content;
+      if (!isJsonResponse && jsonBuffer.length < 30) {
+        jsonBuffer += content;
+        if (jsonBuffer.includes("```json") || jsonBuffer.includes("```\njson") || jsonBuffer.includes("```") || jsonBuffer.includes("{")) {
+          isJsonResponse = true;
+        }
+      }
+      if (!isJsonResponse) {
+        console.log(`Time took for emitting ${Date.now() - start}`);
         this.eventEmitter.emit("stream-chunk", content);
+        continue;
+      }
+      jsonBuffer += content;
+      try {
+        const textMatch = /"text":\s*"([^"]*)/.exec(jsonBuffer);
+        if (textMatch) {
+          const capturedText = textMatch[1];
+          if (capturedText.length > textValue.length) {
+            const newText = capturedText.substring(textValue.length);
+            console.log(`Time took for emitting ${Date.now() - start}`);
+            this.eventEmitter.emit("stream-chunk", newText);
+            textValue = capturedText;
+          }
+        }
+        if (jsonBuffer.includes("}") && (jsonBuffer.includes("```") || jsonBuffer.endsWith("}"))) {
+          let jsonStr = jsonBuffer;
+          if (jsonStr.includes("```json")) {
+            jsonStr = jsonStr.replace(/```json\s*/, "").replace(/\s*```$/, "");
+          } else if (jsonStr.includes("```")) {
+            jsonStr = jsonStr.replace(/```\s*/, "").replace(/\s*```$/, "");
+          }
+          const firstBrace = jsonStr.indexOf("{");
+          const lastBrace = jsonStr.lastIndexOf("}");
+          if (firstBrace >= 0 && lastBrace > firstBrace) {
+            const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
+            try {
+              const parsed = JSON.parse(jsonObject);
+              if (parsed.text && parsed.text.length > textValue.length) {
+                const newText = parsed.text.substring(textValue.length);
+                console.log(`Time took for emitting ${Date.now() - start}`);
+                this.eventEmitter.emit("stream-chunk", newText);
+                textValue = parsed.text;
+              }
+            } catch (e) {
+            }
+          }
+        }
+      } catch (e) {
       }
     }
-    this.eventEmitter.emit("stream-end");
-    if (fullResponse.trim()) {
-      const responseMemory = {
-        id: stringToUuid6(`${userId}-voice-response-${Date.now()}`),
-        agentId: this.runtime.agentId,
-        userId: this.runtime.agentId,
-        content: {
-          text: fullResponse,
-          source: "twitter",
-          user: this.runtime.character.name
-          // inReplyTo: userId,
-        },
-        roomId: stringToUuid6(`twitter_generate_room-${this.spaceId}`),
-        embedding: getEmbeddingZeroVector5()
-      };
-      await this.runtime.messageManager.createMemory(responseMemory);
+    if (isJsonResponse && jsonBuffer && !textValue) {
+      try {
+        let jsonStr = jsonBuffer;
+        if (jsonStr.includes("```json")) {
+          jsonStr = jsonStr.replace(/```json\s*/, "").replace(/\s*```$/, "");
+        } else if (jsonStr.includes("```")) {
+          jsonStr = jsonStr.replace(/```\s*/, "").replace(/\s*```$/, "");
+        }
+        const firstBrace = jsonStr.indexOf("{");
+        const lastBrace = jsonStr.lastIndexOf("}");
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
+          const parsed = JSON.parse(jsonObject);
+          if (parsed.text) {
+            console.log(`Time took for emitting ${Date.now() - start}`);
+            this.eventEmitter.emit("stream-chunk", parsed.text);
+          } else {
+            console.log(`Time took for emitting ${Date.now() - start}`);
+            this.eventEmitter.emit("stream-chunk", jsonBuffer);
+          }
+        } else {
+          console.log(`Time took for emitting ${Date.now() - start}`);
+          this.eventEmitter.emit("stream-chunk", jsonBuffer);
+        }
+      } catch (e) {
+        console.log(`Time took for emitting ${Date.now() - start}`);
+        this.eventEmitter.emit("stream-chunk", jsonBuffer);
+      }
     }
+    console.log(`Time took for completing LLM ${Date.now() - start}`);
+    this.eventEmitter.emit("stream-end");
   }
   /**
    * Generate Response

@@ -114,6 +114,7 @@ export class SttTtsPlugin implements Plugin {
   private ttsAbortController: AbortController | null = null;
 
   private eventEmitter = new EventEmitter();
+  private openai: OpenAI;
 
   onAttach(_space: Space) {
     elizaLogger.log('[SttTtsPlugin] onAttach => space was attached');
@@ -155,6 +156,18 @@ export class SttTtsPlugin implements Plugin {
       config?.grokBaseUrl ??
       this.runtime.getSetting('GROK_BASE_URL') ??
       'https://api.x.ai/v1';
+
+    if (isEmpty(this.grokApiKey)) {
+      throw new Error('Grok API key is required');
+    }
+    if (isEmpty(this.grokBaseUrl)) {
+      throw new Error('Grok base URL is required');
+    }
+
+    this.openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl,
+    });
 
     this.volumeBuffers = new Map<string, number[]>();
     this.processingLocks = new Map<string, Promise<void>>();
@@ -316,7 +329,6 @@ export class SttTtsPlugin implements Plugin {
     this.processingLocks.set(userId, lockPromise);
 
     try {
-      const start = Date.now();
       elizaLogger.log(
         '[SttTtsPlugin] Starting audio processing for user:',
         userId,
@@ -346,7 +358,6 @@ export class SttTtsPlugin implements Plugin {
 
       // 3. Wait for buffer merging to complete and continue with dependent operations
       const merged = await mergeBufferPromise;
-      console.log(`PCM merging took: ${Date.now() - start} ms`);
 
       // 4. Start audio optimization (CPU-bound) and WAV conversion (potentially I/O bound) in parallel
       const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
@@ -357,11 +368,10 @@ export class SttTtsPlugin implements Plugin {
         optimizedPcm === merged ? 48000 : 16000,
       );
 
-      console.log(`Convert Wav took: ${Date.now() - start} ms`);
+      const start = Date.now();
 
       // 10. Start transcription (I/O and CPU intensive)
-      const sttText =
-        await this.transcriptionService.transcribe(wavBuffer);
+      const sttText = await this.transcriptionService.transcribe(wavBuffer);
 
       console.log(`Transcription took: ${Date.now() - start} ms`);
 
@@ -391,24 +401,26 @@ export class SttTtsPlugin implements Plugin {
       // Helper function to determine if a text chunk forms a natural break point
       const isNaturalBreakPoint = (text: string): boolean => {
         // Check for sentence endings or natural pauses
-        return /[.!?;:](\s|$)/.test(text) || // Sentence endings or strong pauses
-               /[,](\s|$)/.test(text) && text.length > 30; // Commas with sufficient context
+        return (
+          /[.!?;:](\s|$)/.test(text) || // Sentence endings or strong pauses
+          (/[,](\s|$)/.test(text) && text.length > 30)
+        ); // Commas with sufficient context
       };
 
       // Process chunks with a slight delay to allow for more complete thoughts
       const processQueuedChunks = async () => {
         if (pendingChunks.length === 0) return;
-        
+
         // Join pending chunks into a more natural speech unit
         const textToSpeak = pendingChunks.join('');
         pendingChunks = [];
-        
+
         // Add slight pauses for more natural speech rhythm
         // Replace periods and other sentence endings with a period and a pause marker
         const textWithPauses = textToSpeak
           .replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2')
           .replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
-        
+
         if (!isSpeaking) {
           isSpeaking = true;
           await this.speakText(textWithPauses);
@@ -439,13 +451,16 @@ export class SttTtsPlugin implements Plugin {
         }
 
         // Process chunk when it reaches minimum size or contains natural break points
-        if (currentChunk.length >= minChunkSize || isNaturalBreakPoint(currentChunk)) {
+        if (
+          currentChunk.length >= minChunkSize ||
+          isNaturalBreakPoint(currentChunk)
+        ) {
           const chunkToProcess = currentChunk;
           currentChunk = '';
-          
+
           // Add to pending chunks
           pendingChunks.push(chunkToProcess);
-          
+
           // Set a timer to process chunks, allowing more text to accumulate
           // This creates more natural speech by processing larger, more complete thoughts
           processingTimer = setTimeout(processQueuedChunks, 300);
@@ -458,7 +473,7 @@ export class SttTtsPlugin implements Plugin {
         if (currentChunk.length > 0) {
           pendingChunks.push(currentChunk);
         }
-        
+
         // Process any final chunks immediately
         if (pendingChunks.length > 0) {
           processQueuedChunks();
@@ -542,13 +557,11 @@ export class SttTtsPlugin implements Plugin {
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
-      const start = Date.now();
       this.processTtsQueue()
         .catch((err) => {
           elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
         })
         .then((res) => {
-          console.log(`Voice took ${Date.now() - start}`);
           return res;
         });
     }
@@ -1160,9 +1173,10 @@ export class SttTtsPlugin implements Plugin {
       ),
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]);
-
-    let start = Date.now();
+    ]).catch(error => {
+      elizaLogger.warn(`Error when handling streaming for spaces error ${error} ignoring`)
+      return;
+    });
 
     const memory = {
       id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
@@ -1190,13 +1204,16 @@ export class SttTtsPlugin implements Plugin {
           agentName: this.runtime.character.name,
         },
       ),
-      this.runtime.messageManager.createMemory(memory),
+      this.runtime.messageManager.createMemory(memory).catch(error => {
+        elizaLogger.warn(`Error when creating memories for twitter spaces ${error} ignoring`);
+        return;
+      }),
     ]);
 
-    start = Date.now();
-    state = await this.runtime.updateRecentMessageState(state);
-    console.log(`Recent messages state update took ${Date.now() - start} ms`);
-
+    state = await this.runtime.updateRecentMessageState(state).catch(error => {
+      elizaLogger.warn(`Error when updating recent message state from spaces ${error} ignoring`);
+      return state;
+    });
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
       return;
@@ -1217,12 +1234,6 @@ export class SttTtsPlugin implements Plugin {
       system: this.runtime.character.system,
     });
 
-    // Create OpenAI client
-    const openai = new OpenAI({
-      apiKey: this.grokApiKey,
-      baseURL: this.grokBaseUrl,
-    });
-
     // Create a system message that includes the full context
     const systemMessage = {
       role: 'system' as const,
@@ -1239,8 +1250,9 @@ export class SttTtsPlugin implements Plugin {
     // Signal stream start
     this.eventEmitter.emit('stream-start');
 
+    const start = Date.now();
     // Make streaming request to Grok
-    const stream = await openai.chat.completions.create({
+    const stream = await this.openai.chat.completions.create({
       model: 'grok-2-latest',
       messages: messages,
       stream: true,
@@ -1250,75 +1262,84 @@ export class SttTtsPlugin implements Plugin {
     let jsonBuffer = '';
     let isJsonResponse = false;
     let textValue = '';
-    let lastEmittedLength = 0;
 
     // Process each chunk as it arrives
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content || '';
       if (!content) continue;
-      
+
       fullResponse += content;
-      
+
       // Check early chunks for JSON indicators
       if (!isJsonResponse && jsonBuffer.length < 30) {
         jsonBuffer += content;
-        if (jsonBuffer.includes('```json') || jsonBuffer.includes('```\njson') || 
-            jsonBuffer.includes('```') || jsonBuffer.includes('{')) {
+        if (
+          jsonBuffer.includes('```json') ||
+          jsonBuffer.includes('```\njson') ||
+          jsonBuffer.includes('```') ||
+          jsonBuffer.includes('{')
+        ) {
           isJsonResponse = true;
         }
       }
-      
+
       // If it's not JSON, emit directly
       if (!isJsonResponse) {
+        console.log(`Time took for emitting ${Date.now()-start}`)
         this.eventEmitter.emit('stream-chunk', content);
         continue;
       }
-      
+
       // It's JSON, continue buffering
       jsonBuffer += content;
-      
+
       // Try to extract the text field value
       try {
         // Look for "text": pattern
         const textMatch = /"text":\s*"([^"]*)/.exec(jsonBuffer);
-        
+
         if (textMatch) {
           // We found the text field
           const capturedText = textMatch[1];
-          
+
           // If we have more text than before, emit the difference
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
+            console.log(`Time took for emitting ${Date.now()-start}`)
             this.eventEmitter.emit('stream-chunk', newText);
             textValue = capturedText;
           }
         }
-        
+
         // Also check for a complete JSON object and parse it
-        if (jsonBuffer.includes('}') && (jsonBuffer.includes('```') || jsonBuffer.endsWith('}'))) {
+        if (
+          jsonBuffer.includes('}') &&
+          (jsonBuffer.includes('```') || jsonBuffer.endsWith('}'))
+        ) {
           // Try to extract the complete JSON
           let jsonStr = jsonBuffer;
-          
+
           // Clean up markdown code block syntax if present
           if (jsonStr.includes('```json')) {
             jsonStr = jsonStr.replace(/```json\s*/, '').replace(/\s*```$/, '');
           } else if (jsonStr.includes('```')) {
             jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
           }
-          
+
           // Find the first { and last }
           const firstBrace = jsonStr.indexOf('{');
           const lastBrace = jsonStr.lastIndexOf('}');
-          
+
           if (firstBrace >= 0 && lastBrace > firstBrace) {
             const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
-            
+
             try {
               const parsed = JSON.parse(jsonObject);
-              
+
               // If we have a text field, emit any new content
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
+                console.log(`Time took for emitting ${Date.now()-start}`)
                 this.eventEmitter.emit('stream-chunk', newText);
                 textValue = parsed.text;
               }
@@ -1342,52 +1363,60 @@ export class SttTtsPlugin implements Plugin {
         } else if (jsonStr.includes('```')) {
           jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
         }
-        
+
         // Find the first { and last }
         const firstBrace = jsonStr.indexOf('{');
         const lastBrace = jsonStr.lastIndexOf('}');
-        
+
         if (firstBrace >= 0 && lastBrace > firstBrace) {
           const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
           const parsed = JSON.parse(jsonObject);
-          
+
           if (parsed.text) {
+            console.log(`Time took for emitting ${Date.now()-start}`)
             this.eventEmitter.emit('stream-chunk', parsed.text);
           } else {
+            console.log(`Time took for emitting ${Date.now()-start}`)
             // No text field found, emit the whole buffer as fallback
             this.eventEmitter.emit('stream-chunk', jsonBuffer);
           }
         } else {
+          console.log(`Time took for emitting ${Date.now()-start}`)
           // No valid JSON found, emit the whole buffer as fallback
           this.eventEmitter.emit('stream-chunk', jsonBuffer);
         }
       } catch (e) {
+        console.log(`Time took for emitting ${Date.now()-start}`)
         // Parsing failed, emit the whole buffer as fallback
         this.eventEmitter.emit('stream-chunk', jsonBuffer);
       }
     }
 
+    console.log(`Time took for completing LLM ${Date.now()-start}`)
     // Signal stream end
     this.eventEmitter.emit('stream-end');
 
     // Save the complete response to memory
-    if (fullResponse.trim()) {
-      const responseMemory: Memory = {
-        id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
-        agentId: this.runtime.agentId,
-        userId: this.runtime.agentId,
-        content: {
-          text: fullResponse,
-          source: 'twitter',
-          user: this.runtime.character.name,
-          inReplyTo: memory.id,
-        },
-        roomId,
-        embedding: getEmbeddingZeroVector(),
-      };
+    // if (fullResponse.trim()) {
+    //   const responseMemory: Memory = {
+    //     id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
+    //     agentId: this.runtime.agentId,
+    //     userId: this.runtime.agentId,
+    //     content: {
+    //       text: fullResponse,
+    //       source: 'twitter',
+    //       user: this.runtime.character.name,
+    //       inReplyTo: memory.id,
+    //     },
+    //     roomId,
+    //     embedding: getEmbeddingZeroVector(),
+    //   };
 
-      await this.runtime.messageManager.createMemory(responseMemory);
-    }
+    //   await this.runtime.messageManager.createMemory(responseMemory).catch(error => {
+    //     elizaLogger.warn(`Error when creating memory after response on spaces ${error} ignoring`)
+    //     return;
+    //   });
+    // }
   }
 
   /**
