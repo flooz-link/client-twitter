@@ -172,12 +172,41 @@ export class SttTtsPlugin implements Plugin {
     if (this.isProcessingAudio) {
       return;
     }
+    
+    // Calculate the maximum amplitude in this audio chunk
     let maxVal = 0;
     for (let i = 0; i < data.samples.length; i++) {
       const val = Math.abs(data.samples[i]);
       if (val > maxVal) maxVal = val;
     }
-    if (maxVal < this.silenceThreshold) {
+    
+    // Initialize or get the volume buffer for this user
+    let volumeBuffer = this.volumeBuffers.get(data.userId);
+    if (!volumeBuffer) {
+      volumeBuffer = [];
+      this.volumeBuffers.set(data.userId, volumeBuffer);
+    }
+    
+    // Add the current max amplitude to the volume buffer
+    volumeBuffer.push(maxVal);
+    
+    // Keep the buffer at a reasonable size
+    if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
+      volumeBuffer.shift();
+    }
+    
+    // Calculate average and standard deviation to detect voice vs. noise
+    const avgVolume = volumeBuffer.reduce((sum, val) => sum + val, 0) / volumeBuffer.length;
+    
+    // Calculate standard deviation
+    const variance = volumeBuffer.reduce((sum, val) => sum + Math.pow(val - avgVolume, 2), 0) / volumeBuffer.length;
+    const stdDev = Math.sqrt(variance);
+    
+    // Voice typically has higher variance than background noise
+    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
+    
+    // Skip processing if below threshold or likely not voice
+    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
       return;
     }
 
@@ -194,6 +223,22 @@ export class SttTtsPlugin implements Plugin {
 
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
+        // Only process if we have enough audio data (prevents processing very short noises)
+        const chunks = this.pcmBuffers.get(data.userId) || [];
+        const totalAudioLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        
+        // Require at least 0.5 seconds of audio (24000 samples at 48kHz) to process
+        const minSamplesToProcess = 48000 * 0.5;
+        
+        if (totalAudioLength < minSamplesToProcess) {
+          elizaLogger.log(
+            '[SttTtsPlugin] Audio too short, skipping processing for user =>',
+            data.userId,
+            `(${totalAudioLength} samples)`
+          );
+          return;
+        }
+        
         elizaLogger.log(
           '[SttTtsPlugin] start processing audio for user =>',
           data.userId,
@@ -204,32 +249,57 @@ export class SttTtsPlugin implements Plugin {
         );
       }, this.silenceDetectionThreshold);
     } else {
-      // check interruption
-      let volumeBuffer = this.volumeBuffers.get(data.userId);
-      if (!volumeBuffer) {
-        volumeBuffer = [];
-        this.volumeBuffers.set(data.userId, volumeBuffer);
-      }
+      // Check for interruption - but only if it's likely to be real speech
+      // Apply the same voice detection logic we use for initial processing
+      
+      // Get normalized amplitude for this chunk (0-1 scale)
       const samples = new Int16Array(
         data.samples.buffer,
         data.samples.byteOffset,
         data.samples.length / 2,
       );
       const maxAmplitude = Math.max(...samples.map(Math.abs)) / 32768;
-      volumeBuffer.push(maxAmplitude);
-
-      if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
-        volumeBuffer.shift();
+      
+      // Track amplitudes for interruption detection
+      let interruptBuffer = this.volumeBuffers.get(`interrupt-${data.userId}`);
+      if (!interruptBuffer) {
+        interruptBuffer = [];
+        this.volumeBuffers.set(`interrupt-${data.userId}`, interruptBuffer);
       }
-      const avgVolume =
-        volumeBuffer.reduce((sum, v) => sum + v, 0) / VOLUME_WINDOW_SIZE;
-
-      if (avgVolume > SPEAKING_THRESHOLD) {
-        volumeBuffer.length = 0;
+      
+      interruptBuffer.push(maxAmplitude);
+      
+      if (interruptBuffer.length > VOLUME_WINDOW_SIZE) {
+        interruptBuffer.shift();
+      }
+      
+      // Calculate average volume
+      const avgInterruptVolume = 
+        interruptBuffer.reduce((sum, v) => sum + v, 0) / interruptBuffer.length;
+      
+      // Calculate variance and standard deviation
+      const interruptVariance = 
+        interruptBuffer.reduce((sum, v) => sum + Math.pow(v - avgInterruptVolume, 2), 0) / interruptBuffer.length;
+      const interruptStdDev = Math.sqrt(interruptVariance);
+      
+      // Check if this is likely sustained speech (not just clicks or background noise)
+      // Require higher thresholds for interruption than for initial detection
+      const isLikelySustainedSpeech = 
+        avgInterruptVolume > SPEAKING_THRESHOLD && 
+        interruptStdDev > 0.05 && 
+        interruptBuffer.length >= Math.min(VOLUME_WINDOW_SIZE, 10);
+      
+      if (isLikelySustainedSpeech) {
+        elizaLogger.log('[SttTtsPlugin] Detected likely speech interruption');
+        
+        // Clear the buffer to prevent repeated interruptions
+        interruptBuffer.length = 0;
+        
+        // Abort the current TTS if speaking
         if (this.ttsAbortController) {
           this.ttsAbortController.abort();
           this.isSpeaking = false;
-          elizaLogger.log('[SttTtsPlugin] TTS playback interrupted');
+          elizaLogger.log('[SttTtsPlugin] TTS playback interrupted by speech');
         }
       }
     }
@@ -385,27 +455,39 @@ export class SttTtsPlugin implements Plugin {
       let ttsBuffer = '';
       
       // Minimum characters needed for natural speech synthesis
-      const minTtsChunkSize = 30;
+      // Increased buffer size to make speech less choppy
+      const minTtsChunkSize = 60;
       
       // Flag to track if TTS is currently processing
       let isTtsProcessing = false;
 
       // Helper function to determine if text forms a natural break point
       const isNaturalBreakPoint = (text: string): boolean => {
-        return /[.!?;:](\s|$)/.test(text) || (/[,](\s|$)/.test(text) && text.length > 30);
+        // Enhanced natural break detection with more specific patterns
+        return (
+          /[.!?](\s|$)/.test(text) || // Strong sentence endings
+          (/[;:](\s|$)/.test(text) && text.length > 40) || // Medium pauses with sufficient context
+          (/[,](\s|$)/.test(text) && text.length > 80) // Commas only with substantial context
+        );
       };
 
       // Function to process TTS for accumulated text
       const processTtsBuffer = async () => {
         if (ttsBuffer.length === 0 || isTtsProcessing) return;
         
+        // Only process if we have enough text or hit a natural break
+        if (ttsBuffer.length < minTtsChunkSize && !isNaturalBreakPoint(ttsBuffer)) {
+          return;
+        }
+        
         const textToProcess = ttsBuffer;
         ttsBuffer = '';
         
-        // Add natural pauses for better speech rhythm
+        // Enhanced pause markers for more natural speech rhythm
         const textWithPauses = textToProcess
-          .replace(/([.!?])(\s|$)/g, '$1<break time="0.5s"/>$2')
-          .replace(/([,;:])(\s|$)/g, '$1<break time="0.3s"/>$2');
+          .replace(/([.!?])(\s|$)/g, '$1<break time="0.6s"/>$2') // Longer pauses at sentence ends
+          .replace(/([;:])(\s|$)/g, '$1<break time="0.4s"/>$2') // Medium pauses
+          .replace(/([,])(\s|$)/g, '$1<break time="0.2s"/>$2'); // Short pauses
         
         isTtsProcessing = true;
         
@@ -420,7 +502,7 @@ export class SttTtsPlugin implements Plugin {
           isTtsProcessing = false;
           
           // If we have more text buffered, process it immediately
-          if (ttsBuffer.length > 0) {
+          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
             processTtsBuffer();
           }
         }
