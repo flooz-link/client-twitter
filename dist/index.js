@@ -3043,6 +3043,10 @@ var SttTtsPlugin = class {
   lastInterruptCheck = 0;
   audioBuffer = [];
   streamingInterval = null;
+  // Transcription buffer system to handle pauses in speech
+  transcriptionBuffers = /* @__PURE__ */ new Map();
+  transcriptionBufferTimeout = 5e3;
+  // 5 seconds buffer window
   init(params) {
     var _a;
     elizaLogger6.log(
@@ -3455,7 +3459,8 @@ var SttTtsPlugin = class {
       elizaLogger6.debug(
         `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, estimated duration=${(merged.length / 48e3).toFixed(2)}s`
       );
-      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
+      const noiselessPcm = this.applyNoiseReduction(merged, 300);
+      const optimizedPcm = this.maybeDownsampleAudio(noiselessPcm, 48e3, 16e3);
       let wavBuffer;
       let sttText;
       try {
@@ -3476,6 +3481,18 @@ var SttTtsPlugin = class {
         elizaLogger6.log(
           `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
         );
+        const now = Date.now();
+        const prevBuffer = this.transcriptionBuffers.get(userId);
+        if (prevBuffer && now - prevBuffer.timestamp < this.transcriptionBufferTimeout) {
+          sttText = prevBuffer.text + " " + sttText;
+          elizaLogger6.log(
+            `[SttTtsPlugin] Appended to transcription buffer for user=${userId}, combined text="${sttText}"`
+          );
+        }
+        this.transcriptionBuffers.set(userId, {
+          text: sttText,
+          timestamp: now
+        });
         let accumulatedText = "";
         let ttsBuffer = "";
         const minTtsChunkSize = 20;
@@ -3494,7 +3511,7 @@ var SttTtsPlugin = class {
           try {
             const textToProcess = ttsBuffer;
             ttsBuffer = "";
-            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="50ms"/> ').replace(/,\s+/g, ', <break time="10ms"/> ');
+            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="30ms"/> ').replace(/,\s+/g, ', <break time="5ms"/> ');
             elizaLogger6.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? "..." : ""}"`);
             await this.streamTtsToJanus(textWithPauses, signal);
             if (ttsBuffer.length > 0 && !signal.aborted) {
@@ -3593,6 +3610,19 @@ var SttTtsPlugin = class {
     this.audioBuffer = [];
     this.activeStreams.clear();
     this.currentStreamId = null;
+    this.eventEmitter.removeAllListeners();
+    if (this.userSpeakingTimer) {
+      clearTimeout(this.userSpeakingTimer);
+      this.userSpeakingTimer = null;
+    }
+    if (this.streamingInterval) {
+      clearInterval(this.streamingInterval);
+      this.streamingInterval = null;
+    }
+    this.pcmBuffers.clear();
+    this.volumeBuffers.clear();
+    this.audioBuffer = [];
+    elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
   }
   /**
    * Stream a single chunk of audio to Janus
@@ -3606,8 +3636,8 @@ var SttTtsPlugin = class {
       try {
         if (samples.length !== EXPECTED_SAMPLES || samples.buffer.byteLength !== EXPECTED_BYTES) {
           const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
-          const copySamples = Math.min(samples.length, EXPECTED_SAMPLES);
-          for (let i = 0; i < copySamples; i++) {
+          const copyLength = Math.min(samples.length, EXPECTED_SAMPLES);
+          for (let i = 0; i < copyLength; i++) {
             properSizedSamples[i] = samples[i];
           }
           const bufferView = new Int16Array(
@@ -3690,23 +3720,48 @@ var SttTtsPlugin = class {
         maxAmplitude = absValue;
       }
     }
+    const targetAmplitude = 22e3;
     let gainFactor = 1;
-    if (maxAmplitude > 1e4) {
-      gainFactor = Math.min(3, 1e4 / Math.max(1, maxAmplitude));
+    if (maxAmplitude > 0) {
+      gainFactor = targetAmplitude / maxAmplitude;
+    }
+    if (Math.abs(gainFactor - 1) > 0.1) {
       elizaLogger6.debug(
-        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`
+        `[SttTtsPlugin] Normalizing audio by factor of ${gainFactor.toFixed(2)}, max amplitude: ${maxAmplitude}`
       );
+      const normalizedAudio = new Int16Array(audio.length);
       for (let i = 0; i < audio.length; i++) {
-        audio[i] = Math.max(
+        normalizedAudio[i] = Math.max(
           -32768,
           Math.min(32767, Math.round(audio[i] * gainFactor))
         );
       }
+      return normalizedAudio;
+    }
+    return audio;
+  }
+  /**
+   * Apply noise reduction to improve speech recognition
+   * This implements a simple noise gate with smoothing to reduce background noise
+   */
+  applyNoiseReduction(audio, threshold = 300) {
+    const result = new Int16Array(audio.length);
+    let smoothedEnergy = 0;
+    const smoothingFactor = 0.2;
+    for (let i = 0; i < audio.length; i++) {
+      const energy = Math.abs(audio[i]);
+      smoothedEnergy = smoothingFactor * energy + (1 - smoothingFactor) * smoothedEnergy;
+      if (smoothedEnergy > threshold) {
+        const attenuationFactor = Math.min(1, (smoothedEnergy - threshold) / threshold);
+        result[i] = Math.round(audio[i] * attenuationFactor);
+      } else {
+        result[i] = Math.round(audio[i] * 0.1);
+      }
     }
     elizaLogger6.debug(
-      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, scale factor: ${gainFactor.toFixed(2)}`
+      `[SttTtsPlugin] Applied noise reduction with threshold ${threshold}`
     );
-    return audio;
+    return result;
   }
   /**
    * Convert to WAV format
@@ -3855,12 +3910,7 @@ var SttTtsPlugin = class {
       ),
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId)
-    ]).catch((error) => {
-      elizaLogger6.warn(
-        `Error when handling streaming for spaces error ${error} ignoring`
-      );
-      return;
-    });
+    ]);
     const memory = {
       id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
       agentId: this.runtime.agentId,
@@ -4128,6 +4178,7 @@ var SttTtsPlugin = class {
     this.pcmBuffers.clear();
     this.volumeBuffers.clear();
     this.audioBuffer = [];
+    this.transcriptionBuffers.clear();
     elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
   }
   async mergeAudioChunks(chunks) {

@@ -115,13 +115,6 @@ export class SttTtsPlugin implements Plugin {
   private audioBuffer: Int16Array[] = [];
   private streamingInterval: NodeJS.Timeout | null = null;
 
-  // Transcription buffer system to handle pauses in speech
-  private transcriptionBuffers: Map<string, {
-    text: string;
-    timestamp: number;
-  }> = new Map();
-  private transcriptionBufferTimeout = 5000; // 5 seconds buffer window
-
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
     elizaLogger.log(
       '[SttTtsPlugin] init => Space fully ready. Subscribing to events.',
@@ -611,10 +604,10 @@ export class SttTtsPlugin implements Plugin {
               
               // Check if we need to resize the frame
               if (frame.length !== EXPECTED_SAMPLES) {
-                // Create a new buffer with exactly the right size
+                // Create properly sized frame
                 const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
                 
-                // Copy data from original samples, being careful not to overflow
+                // Copy data, being careful not to overflow
                 const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
                 properSizedFrame.set(frame.subarray(0, copyLength));
                 
@@ -704,13 +697,10 @@ export class SttTtsPlugin implements Plugin {
           `estimated duration=${(merged.length / 48000).toFixed(2)}s`,
       );
 
-      // 4. Apply noise reduction to improve speech recognition
-      const noiselessPcm = this.applyNoiseReduction(merged, 300);
+      // 4. Optimize audio (downsample if needed)
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
-      // 5. Optimize audio (downsample if needed)
-      const optimizedPcm = this.maybeDownsampleAudio(noiselessPcm, 48000, 16000);
-
-      // 6. Convert to WAV format - declare outside try block so it's accessible in catch
+      // 5. Convert to WAV format - declare outside try block so it's accessible in catch
       let wavBuffer: ArrayBuffer;
       let sttText: string;
 
@@ -723,7 +713,7 @@ export class SttTtsPlugin implements Plugin {
 
         const start = Date.now();
 
-        // 7. Transcribe audio
+        // 6. Transcribe audio
         sttText = await this.transcriptionService.transcribe(wavBuffer);
 
         console.log(`Transcription took: ${Date.now() - start} ms`);
@@ -742,30 +732,13 @@ export class SttTtsPlugin implements Plugin {
           `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`,
         );
 
-        // Check if we have a previous transcription buffer for this user
-        const now = Date.now();
-        const prevBuffer = this.transcriptionBuffers.get(userId);
-        
-        // If we have a previous buffer that's still within our time window, append to it
-        if (prevBuffer && (now - prevBuffer.timestamp) < this.transcriptionBufferTimeout) {
-          // Append the new transcription to the existing buffer
-          sttText = prevBuffer.text + " " + sttText;
-          elizaLogger.log(
-            `[SttTtsPlugin] Appended to transcription buffer for user=${userId}, combined text="${sttText}"`,
-          );
-        }
-        
-        // Update the transcription buffer with the current (possibly combined) text
-        this.transcriptionBuffers.set(userId, {
-          text: sttText,
-          timestamp: now
-        });
-
-        // 8. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
+        // 7. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
         // Use the abort controller that was created in abortPreviousStreams
 
         // Track accumulated text for logging
         let accumulatedText = '';
+
+        // Buffer for accumulating text until we have enough for natural TTS
         let ttsBuffer = '';
 
         // Minimum characters needed for natural speech synthesis
@@ -954,27 +927,6 @@ export class SttTtsPlugin implements Plugin {
     // Mark all active streams as inactive
     this.activeStreams.clear();
     this.currentStreamId = null;
-    
-    // Clear all event listeners
-    this.eventEmitter.removeAllListeners();
-    
-    // Clear any timers
-    if (this.userSpeakingTimer) {
-      clearTimeout(this.userSpeakingTimer);
-      this.userSpeakingTimer = null;
-    }
-    
-    if (this.streamingInterval) {
-      clearInterval(this.streamingInterval);
-      this.streamingInterval = null;
-    }
-    
-    // Clear buffers
-    this.pcmBuffers.clear();
-    this.volumeBuffers.clear();
-    this.audioBuffer = [];
-    
-    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
   /**
@@ -1000,8 +952,8 @@ export class SttTtsPlugin implements Plugin {
           const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
 
           // Copy data from original samples, being careful not to overflow
-          const copyLength = Math.min(samples.length, EXPECTED_SAMPLES);
-          for (let i = 0; i < copyLength; i++) {
+          const copySamples = Math.min(samples.length, EXPECTED_SAMPLES);
+          for (let i = 0; i < copySamples; i++) {
             properSizedSamples[i] = samples[i];
           }
 
@@ -1120,77 +1072,33 @@ export class SttTtsPlugin implements Plugin {
         maxAmplitude = absValue;
       }
     }
-  
-    // Target amplitude (about 50-70% of max Int16 value for headroom)
-    const targetAmplitude = 22000; // ~67% of max Int16 value
-  
-    // Calculate gain factor to reach target amplitude
+
+    // Default gain factor (no change)
     let gainFactor = 1.0;
-    if (maxAmplitude > 0) {
-      gainFactor = targetAmplitude / maxAmplitude;
-    }
-  
-    // Apply normalization only if needed
-    if (Math.abs(gainFactor - 1.0) > 0.1) { // Only normalize if gain change is significant
+
+    // If the audio is already loud enough, return it as is
+    if (maxAmplitude > 10000) {
+      // Less than ~15% of max Int16 value
+      gainFactor = Math.min(3.0, 10000 / Math.max(1, maxAmplitude));
       elizaLogger.debug(
-        `[SttTtsPlugin] Normalizing audio by factor of ${gainFactor.toFixed(2)}, max amplitude: ${maxAmplitude}`,
+        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`,
       );
-  
-      // Create a new array to avoid modifying the original
-      const normalizedAudio = new Int16Array(audio.length);
+
       for (let i = 0; i < audio.length; i++) {
         // Apply gain and clamp to Int16 range
-        normalizedAudio[i] = Math.max(
+        audio[i] = Math.max(
           -32768,
           Math.min(32767, Math.round(audio[i] * gainFactor)),
         );
       }
-      return normalizedAudio;
     }
-  
-    return audio;
-  }
 
-  
-  /**
-   * Apply noise reduction to improve speech recognition
-   * This implements a simple noise gate with smoothing to reduce background noise
-   */
-  private applyNoiseReduction(audio: Int16Array, threshold = 300): Int16Array {
-    // Create a copy to avoid modifying the original
-    const result = new Int16Array(audio.length);
-    
-    // Simple exponential moving average for smoothing
-    let smoothedEnergy = 0;
-    const smoothingFactor = 0.2; // Lower = more smoothing
-    
-    // Process each sample
-    for (let i = 0; i < audio.length; i++) {
-      // Calculate instantaneous energy (absolute value)
-      const energy = Math.abs(audio[i]);
-      
-      // Update smoothed energy estimate
-      smoothedEnergy = smoothingFactor * energy + (1 - smoothingFactor) * smoothedEnergy;
-      
-      // Apply soft noise gate
-      if (smoothedEnergy > threshold) {
-        // Calculate attenuation factor (soft knee)
-        const attenuationFactor = Math.min(1.0, (smoothedEnergy - threshold) / threshold);
-        
-        // Apply the attenuation
-        result[i] = Math.round(audio[i] * attenuationFactor);
-      } else {
-        // Below threshold - attenuate significantly but not completely
-        // This prevents unnatural "holes" in the audio
-        result[i] = Math.round(audio[i] * 0.1);
-      }
-    }
-    
     elizaLogger.debug(
-      `[SttTtsPlugin] Applied noise reduction with threshold ${threshold}`
+      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, ` +
+        `scale factor: ${gainFactor.toFixed(2)}`,
     );
-    
-    return result;
+
+    return audio;
   }
 
   /**
@@ -1398,7 +1306,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Ensure the user exists in the accounts table
     // Ensure room exists and user is in it
-
     await Promise.all([
       this.runtime.ensureUserExists(
         userUuid,
@@ -1408,7 +1315,12 @@ export class SttTtsPlugin implements Plugin {
       ),
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]);
+    ]).catch((error) => {
+      elizaLogger.warn(
+        `Error when handling streaming for spaces error ${error} ignoring`,
+      );
+      return;
+    });
 
     const memory = {
       id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
@@ -1448,7 +1360,6 @@ export class SttTtsPlugin implements Plugin {
     //   return state;
     // });
     const shouldIgnore = await this._shouldIgnore(memory);
-
     if (shouldIgnore) {
       return;
     }
@@ -1780,7 +1691,6 @@ export class SttTtsPlugin implements Plugin {
     this.pcmBuffers.clear();
     this.volumeBuffers.clear();
     this.audioBuffer = [];
-    this.transcriptionBuffers.clear();
     
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
@@ -1806,7 +1716,7 @@ export class SttTtsPlugin implements Plugin {
         maxAmplitude = absValue;
       }
     }
-  
+
     elizaLogger.debug(
       `[SttTtsPlugin] Merged ${chunks.length} audio chunks, total samples: ${totalLength}, ` +
         `max amplitude: ${maxAmplitude}`,
