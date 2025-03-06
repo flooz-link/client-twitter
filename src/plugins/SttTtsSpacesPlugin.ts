@@ -32,6 +32,8 @@ import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
 
+// No Web Audio API polyfill needed, using native Node.js capabilities
+
 interface PluginConfig {
   runtime: IAgentRuntime;
   client: ClientBase;
@@ -610,11 +612,22 @@ export class SttTtsPlugin implements Plugin {
     // Calculate total length of all chunks
     const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     
-    // Professional audio processing here
-    const context = new OfflineAudioContext(1, 48000 * 10, 48000);
-    const buffer = context.createBuffer(1, totalLength, 48000);
-    // ... existing quality processing ...
-    return buffer.getChannelData(0);
+    // Simple concatenation of chunks - no need for browser APIs
+    const result = new Float32Array(totalLength);
+    let offset = 0;
+    
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // Here you could add any audio processing you need
+    // For example, applying a simple gain adjustment:
+    // for (let i = 0; i < result.length; i++) {
+    //   result[i] = Math.max(-1.0, Math.min(1.0, result[i] * 1.2));  // Apply gain of 1.2
+    // }
+    
+    return result;
   }
 
   /**

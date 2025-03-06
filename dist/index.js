@@ -3342,9 +3342,13 @@ var SttTtsPlugin = class {
   }
   async processFloatAudio(chunks) {
     const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const context = new OfflineAudioContext(1, 48e3 * 10, 48e3);
-    const buffer = context.createBuffer(1, totalLength, 48e3);
-    return buffer.getChannelData(0);
+    const result = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
   }
   /**
    * Downsample audio if needed for Whisper
