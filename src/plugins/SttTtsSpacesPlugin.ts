@@ -102,6 +102,7 @@ export class SttTtsPlugin implements Plugin {
   private volumeBuffers: Map<string, number[]>;
   private ttsAbortController: AbortController | null = null;
   private currentStreamId: string | null = null;
+  private activeStreams = new Set<string>();
 
   private eventEmitter = new EventEmitter();
   private openai: OpenAI;
@@ -760,26 +761,28 @@ export class SttTtsPlugin implements Plugin {
    */
   private async processAudio(userId: string): Promise<void> {
     try {
+      // Prevent concurrent processing
       if (this.isProcessingAudio) {
-        elizaLogger.log('[SttTtsPlugin] Interrupting previous audio processing');
-        
-        // If we're already processing audio, abort the previous TTS
-        if (this.ttsAbortController) {
-          this.ttsAbortController.abort();
-          this.ttsAbortController = null;
-        }
-        
-        // Remove all existing event listeners to prevent old events from being processed
-        this.eventEmitter.removeAllListeners('stream-chunk');
-        this.eventEmitter.removeAllListeners('stream-start');
-        this.eventEmitter.removeAllListeners('stream-end');
-        
-        // Wait a moment for cleanup to complete
-        await new Promise(resolve => setTimeout(resolve, 100));
+        elizaLogger.log(
+          '[SttTtsPlugin] Already processing audio, skipping this request',
+        );
+        return;
       }
 
-      // Set the global processing flag
       this.isProcessingAudio = true;
+
+      // Abort any previous streams before starting a new one
+      this.abortPreviousStreams();
+
+      // Get the signal from the current abort controller
+      const signal = this.ttsAbortController!.signal;
+
+      // Create a unique ID for this stream session
+      const streamId = uuidv4();
+      this.currentStreamId = streamId;
+      this.activeStreams.add(streamId);
+
+      elizaLogger.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
 
       // Get chunks and clear only this user's buffer
       const chunks = this.pcmBuffers.get(userId) || [];
@@ -848,15 +851,7 @@ export class SttTtsPlugin implements Plugin {
         );
 
         // 7. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
-        // Create a TTS abort controller for this session
-        this.ttsAbortController = new AbortController();
-        const signal = this.ttsAbortController.signal;
-
-        // Create a unique ID for this stream session
-        const streamId = uuidv4();
-        this.currentStreamId = streamId;
-
-        elizaLogger.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
+        // Use the abort controller that was created in abortPreviousStreams
 
         // Track accumulated text for logging
         let accumulatedText = '';
@@ -950,8 +945,8 @@ export class SttTtsPlugin implements Plugin {
 
         // Set up event listeners for the streaming response
         this.eventEmitter.once('stream-start', (startStreamId?: string) => {
-          // Only process if this is the current stream
-          if (startStreamId && startStreamId !== streamId) {
+          // Only process if this is the current stream and it's still active
+          if (startStreamId && (!this.activeStreams.has(startStreamId) || signal.aborted)) {
             elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-start from outdated stream`);
             return;
           }
@@ -960,19 +955,13 @@ export class SttTtsPlugin implements Plugin {
 
         // Handle each chunk as it comes in from Grok
         this.eventEmitter.on('stream-chunk', (chunk: string, chunkStreamId?: string) => {
-          // Ignore chunks if this stream is no longer current
-          if (streamId !== this.currentStreamId) {
+          // Ignore chunks if this stream is no longer active or has been aborted
+          if (!chunkStreamId || !this.activeStreams.has(chunkStreamId) || signal.aborted) {
             elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
             return;
           }
           
-          // Ignore chunks from different streams
-          if (chunkStreamId && chunkStreamId !== streamId) {
-            elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from different stream ID`);
-            return;
-          }
-
-          if (typeof chunk !== 'string' || isEmpty(chunk) || signal.aborted) {
+          if (typeof chunk !== 'string' || isEmpty(chunk)) {
             return;
           }
 
@@ -988,18 +977,15 @@ export class SttTtsPlugin implements Plugin {
 
         // Clean up when stream ends
         this.eventEmitter.once('stream-end', (endStreamId?: string) => {
-          // Ignore end events if this stream is no longer current
-          if (streamId !== this.currentStreamId) {
+          // Ignore end events if this stream is no longer active
+          if (!endStreamId || !this.activeStreams.has(endStreamId) || signal.aborted) {
             elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
             return;
           }
           
-          // Ignore end events from different streams
-          if (endStreamId && endStreamId !== streamId) {
-            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from different stream ID`);
-            return;
-          }
-
+          // Remove this stream from active streams
+          this.activeStreams.delete(endStreamId);
+          
           // Process any remaining text in the buffer
           if (ttsBuffer.length > 0 && !signal.aborted) {
             processTtsChunk();
@@ -1034,17 +1020,34 @@ export class SttTtsPlugin implements Plugin {
           elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
         }
       } finally {
-        // Clean up the TTS abort controller
-        if (this.ttsAbortController) {
-          this.ttsAbortController = null;
-        }
-
-        // Release the global processing flag
+        // Reset the processing flag
         this.isProcessingAudio = false;
       }
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     }
+  }
+
+  /**
+   * Abort any ongoing TTS and streaming processes
+   * This should be called before starting a new stream
+   */
+  private abortPreviousStreams(): void {
+    // Abort any ongoing TTS process
+    if (this.ttsAbortController) {
+      elizaLogger.log('[SttTtsPlugin] Aborting previous TTS stream');
+      this.ttsAbortController.abort();
+    }
+    
+    // Create a new abort controller for the next stream
+    this.ttsAbortController = new AbortController();
+    
+    // Clear audio buffer to stop any ongoing audio processing
+    this.audioBuffer = [];
+    
+    // Mark all active streams as inactive
+    this.activeStreams.clear();
+    this.currentStreamId = null;
   }
 
   /**
@@ -1408,8 +1411,8 @@ export class SttTtsPlugin implements Plugin {
     // Use the current stream ID
     const streamId = this.currentStreamId;
     
-    if (!streamId) {
-      elizaLogger.error('[SttTtsPlugin] No current stream ID found');
+    if (!streamId || !this.activeStreams.has(streamId)) {
+      elizaLogger.error('[SttTtsPlugin] No current stream ID found or stream is no longer active');
       return;
     }
     
@@ -1517,6 +1520,14 @@ export class SttTtsPlugin implements Plugin {
     this.eventEmitter.emit('stream-start', streamId);
 
     const start = Date.now();
+    
+    // Check if the stream is still active before making the API call
+    if (!this.activeStreams.has(streamId) || this.ttsAbortController?.signal.aborted) {
+      elizaLogger.log('[SttTtsPlugin] Stream was aborted before API call, cancelling');
+      this.eventEmitter.emit('stream-end', streamId);
+      return;
+    }
+    
     // Make streaming request to Grok
     const stream = await this.openai.chat.completions.create({
       model: 'grok-2-latest',
@@ -1842,12 +1853,36 @@ export class SttTtsPlugin implements Plugin {
   }
 
   cleanup(): void {
-    elizaLogger.log('[SttTtsPlugin] cleanup => releasing resources');
+    // Abort any ongoing TTS processes
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
+    }
+    
+    // Clear all active streams
+    this.activeStreams.clear();
+    this.currentStreamId = null;
+    
+    // Clear all event listeners
+    this.eventEmitter.removeAllListeners();
+    
+    // Clear any timers
+    if (this.userSpeakingTimer) {
+      clearTimeout(this.userSpeakingTimer);
+      this.userSpeakingTimer = null;
+    }
+    
+    if (this.streamingInterval) {
+      clearInterval(this.streamingInterval);
+      this.streamingInterval = null;
+    }
+    
+    // Clear buffers
     this.pcmBuffers.clear();
-    this.userSpeakingTimer = null;
-    this.ttsQueue = [];
-    this.isSpeaking = false;
     this.volumeBuffers.clear();
+    this.audioBuffer = [];
+    
+    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
   private async mergeAudioChunks(chunks: Int16Array[]): Promise<Int16Array> {

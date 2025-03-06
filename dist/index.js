@@ -3038,6 +3038,7 @@ var SttTtsPlugin = class {
   volumeBuffers;
   ttsAbortController = null;
   currentStreamId = null;
+  activeStreams = /* @__PURE__ */ new Set();
   eventEmitter = new EventEmitter2();
   openai;
   transcriptionService;
@@ -3513,17 +3514,18 @@ var SttTtsPlugin = class {
     var _a;
     try {
       if (this.isProcessingAudio) {
-        elizaLogger6.log("[SttTtsPlugin] Interrupting previous audio processing");
-        if (this.ttsAbortController) {
-          this.ttsAbortController.abort();
-          this.ttsAbortController = null;
-        }
-        this.eventEmitter.removeAllListeners("stream-chunk");
-        this.eventEmitter.removeAllListeners("stream-start");
-        this.eventEmitter.removeAllListeners("stream-end");
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        elizaLogger6.log(
+          "[SttTtsPlugin] Already processing audio, skipping this request"
+        );
+        return;
       }
       this.isProcessingAudio = true;
+      this.abortPreviousStreams();
+      const signal = this.ttsAbortController.signal;
+      const streamId = uuidv4();
+      this.currentStreamId = streamId;
+      this.activeStreams.add(streamId);
+      elizaLogger6.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
       const chunks = this.pcmBuffers.get(userId) || [];
       this.pcmBuffers.delete(userId);
       if (!chunks.length) {
@@ -3560,11 +3562,6 @@ var SttTtsPlugin = class {
         elizaLogger6.log(
           `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
         );
-        this.ttsAbortController = new AbortController();
-        const signal = this.ttsAbortController.signal;
-        const streamId = uuidv4();
-        this.currentStreamId = streamId;
-        elizaLogger6.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
         let accumulatedText = "";
         let ttsBuffer = "";
         const minTtsChunkSize = 30;
@@ -3615,22 +3612,18 @@ var SttTtsPlugin = class {
           }
         };
         this.eventEmitter.once("stream-start", (startStreamId) => {
-          if (startStreamId && startStreamId !== streamId) {
+          if (startStreamId && (!this.activeStreams.has(startStreamId) || signal.aborted)) {
             elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-start from outdated stream`);
             return;
           }
           elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
         });
         this.eventEmitter.on("stream-chunk", (chunk, chunkStreamId) => {
-          if (streamId !== this.currentStreamId) {
+          if (!chunkStreamId || !this.activeStreams.has(chunkStreamId) || signal.aborted) {
             elizaLogger6.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
             return;
           }
-          if (chunkStreamId && chunkStreamId !== streamId) {
-            elizaLogger6.debug(`[SttTtsPlugin] Ignoring chunk from different stream ID`);
-            return;
-          }
-          if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted) {
+          if (typeof chunk !== "string" || isEmpty(chunk)) {
             return;
           }
           accumulatedText += chunk;
@@ -3638,14 +3631,11 @@ var SttTtsPlugin = class {
           manageTtsBuffer();
         });
         this.eventEmitter.once("stream-end", (endStreamId) => {
-          if (streamId !== this.currentStreamId) {
+          if (!endStreamId || !this.activeStreams.has(endStreamId) || signal.aborted) {
             elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
             return;
           }
-          if (endStreamId && endStreamId !== streamId) {
-            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-end from different stream ID`);
-            return;
-          }
+          this.activeStreams.delete(endStreamId);
           if (ttsBuffer.length > 0 && !signal.aborted) {
             processTtsChunk();
           }
@@ -3670,14 +3660,25 @@ var SttTtsPlugin = class {
           elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
         }
       } finally {
-        if (this.ttsAbortController) {
-          this.ttsAbortController = null;
-        }
         this.isProcessingAudio = false;
       }
     } catch (error) {
       elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
     }
+  }
+  /**
+   * Abort any ongoing TTS and streaming processes
+   * This should be called before starting a new stream
+   */
+  abortPreviousStreams() {
+    if (this.ttsAbortController) {
+      elizaLogger6.log("[SttTtsPlugin] Aborting previous TTS stream");
+      this.ttsAbortController.abort();
+    }
+    this.ttsAbortController = new AbortController();
+    this.audioBuffer = [];
+    this.activeStreams.clear();
+    this.currentStreamId = null;
   }
   /**
    * Stream a single chunk of audio to Janus
@@ -3920,10 +3921,10 @@ var SttTtsPlugin = class {
    * Handle User Message with streaming support
    */
   async handleUserMessageStreaming(userText, userId) {
-    var _a, _b;
+    var _a, _b, _c;
     const streamId = this.currentStreamId;
-    if (!streamId) {
-      elizaLogger6.error("[SttTtsPlugin] No current stream ID found");
+    if (!streamId || !this.activeStreams.has(streamId)) {
+      elizaLogger6.error("[SttTtsPlugin] No current stream ID found or stream is no longer active");
       return;
     }
     elizaLogger6.log(`[SttTtsPlugin] Handling user message with stream ID: ${streamId}`);
@@ -4003,6 +4004,11 @@ var SttTtsPlugin = class {
     const progressiveDelay = 400;
     this.eventEmitter.emit("stream-start", streamId);
     const start = Date.now();
+    if (!this.activeStreams.has(streamId) || ((_a = this.ttsAbortController) == null ? void 0 : _a.signal.aborted)) {
+      elizaLogger6.log("[SttTtsPlugin] Stream was aborted before API call, cancelling");
+      this.eventEmitter.emit("stream-end", streamId);
+      return;
+    }
     const stream = await this.openai.chat.completions.create({
       model: "grok-2-latest",
       messages,
@@ -4013,7 +4019,7 @@ var SttTtsPlugin = class {
     let isJsonResponse = false;
     let textValue = "";
     for await (const chunk of stream) {
-      const content = ((_b = (_a = chunk.choices[0]) == null ? void 0 : _a.delta) == null ? void 0 : _b.content) || "";
+      const content = ((_c = (_b = chunk.choices[0]) == null ? void 0 : _b.delta) == null ? void 0 : _c.content) || "";
       if (!content) continue;
       fullResponse += content;
       if (!isJsonResponse && jsonBuffer.length < 30) {
@@ -4217,12 +4223,25 @@ var SttTtsPlugin = class {
     return false;
   }
   cleanup() {
-    elizaLogger6.log("[SttTtsPlugin] cleanup => releasing resources");
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
+    }
+    this.activeStreams.clear();
+    this.currentStreamId = null;
+    this.eventEmitter.removeAllListeners();
+    if (this.userSpeakingTimer) {
+      clearTimeout(this.userSpeakingTimer);
+      this.userSpeakingTimer = null;
+    }
+    if (this.streamingInterval) {
+      clearInterval(this.streamingInterval);
+      this.streamingInterval = null;
+    }
     this.pcmBuffers.clear();
-    this.userSpeakingTimer = null;
-    this.ttsQueue = [];
-    this.isSpeaking = false;
     this.volumeBuffers.clear();
+    this.audioBuffer = [];
+    elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
   }
   async mergeAudioChunks(chunks) {
     const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
