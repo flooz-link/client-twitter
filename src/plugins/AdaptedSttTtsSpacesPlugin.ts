@@ -1,13 +1,37 @@
 import { spawn } from 'child_process';
-import { elizaLogger, stringToUuid, composeContext, getEmbeddingZeroVector, generateMessageResponse, ModelClass, type Content, type IAgentRuntime, type Memory, type Plugin, type State, composeRandomUser, generateShouldRespond } from '@elizaos/core';
-import type { Space, JanusClient, AudioDataWithUser } from '@flooz-link/agent-twitter-client';
+import {
+  elizaLogger,
+  stringToUuid,
+  composeContext,
+  getEmbeddingZeroVector,
+  generateMessageResponse,
+  ModelClass,
+  type Content,
+  type IAgentRuntime,
+  type Memory,
+  type Plugin,
+  type State,
+  composeRandomUser,
+  generateShouldRespond,
+} from '@elizaos/core';
+import type {
+  Space,
+  JanusClient,
+  AudioDataWithUser,
+} from '@flooz-link/agent-twitter-client';
 import type { ClientBase } from '../base';
-import { twitterVoiceHandlerTemplate, twitterShouldRespondTemplate } from './templates';
+import {
+  twitterVoiceHandlerTemplate,
+  twitterShouldRespondTemplate,
+} from './templates';
 import { isEmpty } from '../utils';
 import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
-import { DeepgramStreamingClient, DeepgramStreamingOptions } from '../services/DeepgramStreamingClient';
+import {
+  DeepgramStreamingClient,
+  DeepgramStreamingOptions,
+} from '../services/DeepgramStreamingClient';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -19,7 +43,10 @@ interface PluginConfig {
   silenceDetectionWindow?: number;
   voiceId?: string;
   elevenLabsModel?: string;
-  chatContext?: Array<{ role: 'system' | 'user' | 'assistant'; content: string; }>;
+  chatContext?: Array<{
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+  }>;
   deepgramApiKey: string;
   grokApiKey?: string;
   grokBaseUrl?: string;
@@ -41,7 +68,10 @@ export class AdaptedSttTtsPlugin implements Plugin {
 
   private voiceId = '21m00Tcm4TlvDq8ikWAM';
   private elevenLabsModel = 'eleven_monolingual_v1';
-  private chatContext: Array<{ role: 'system' | 'user' | 'assistant'; content: string; }> = [];
+  private chatContext: Array<{
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+  }> = [];
 
   private pcmBuffers = new Map<string, Float32Array[]>();
   private silenceThreshold = 50;
@@ -83,8 +113,12 @@ export class AdaptedSttTtsPlugin implements Plugin {
     if (config.chatContext) {
       this.chatContext = config.chatContext;
     }
-    this.grokApiKey = config.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
-    this.grokBaseUrl = config.grokBaseUrl ?? this.runtime.getSetting('GROK_BASE_URL') ?? 'https://api.x.ai/v1';
+    this.grokApiKey =
+      config.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
+    this.grokBaseUrl =
+      config.grokBaseUrl ??
+      this.runtime.getSetting('GROK_BASE_URL') ??
+      'https://api.x.ai/v1';
 
     if (isEmpty(this.grokApiKey)) {
       throw new Error('Grok API key is required');
@@ -131,7 +165,9 @@ export class AdaptedSttTtsPlugin implements Plugin {
   }
 
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
-    elizaLogger.log('[AdaptedSttTtsPlugin] init => Space fully ready. Subscribing to events.');
+    elizaLogger.log(
+      '[AdaptedSttTtsPlugin] init => Space fully ready. Subscribing to events.',
+    );
 
     this.space = params.space;
     this.janus = (this.space as any)?.janusClient as JanusClient | undefined;
@@ -152,7 +188,10 @@ export class AdaptedSttTtsPlugin implements Plugin {
 
     let zeroCrossings = 0;
     for (let i = 1; i < audioLength; i++) {
-      if ((audio[i] >= 0 && audio[i - 1] < 0) || (audio[i] < 0 && audio[i - 1] >= 0)) {
+      if (
+        (audio[i] >= 0 && audio[i - 1] < 0) ||
+        (audio[i] < 0 && audio[i - 1] >= 0)
+      ) {
         zeroCrossings++;
       }
     }

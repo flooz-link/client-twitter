@@ -30,7 +30,7 @@ export class DeepgramStreamingClient extends EventEmitter {
 
   /**
    * Create a new Deepgram streaming client
-   * 
+   *
    * @param options Configuration options for Deepgram
    */
   constructor(options: DeepgramStreamingOptions) {
@@ -43,9 +43,9 @@ export class DeepgramStreamingClient extends EventEmitter {
       endpointing: 'enhanced',
       vad_events: true,
       smart_format: true,
-      ...options
+      ...options,
     };
-    
+
     this.deepgramClient = createClient(this.options.apiKey);
   }
 
@@ -73,7 +73,7 @@ export class DeepgramStreamingClient extends EventEmitter {
       if (this.keepAliveInterval) {
         clearInterval(this.keepAliveInterval);
       }
-      
+
       this.keepAliveInterval = setInterval(() => {
         elizaLogger.debug('[DeepgramStreamingClient] Sending keepalive');
         deepgram.keepAlive();
@@ -103,21 +103,22 @@ export class DeepgramStreamingClient extends EventEmitter {
         this.emit('error', error);
       });
 
-
       deepgram.addListener(LiveTranscriptionEvents.Transcript, (data: any) => {
         elizaLogger.debug('[DeepgramStreamingClient] Transcript received');
-        
+
         // Forward the full transcription data
         this.emit('transcription', data);
-        
+
         // Process the transcript to detect sentences
-        if (data && data.is_final && 
-            data.channel && 
-            data.channel.alternatives && 
-            data.channel.alternatives.length > 0) {
-          
+        if (
+          data &&
+          data.is_final &&
+          data.channel &&
+          data.channel.alternatives &&
+          data.channel.alternatives.length > 0
+        ) {
           const transcript = data.channel.alternatives[0].transcript.trim();
-          
+
           // Only emit if there's actual content
           if (transcript) {
             this.emit('sentence', transcript);
@@ -128,7 +129,7 @@ export class DeepgramStreamingClient extends EventEmitter {
       deepgram.addListener(LiveTranscriptionEvents.Metadata, (data: any) => {
         elizaLogger.debug('[DeepgramStreamingClient] Metadata received');
         this.emit('metadata', data);
-        
+
         // Check for speech final events
         if (data && data.speech_final) {
           this.emit('speech_final');
@@ -145,25 +146,32 @@ export class DeepgramStreamingClient extends EventEmitter {
 
   /**
    * Send audio data to Deepgram
-   * 
+   *
    * @param audioChunk Audio data as Buffer, ArrayBuffer, Int16Array or Float32Array
    */
-  public sendAudio(audioChunk: Buffer | ArrayBuffer | Int16Array | Float32Array): void {
+  public sendAudio(
+    audioChunk: Buffer | ArrayBuffer | Int16Array | Float32Array,
+  ): void {
     if (!this.isConnected || !this.connection) {
-      elizaLogger.warn('[DeepgramStreamingClient] Cannot send audio: not connected');
+      elizaLogger.warn(
+        '[DeepgramStreamingClient] Cannot send audio: not connected',
+      );
       return;
     }
 
     try {
       // Handle different types of audio input
       let audioData: ArrayBuffer;
-      
+
       if (audioChunk instanceof Float32Array) {
         // Convert Float32Array to Int16Array for Deepgram
         const int16Data = new Int16Array(audioChunk.length);
         for (let i = 0; i < audioChunk.length; i++) {
           // Convert normalized float (-1.0 to 1.0) to Int16 range (-32768 to 32767)
-          int16Data[i] = Math.max(-32768, Math.min(32767, Math.round(audioChunk[i] * 32767)));
+          int16Data[i] = Math.max(
+            -32768,
+            Math.min(32767, Math.round(audioChunk[i] * 32767)),
+          );
         }
         audioData = int16Data.buffer;
       } else if (audioChunk instanceof Int16Array) {
@@ -171,18 +179,22 @@ export class DeepgramStreamingClient extends EventEmitter {
       } else if (audioChunk instanceof Buffer) {
         audioData = audioChunk.buffer.slice(
           audioChunk.byteOffset,
-          audioChunk.byteOffset + audioChunk.byteLength
+          audioChunk.byteOffset + audioChunk.byteLength,
         );
       } else {
         // It's already an ArrayBuffer
         audioData = audioChunk;
       }
-      
+
       // Check connection state before sending
-      if (this.connection.getReadyState() === 1) { // OPEN
+      if (this.connection.getReadyState() === 1) {
+        // OPEN
         this.connection.send(audioData);
-      } else if (this.connection.getReadyState() >= 2) { // CLOSING or CLOSED
-        elizaLogger.warn('[DeepgramStreamingClient] Connection closing/closed, reconnecting');
+      } else if (this.connection.getReadyState() >= 2) {
+        // CLOSING or CLOSED
+        elizaLogger.warn(
+          '[DeepgramStreamingClient] Connection closing/closed, reconnecting',
+        );
         this.disconnect();
         this.connection.removeAllListeners();
         this.connect();
@@ -190,7 +202,10 @@ export class DeepgramStreamingClient extends EventEmitter {
         elizaLogger.warn('[DeepgramStreamingClient] Connection not ready');
       }
     } catch (error) {
-      elizaLogger.error('[DeepgramStreamingClient] Error sending audio:', error);
+      elizaLogger.error(
+        '[DeepgramStreamingClient] Error sending audio:',
+        error,
+      );
       this.emit('error', error);
     }
   }
@@ -199,7 +214,11 @@ export class DeepgramStreamingClient extends EventEmitter {
    * Check if the connection is ready to receive audio
    */
   public isReady(): boolean {
-    return this.isConnected && this.connection && this.connection.getReadyState() === 1;
+    return (
+      this.isConnected &&
+      this.connection &&
+      this.connection.getReadyState() === 1
+    );
   }
 
   /**
@@ -212,12 +231,15 @@ export class DeepgramStreamingClient extends EventEmitter {
           clearInterval(this.keepAliveInterval);
           this.keepAliveInterval = null;
         }
-        
+
         this.connection.finish();
         this.isConnected = false;
         elizaLogger.info('[DeepgramStreamingClient] Connection closed');
       } catch (error) {
-        elizaLogger.error('[DeepgramStreamingClient] Error closing connection:', error);
+        elizaLogger.error(
+          '[DeepgramStreamingClient] Error closing connection:',
+          error,
+        );
       }
     }
   }
@@ -229,16 +251,20 @@ export class DeepgramStreamingClient extends EventEmitter {
     if (this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
       this.reconnectAttempts++;
       const delay = Math.pow(2, this.reconnectAttempts) * 1000; // Exponential backoff
-      
-      elizaLogger.info(`[DeepgramStreamingClient] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-      
+
+      elizaLogger.info(
+        `[DeepgramStreamingClient] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`,
+      );
+
       setTimeout(() => {
         if (!this.isConnected) {
           this.connect();
         }
       }, delay);
     } else {
-      elizaLogger.error(`[DeepgramStreamingClient] Failed to reconnect after ${this.MAX_RECONNECT_ATTEMPTS} attempts`);
+      elizaLogger.error(
+        `[DeepgramStreamingClient] Failed to reconnect after ${this.MAX_RECONNECT_ATTEMPTS} attempts`,
+      );
       this.emit('reconnect_failed');
     }
   }
