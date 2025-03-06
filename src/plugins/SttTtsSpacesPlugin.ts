@@ -86,7 +86,7 @@ export class SttTtsPlugin implements Plugin {
   /**
    * userId => arrayOfChunks (PCM Int16)
    */
-  private pcmBuffers = new Map<string, Float32Array[]>();
+  private pcmBuffers = new Map<string, Int16Array[]>();
 
   /**
    * For ignoring near-silence frames (if amplitude < threshold)
@@ -111,133 +111,54 @@ export class SttTtsPlugin implements Plugin {
   private openai: OpenAI;
   private transcriptionService: ITranscriptionService;
 
-  private interruptAnalysisBuffer = new Float32Array(1024);
+  private interruptAnalysisBuffer = new Int16Array(1024);
   private interruptBufferIndex = 0;
   private lastInterruptCheck = 0;
 
-  private audioQueue: string[] = [];
-  private isStreamingToJanus = false;
+  private audioBuffer: Int16Array[] = [];
+  private streamingInterval: NodeJS.Timeout | null = null;
 
   private async processAudioQueue() {
-    if (this.isStreamingToJanus || this.audioQueue.length === 0) return;
-    this.isStreamingToJanus = true;
-    const sentence = this.audioQueue.shift();
-    if (sentence) {
-      await this.streamToJanus(sentence);
+    if (this.audioBuffer.length === 0) return;
+    const chunk = this.audioBuffer.shift();
+    if (chunk) {
+      await this.streamToJanus(chunk);
     }
-    this.isStreamingToJanus = false;
-    if (this.audioQueue.length > 0) {
-      setTimeout(() => this.processAudioQueue(), 1000); // Add delay between streams
+    if (this.audioBuffer.length > 0) {
+      setTimeout(() => this.processAudioQueue(), 200); // Add delay between streams
     }
   }
 
-  private streamToJanus(sentence: string) {
-    // Logic to stream sentence to Janus
-    elizaLogger.info('[SttTtsPlugin] Streaming to Janus:', sentence);
+  private streamToJanus(chunk: Int16Array) {
+    // Logic to stream chunk to Janus
+    elizaLogger.info('[SttTtsPlugin] Streaming Int16Array chunk to Janus');
     // Simulate streaming delay
-    return new Promise((resolve) => setTimeout(resolve, 2000));
-  }
-
-  private handleSentence(sentence: string) {
-    this.audioQueue.push(sentence);
-    this.processAudioQueue();
-  }
-
-
-  private convertInt16ToFloat32(int16Array: Int16Array): Float32Array {
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-      float32Array[i] = int16Array[i] / 32768;
-    }
-    return float32Array;
+    return new Promise((resolve) => setTimeout(resolve, 200));
   }
 
   public addAudioChunk(userId: string, chunk: Int16Array): void {
     if (!this.pcmBuffers.has(userId)) {
       this.pcmBuffers.set(userId, []);
     }
-    const float32Chunk = this.convertInt16ToFloat32(chunk);
-    this.pcmBuffers.get(userId)?.push(float32Chunk);
+    this.pcmBuffers.get(userId)?.push(chunk);
+    this.audioBuffer.push(chunk);
+    this.startStreamingToJanus();
   }
 
-  private analyzeForInterruption(audio: Float32Array): boolean {
-    // Simple algorithm based on volume and zero crossings rate
-    const audioLength = audio.length;
-    if (audioLength < 512) return false;
-
-    // Calculate zero crossing rate - indicates speech activity
-    let zeroCrossings = 0;
-    for (let i = 1; i < audioLength; i++) {
-      if ((audio[i] >= 0 && audio[i - 1] < 0) || (audio[i] < 0 && audio[i - 1] >= 0)) {
-        zeroCrossings++;
+  private startStreamingToJanus() {
+    if (this.streamingInterval) return;
+    this.streamingInterval = setInterval(() => {
+      if (this.audioBuffer.length > 0) {
+        this.processAudioQueue();
       }
-    }
-    const zcr = (zeroCrossings / audio.length);
-
-    // Calculate Root Mean Square (RMS) - indicates volume
-    let sumSquares = 0;
-    for (let i = 0; i < audioLength; i++) {
-      sumSquares += audio[i] * audio[i];
-    }
-    const rms = Math.sqrt(sumSquares / audioLength);
-
-    // Voice typically has ZCR between 0.05-0.15 and RMS > 0.05
-    return zcr > 0.05 && zcr < 0.15 && rms > 0.07;
+    }, 200); // Stream every 200ms
   }
 
-  onAttach(_space: Space) {
-    elizaLogger.log('[SttTtsPlugin] onAttach => space was attached');
-  }
-
-  init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
-    elizaLogger.log(
-      '[SttTtsPlugin] init => Space fully ready. Subscribing to events.',
-    );
-
-    this.space = params.space;
-    this.janus = (this.space as any)?.janusClient as JanusClient | undefined;
-
-    const config = params.pluginConfig as PluginConfig;
-    this.runtime = config?.runtime;
-    this.client = config?.client;
-    this.spaceId = config?.spaceId;
-    this.elevenLabsApiKey = config?.elevenLabsApiKey;
-    this.transcriptionService = config.transcriptionService;
-    if (typeof config?.silenceThreshold === 'number') {
-      this.silenceThreshold = config.silenceThreshold;
+  private stopStreamingToJanus() {
+    if (this.streamingInterval) {
+      clearInterval(this.streamingInterval);
+      this.streamingInterval = null;
     }
-    if (typeof config?.silenceDetectionWindow === 'number') {
-      this.silenceDetectionThreshold = config.silenceDetectionWindow;
-    }
-    if (config?.voiceId) {
-      this.voiceId = config.voiceId;
-    }
-    if (config?.elevenLabsModel) {
-      this.elevenLabsModel = config.elevenLabsModel;
-    }
-    if (config?.chatContext) {
-      this.chatContext = config.chatContext;
-    }
-    this.grokApiKey =
-      config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
-    this.grokBaseUrl =
-      config?.grokBaseUrl ??
-      this.runtime.getSetting('GROK_BASE_URL') ??
-      'https://api.x.ai/v1';
-
-    if (isEmpty(this.grokApiKey)) {
-      throw new Error('Grok API key is required');
-    }
-    if (isEmpty(this.grokBaseUrl)) {
-      throw new Error('Grok base URL is required');
-    }
-
-    this.openai = new OpenAI({
-      apiKey: this.grokApiKey,
-      baseURL: this.grokBaseUrl,
-    });
-
-    this.volumeBuffers = new Map<string, number[]>();
   }
 
   /**
@@ -294,7 +215,7 @@ export class SttTtsPlugin implements Plugin {
       arr = [];
       this.pcmBuffers.set(data.userId, arr);
     }
-    arr.push(this.convertInt16ToFloat32(data.samples));
+    arr.push(data.samples);
 
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
@@ -328,7 +249,7 @@ export class SttTtsPlugin implements Plugin {
       // Apply the same voice detection logic we use for initial processing
 
       // Get normalized amplitude for this chunk (0-1 scale)
-      const samples = new Float32Array(
+      const samples = new Int16Array(
         data.samples.buffer,
         data.samples.byteOffset,
         data.samples.length / 4
@@ -339,7 +260,7 @@ export class SttTtsPlugin implements Plugin {
         this.interruptAnalysisBuffer[this.interruptBufferIndex++] = sample;
         if (this.interruptBufferIndex >= this.interruptAnalysisBuffer.length) {
           this.interruptBufferIndex = 0;
-          if (this.analyzeForInterruption(this.interruptAnalysisBuffer)) {
+          if (this.enhancedAnalyzeForInterruption(this.interruptAnalysisBuffer)) {
             this.ttsAbortController?.abort();
             this.isSpeaking = false;
             elizaLogger.log('[SttTtsPlugin] Fast interruption detected');
@@ -397,21 +318,13 @@ export class SttTtsPlugin implements Plugin {
       // 3. Wait for buffer merging to complete
       const merged = await mergeBufferPromise;
 
-      // Convert Float32Array back to Int16Array for downstream processing
-      const mergedInt16 = new Int16Array(merged.length);
-      for (let i = 0; i < merged.length; i++) {
-        // Convert normalized float (-1.0 to 1.0) back to Int16 range
-        // Clamp to ensure we don't exceed the range
-        mergedInt16[i] = Math.max(-32768, Math.min(32767, Math.round(merged[i] * 32768)));
-      }
-
       // 4. Optimize audio (downsample if needed)
-      const optimizedPcm = this.maybeDownsampleAudio(mergedInt16, 48000, 16000);
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
       // 5. Convert to WAV format
       const wavBuffer = await this.convertPcmToWavInMemory(
         optimizedPcm,
-        optimizedPcm === mergedInt16 ? 48000 : 16000
+        optimizedPcm === merged ? 48000 : 16000
       );
 
       const start = Date.now();
@@ -567,29 +480,12 @@ export class SttTtsPlugin implements Plugin {
    * Helper method to merge audio chunks in a non-blocking way
    * This allows other operations to continue while CPU-intensive merging happens
    */
-  private async mergeAudioChunks(chunks: Float32Array[]): Promise<Float32Array> {
-    // 1. Normalize to float32 for processing
-    const floatChunks = chunks.map((chunk) => {
-      const float32 = new Float32Array(chunk.length);
-      for (let i = 0; i < chunk.length; i++) {
-        float32[i] = chunk[i] / 32768; // [-1, 1] range
-      }
-      return float32;
-    });
-
-    // 2. Process audio in float32 domain
-    const processed = await this.processFloatAudio(floatChunks);
-
-    // 3. Return the processed Float32Array directly
-    return processed;
-  }
-
-  private async processFloatAudio(chunks: Float32Array[]): Promise<Float32Array> {
+  private async mergeAudioChunks(chunks: Int16Array[]): Promise<Int16Array> {
     // Calculate total length of all chunks
     const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     
     // Simple concatenation of chunks - no need for browser APIs
-    const result = new Float32Array(totalLength);
+    const result = new Int16Array(totalLength);
     let offset = 0;
     
     for (const chunk of chunks) {
@@ -600,7 +496,7 @@ export class SttTtsPlugin implements Plugin {
     // Here you could add any audio processing you need
     // For example, applying a simple gain adjustment:
     // for (let i = 0; i < result.length; i++) {
-    //   result[i] = Math.max(-1.0, Math.min(1.0, result[i] * 1.2));  // Apply gain of 1.2
+    //   result[i] = Math.max(-32768, Math.min(32767, result[i] * 1.2));  // Apply gain of 1.2
     // }
     
     return result;
@@ -1670,5 +1566,30 @@ export class SttTtsPlugin implements Plugin {
     for (let i = 0; i < text.length; i++) {
       view.setUint8(offset + i, text.charCodeAt(i));
     }
+  }
+
+  private enhancedAnalyzeForInterruption(audio: Int16Array): boolean {
+    const audioLength = audio.length;
+    if (audioLength < 512) return false;
+
+    // Calculate zero crossing rate - indicates speech activity
+    let zeroCrossings = 0;
+    for (let i = 1; i < audioLength; i++) {
+      if ((audio[i] >= 0 && audio[i - 1] < 0) || (audio[i] < 0 && audio[i - 1] >= 0)) {
+        zeroCrossings++;
+      }
+    }
+    const zcr = zeroCrossings / audio.length;
+
+    // Calculate Root Mean Square (RMS) - indicates volume
+    let sumSquares = 0;
+    for (let i = 0; i < audioLength; i++) {
+      sumSquares += audio[i] * audio[i];
+    }
+    const rms = Math.sqrt(sumSquares / audioLength) / 32768;
+
+    // Voice typically has ZCR between 0.05-0.15 and RMS > 0.05
+    // Adjust thresholds to ignore non-speech sounds
+    return zcr > 0.05 && zcr < 0.15 && rms > 0.1 && rms < 0.3;
   }
 }
