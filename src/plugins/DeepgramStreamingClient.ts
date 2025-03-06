@@ -256,18 +256,15 @@ export class SttTtsPlugin implements Plugin {
     
     // Make sure socket is ready before sending data
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
-      console.log("Sending audio data to Deepgram", data.samples.length);
       
       try {
         if (this.botProfile.id !== data.userId) {
-          console.log("Sending audio data to Deepgram", data.userId);
           
           // Check if buffer is empty or contains no voice
           const energy = this.calculateEnergy(data.samples);
           const isSilent = energy < 50; // Adjust this threshold based on your audio environment
           
           if (data.samples.length === 0 || isSilent) {
-            console.log("Skipping empty or silent buffer", { length: data.samples.length, energy });
             return;
           }
           
