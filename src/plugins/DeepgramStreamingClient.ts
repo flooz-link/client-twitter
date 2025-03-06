@@ -180,9 +180,7 @@ export class SttTtsPlugin implements Plugin {
         if (this.keepAlive) clearInterval(this.keepAlive);
         this.keepAlive = setInterval(() => {
           console.log("deepgram: keepalive");
-          if (this.socket && this.socket.getReadyState() === 1) {
-            this.socket.keepAlive();
-          }
+          this.socket.keepAlive();
         }, 10 * 1000);
 
           // Setup event listeners outside of the Open event to ensure they're registered
@@ -194,8 +192,8 @@ export class SttTtsPlugin implements Plugin {
         }
       });
 
-      this.socket.addListener(LiveTranscriptionEvents.Close, async () => {
-        console.log("deepgram: disconnected");
+      this.socket.addListener(LiveTranscriptionEvents.Close, async (test) => {
+        console.log("deepgram: disconnected", test);
         if (this.keepAlive) {
           clearInterval(this.keepAlive);
           this.keepAlive = null;
