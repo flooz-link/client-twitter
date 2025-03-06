@@ -2873,9 +2873,7 @@ import {
   elizaLogger as elizaLogger6,
   stringToUuid as stringToUuid6,
   composeContext as composeContext4,
-  getEmbeddingZeroVector as getEmbeddingZeroVector5,
-  generateMessageResponse as generateMessageResponse3,
-  ModelClass as ModelClass4
+  getEmbeddingZeroVector as getEmbeddingZeroVector5
 } from "@elizaos/core";
 
 // src/plugins/templates.ts
@@ -3448,6 +3446,7 @@ var SttTtsPlugin = class {
       this.pcmBuffers.delete(userId);
       if (!chunks.length) {
         elizaLogger6.warn("[SttTtsPlugin] No audio chunks for user =>", userId);
+        this.isProcessingAudio = false;
         return;
       }
       elizaLogger6.log(
@@ -3476,6 +3475,7 @@ var SttTtsPlugin = class {
           elizaLogger6.warn(
             `[SttTtsPlugin] No speech recognized for user => ${userId}, audio buffer size: ${wavBuffer.byteLength} bytes, transcription time: ${Date.now() - start}ms`
           );
+          this.isProcessingAudio = false;
           return;
         }
         elizaLogger6.log(
@@ -3625,65 +3625,6 @@ var SttTtsPlugin = class {
     elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
   }
   /**
-   * Stream a single chunk of audio to Janus
-   * Fixed to ensure exact byte length requirement is met
-   */
-  async streamChunkToJanus(samples, sampleRate) {
-    const EXPECTED_SAMPLES = 480;
-    const EXPECTED_BYTES = EXPECTED_SAMPLES * 2;
-    return new Promise((resolve, reject) => {
-      var _a, _b;
-      try {
-        if (samples.length !== EXPECTED_SAMPLES || samples.buffer.byteLength !== EXPECTED_BYTES) {
-          const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
-          const copyLength = Math.min(samples.length, EXPECTED_SAMPLES);
-          for (let i = 0; i < copyLength; i++) {
-            properSizedSamples[i] = samples[i];
-          }
-          const bufferView = new Int16Array(
-            properSizedSamples.buffer,
-            0,
-            EXPECTED_SAMPLES
-          );
-          (_a = this.janus) == null ? void 0 : _a.pushLocalAudio(bufferView, sampleRate);
-        } else {
-          (_b = this.janus) == null ? void 0 : _b.pushLocalAudio(samples, sampleRate);
-        }
-        resolve();
-      } catch (error) {
-        console.error("[SttTtsPlugin] Error sending audio to Janus:", error);
-        reject(error);
-      }
-    });
-  }
-  /**
-   * Helper method to convert audio chunk to Int16Array format required by Janus
-   */
-  convertAudioChunkToInt16(audioChunk) {
-    if (audioChunk instanceof Int16Array) {
-      return audioChunk;
-    }
-    if (audioChunk instanceof Float32Array) {
-      const int16Chunk = new Int16Array(audioChunk.length);
-      for (let i = 0; i < audioChunk.length; i++) {
-        int16Chunk[i] = Math.max(
-          -32768,
-          Math.min(32767, Math.round(audioChunk[i] * 32767))
-        );
-      }
-      return int16Chunk;
-    }
-    if (audioChunk instanceof ArrayBuffer || ArrayBuffer.isView(audioChunk)) {
-      return new Int16Array(
-        audioChunk instanceof ArrayBuffer ? audioChunk : audioChunk.buffer
-      );
-    }
-    elizaLogger6.warn(
-      "[SttTtsPlugin] Unknown audio chunk format, returning empty array"
-    );
-    return new Int16Array(0);
-  }
-  /**
    * Downsample audio if needed for Whisper
    * Whisper works best with 16kHz audio
    */
@@ -3804,89 +3745,6 @@ var SttTtsPlugin = class {
     }
   }
   /**
-   * Handle User Message
-   */
-  async handleUserMessage(userText, userId) {
-    var _a, _b, _c;
-    const numericId = userId.replace("tw-", "");
-    const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
-    const userUuid = stringToUuid6(`twitter-user-${numericId}`);
-    await Promise.all([
-      this.runtime.ensureUserExists(
-        userUuid,
-        userId,
-        // Use full Twitter ID as username
-        `Twitter User ${numericId}`,
-        "twitter"
-      ),
-      this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId)
-    ]);
-    let start = Date.now();
-    const memory = {
-      id: stringToUuid6(`${roomId}-voice-message-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      content: {
-        text: userText,
-        source: "twitter"
-      },
-      userId: userUuid,
-      roomId,
-      embedding: getEmbeddingZeroVector5(),
-      createdAt: Date.now()
-    };
-    let [state] = await Promise.all([
-      this.runtime.composeState(
-        {
-          agentId: this.runtime.agentId,
-          content: { text: userText, source: "twitter" },
-          userId: userUuid,
-          roomId
-        },
-        {
-          twitterUserName: this.client.profile.username,
-          agentName: this.runtime.character.name
-        }
-      ),
-      this.runtime.messageManager.createMemory(memory)
-    ]);
-    console.log(
-      `Compose state and create memory took ${Date.now() - start} ms`
-    );
-    start = Date.now();
-    state = await this.runtime.updateRecentMessageState(state);
-    console.log(`Recent messages state update took ${Date.now() - start} ms`);
-    const shouldIgnore = await this._shouldIgnore(memory);
-    if (shouldIgnore) {
-      return "";
-    }
-    start = Date.now();
-    const context = composeContext4({
-      state,
-      template: ((_a = this.runtime.character.templates) == null ? void 0 : _a.twitterVoiceHandlerTemplate) || ((_b = this.runtime.character.templates) == null ? void 0 : _b.messageHandlerTemplate) || twitterVoiceHandlerTemplate
-    });
-    const responseContent = await this._generateResponse(memory, context);
-    console.log(`Generating Response took ${Date.now() - start} ms`);
-    const responseMemory = {
-      id: stringToUuid6(`${memory.id}-voice-response-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      userId: this.runtime.agentId,
-      content: {
-        ...responseContent,
-        user: this.runtime.character.name,
-        inReplyTo: memory.id
-      },
-      roomId,
-      embedding: getEmbeddingZeroVector5()
-    };
-    const reply = (_c = responseMemory.content.text) == null ? void 0 : _c.trim();
-    if (reply) {
-      await this.runtime.messageManager.createMemory(responseMemory);
-    }
-    this.eventEmitter.emit("response", reply);
-    return reply;
-  }
-  /**
    * Handle User Message with streaming support
    */
   async handleUserMessageStreaming(userText, userId) {
@@ -3963,9 +3821,6 @@ var SttTtsPlugin = class {
       content: userText
     };
     const messages = [...this.chatContext, systemMessage, userMessage];
-    const progressiveTimeout = null;
-    const minCharactersForProgressive = 15;
-    const progressiveDelay = 400;
     const start = Date.now();
     if (!this.activeStreams.has(streamId) || ((_a = this.ttsAbortController) == null ? void 0 : _a.signal.aborted)) {
       elizaLogger6.log("[SttTtsPlugin] Stream was aborted before API call, cancelling");
@@ -4036,31 +3891,6 @@ var SttTtsPlugin = class {
     this.eventEmitter.emit("stream-end", streamId);
   }
   /**
-   * Generate Response
-   */
-  async _generateResponse(message, context) {
-    const { userId, roomId } = message;
-    const response = await generateMessageResponse3({
-      runtime: this.runtime,
-      context,
-      modelClass: ModelClass4.SMALL
-    });
-    response.source = "discord";
-    if (!response) {
-      elizaLogger6.error(
-        "[SttTtsPlugin] No response from generateMessageResponse"
-      );
-      return;
-    }
-    await this.runtime.databaseAdapter.log({
-      body: { message, context, response },
-      userId,
-      roomId,
-      type: "response"
-    });
-    return response;
-  }
-  /**
    * Should Ignore
    */
   async _shouldIgnore(message) {
@@ -4109,23 +3939,6 @@ var SttTtsPlugin = class {
       return true;
     }
     return false;
-  }
-  /**
-   * Add a message (system, user or assistant) to the chat context.
-   * E.g. to store conversation history or inject a persona.
-   */
-  addMessage(role, content) {
-    this.chatContext.push({ role, content });
-    elizaLogger6.log(
-      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`
-    );
-  }
-  /**
-   * Clear the chat context if needed.
-   */
-  clearChatContext() {
-    this.chatContext = [];
-    elizaLogger6.log("[SttTtsPlugin] clearChatContext => done");
   }
   /**
    * Enhanced analysis for detecting user interruptions in audio

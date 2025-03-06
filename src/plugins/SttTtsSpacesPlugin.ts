@@ -679,6 +679,7 @@ export class SttTtsPlugin implements Plugin {
 
       if (!chunks.length) {
         elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
+        this.isProcessingAudio = false; // Reset flag on early return
         return;
       }
 
@@ -735,6 +736,7 @@ export class SttTtsPlugin implements Plugin {
               `audio buffer size: ${wavBuffer.byteLength} bytes, ` +
               `transcription time: ${Date.now() - start}ms`,
           );
+          this.isProcessingAudio = false; // Reset flag on early return
           return;
         }
 
@@ -977,94 +979,6 @@ export class SttTtsPlugin implements Plugin {
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
-  /**
-   * Stream a single chunk of audio to Janus
-   * Fixed to ensure exact byte length requirement is met
-   */
-  private async streamChunkToJanus(
-    samples: Int16Array,
-    sampleRate: number,
-  ): Promise<void> {
-    // Janus expects exactly 480 samples (960 bytes)
-    const EXPECTED_SAMPLES = 480;
-    const EXPECTED_BYTES = EXPECTED_SAMPLES * 2; // 960 bytes
-
-    return new Promise<void>((resolve, reject) => {
-      try {
-        // Check if we need to create a properly sized buffer
-        if (
-          samples.length !== EXPECTED_SAMPLES ||
-          samples.buffer.byteLength !== EXPECTED_BYTES
-        ) {
-          // Create a new buffer with exactly the right size
-          const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
-
-          // Copy data from original samples, being careful not to overflow
-          const copyLength = Math.min(samples.length, EXPECTED_SAMPLES);
-          for (let i = 0; i < copyLength; i++) {
-            properSizedSamples[i] = samples[i];
-          }
-
-          // Create a buffer view that's EXACTLY 960 bytes (480 samples)
-          // This is crucial - we need the buffer to be exactly 960 bytes
-          const bufferView = new Int16Array(
-            properSizedSamples.buffer,
-            0,
-            EXPECTED_SAMPLES,
-          );
-
-          // Send the properly sized buffer to Janus
-          this.janus?.pushLocalAudio(bufferView, sampleRate);
-        } else {
-          // The buffer is already the right size
-          this.janus?.pushLocalAudio(samples, sampleRate);
-        }
-
-        resolve();
-      } catch (error) {
-        console.error('[SttTtsPlugin] Error sending audio to Janus:', error);
-        reject(error);
-      }
-    });
-  }
-
-  /**
-   * Helper method to convert audio chunk to Int16Array format required by Janus
-   */
-  private convertAudioChunkToInt16(audioChunk: any): Int16Array {
-    // If already Int16Array, return as is
-    if (audioChunk instanceof Int16Array) {
-      return audioChunk;
-    }
-
-    // If it's a Float32Array (common format from Web Audio API)
-    if (audioChunk instanceof Float32Array) {
-      const int16Chunk = new Int16Array(audioChunk.length);
-      for (let i = 0; i < audioChunk.length; i++) {
-        // Convert from float [-1.0, 1.0] to int16 [-32768, 32767]
-        int16Chunk[i] = Math.max(
-          -32768,
-          Math.min(32767, Math.round(audioChunk[i] * 32767)),
-        );
-      }
-      return int16Chunk;
-    }
-
-    // If it's an ArrayBuffer or other binary format
-    if (audioChunk instanceof ArrayBuffer || ArrayBuffer.isView(audioChunk)) {
-      // Assume it's PCM data that needs to be converted to Int16Array
-      // This may need adjustment based on the actual format from your TTS service
-      return new Int16Array(
-        audioChunk instanceof ArrayBuffer ? audioChunk : audioChunk.buffer,
-      );
-    }
-
-    // Fallback for unknown formats - return empty array
-    elizaLogger.warn(
-      '[SttTtsPlugin] Unknown audio chunk format, returning empty array',
-    );
-    return new Int16Array(0);
-  }
 
   /**
    * Downsample audio if needed for Whisper
@@ -1257,122 +1171,6 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Handle User Message
-   */
-  private async handleUserMessage(
-    userText: string,
-    userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
-  ): Promise<string> {
-    // Extract the numeric ID part
-    const numericId = userId.replace('tw-', '');
-    const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
-
-    // Create consistent UUID for the user
-    const userUuid = stringToUuid(`twitter-user-${numericId}`);
-
-    // Ensure the user exists in the accounts table
-    // Ensure room exists and user is in it
-
-    await Promise.all([
-      this.runtime.ensureUserExists(
-        userUuid,
-        userId, // Use full Twitter ID as username
-        `Twitter User ${numericId}`,
-        'twitter',
-      ),
-      this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]);
-
-    let start = Date.now();
-
-    const memory = {
-      id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      content: {
-        text: userText,
-        source: 'twitter',
-      },
-      userId: userUuid,
-      roomId,
-      embedding: getEmbeddingZeroVector(),
-      createdAt: Date.now(),
-    };
-
-    let [state] = await Promise.all([
-      this.runtime.composeState(
-        {
-          agentId: this.runtime.agentId,
-          content: { text: userText, source: 'twitter' },
-          userId: userUuid,
-          roomId,
-        },
-        {
-          twitterUserName: this.client.profile.username,
-          agentName: this.runtime.character.name,
-        },
-      ),
-      this.runtime.messageManager.createMemory(memory),
-    ]);
-    console.log(
-      `Compose state and create memory took ${Date.now() - start} ms`,
-    );
-
-    start = Date.now();
-    state = await this.runtime.updateRecentMessageState(state);
-    console.log(`Recent messages state update took ${Date.now() - start} ms`);
-
-    const shouldIgnore = await this._shouldIgnore(memory);
-
-    if (shouldIgnore) {
-      return '';
-    }
-
-    // const shouldRespond = await this._shouldRespond(userText, state);
-
-    // console.log(`should Respond took ${Date.now() - start} ms`);
-
-    // if (!shouldRespond) {
-    //   return '';
-    // }
-
-    start = Date.now();
-    const context = composeContext({
-      state,
-      template:
-        this.runtime.character.templates?.twitterVoiceHandlerTemplate ||
-        this.runtime.character.templates?.messageHandlerTemplate ||
-        twitterVoiceHandlerTemplate,
-    });
-
-    const responseContent = await this._generateResponse(memory, context);
-
-    console.log(`Generating Response took ${Date.now() - start} ms`);
-
-    const responseMemory: Memory = {
-      id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      userId: this.runtime.agentId,
-      content: {
-        ...responseContent,
-        user: this.runtime.character.name,
-        inReplyTo: memory.id,
-      },
-      roomId,
-      embedding: getEmbeddingZeroVector(),
-    };
-
-    const reply = responseMemory.content.text?.trim();
-    if (reply) {
-      await this.runtime.messageManager.createMemory(responseMemory);
-    }
-
-    this.eventEmitter.emit('response', reply);
-
-    return reply;
-  }
-
-  /**
    * Handle User Message with streaming support
    */
   private async handleUserMessageStreaming(
@@ -1478,11 +1276,6 @@ export class SttTtsPlugin implements Plugin {
     };
 
     const messages = [...this.chatContext, systemMessage, userMessage];
-
-    // Progressive timeout mechanism
-    const progressiveTimeout: NodeJS.Timeout | null = null;
-    const minCharactersForProgressive = 15;
-    const progressiveDelay = 400; // ms
 
     const start = Date.now();
     
@@ -1590,39 +1383,6 @@ export class SttTtsPlugin implements Plugin {
     this.eventEmitter.emit('stream-end', streamId);
   }
 
-  /**
-   * Generate Response
-   */
-  private async _generateResponse(
-    message: Memory,
-    context: string,
-  ): Promise<Content> {
-    const { userId, roomId } = message;
-
-    const response = await generateMessageResponse({
-      runtime: this.runtime,
-      context,
-      modelClass: ModelClass.SMALL,
-    });
-
-    response.source = 'discord';
-
-    if (!response) {
-      elizaLogger.error(
-        '[SttTtsPlugin] No response from generateMessageResponse',
-      );
-      return;
-    }
-
-    await this.runtime.databaseAdapter.log({
-      body: { message, context, response },
-      userId: userId,
-      roomId,
-      type: 'response',
-    });
-
-    return response;
-  }
 
   /**
    * Should Ignore
@@ -1679,24 +1439,7 @@ export class SttTtsPlugin implements Plugin {
     return false;
   }
 
-  /**
-   * Add a message (system, user or assistant) to the chat context.
-   * E.g. to store conversation history or inject a persona.
-   */
-  public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
-    this.chatContext.push({ role, content });
-    elizaLogger.log(
-      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`,
-    );
-  }
 
-  /**
-   * Clear the chat context if needed.
-   */
-  public clearChatContext() {
-    this.chatContext = [];
-    elizaLogger.log('[SttTtsPlugin] clearChatContext => done');
-  }
 
   /**
    * Enhanced analysis for detecting user interruptions in audio
