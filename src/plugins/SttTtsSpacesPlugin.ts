@@ -347,53 +347,17 @@ export class SttTtsPlugin implements Plugin {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    const SAMPLE_RATE = 48000;
-    const FRAME_SIZE = 480; // 10ms at 48kHz
-    const FRAME_DURATION_MS = 10; // Actual playback duration of each frame
+    elizaLogger.log(`[SttTtsPlugin] Streaming text to Janus: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
-    // Create a PassThrough stream for the MP3 data
+    if (!this.janus) {
+      elizaLogger.error('[SttTtsPlugin] No Janus client available for streaming TTS');
+      return;
+    }
+
+    // Create a readable stream for the MP3 data
     const mp3Stream = new PassThrough();
 
-    // Set up FFmpeg process for streaming conversion
-    const ffmpeg = spawn('ffmpeg', [
-      // Input stream settings
-      '-i',
-      'pipe:0',
-      '-f',
-      'mp3',
-
-      // Performance flags
-      '-threads',
-      '4',
-      '-loglevel',
-      'error',
-      '-nostdin',
-      '-fflags',
-      '+nobuffer',
-      '-flags',
-      '+low_delay',
-      '-probesize',
-      '32',
-      '-analyzeduration',
-      '0',
-
-      // Output settings - PCM audio
-      '-f',
-      's16le',
-      '-ar',
-      SAMPLE_RATE.toString(),
-      '-ac',
-      '1',
-      'pipe:1',
-    ]);
-
-    // Connect MP3 stream to FFmpeg input
-    mp3Stream.pipe(ffmpeg.stdin);
-
-    // Create a buffer to store audio frames
-    const audioBuffer: Int16Array[] = [];
-
-    // Flag to track if processing is complete
+    // Flag to track when processing is complete
     let processingComplete = false;
 
     // Flag to track if the stream has been interrupted
@@ -405,126 +369,151 @@ export class SttTtsPlugin implements Plugin {
       return;
     }
 
-    // Set up abort listener to handle interruptions
-    const abortListener = () => {
+    // Monitor abort signal
+    signal.addEventListener('abort', () => {
       isInterrupted = true;
-      elizaLogger.log('[SttTtsPlugin] TTS streaming interrupted - cleaning up resources');
-
-      // End the mp3Stream to stop data flow to FFmpeg
       mp3Stream.end();
+    });
 
-      // Kill the FFmpeg process if it's still running
-      if (ffmpeg && !ffmpeg.killed) {
-        ffmpeg.kill('SIGTERM');
-      }
+    // Start streaming request to ElevenLabs
+    elizaLogger.log('[SttTtsPlugin] Starting ElevenLabs streaming request');
+    
+    // Create a buffer to hold audio frames for playback
+    const audioBuffer: Int16Array[] = [];
 
-      // Clear the audio buffer to prevent further processing
-      audioBuffer.length = 0;
-      processingComplete = true;
-    };
+    // Use FFMPEG to convert MP3 to PCM
+    const ffmpeg = spawn('ffmpeg', [
+      '-i',
+      'pipe:0',
+      '-f',
+      's16le',
+      '-acodec',
+      'pcm_s16le',
+      '-ar',
+      '48000',
+      '-ac',
+      '1',
+      'pipe:1',
+    ]);
 
-    // Add abort listener
-    signal.addEventListener('abort', abortListener);
+    // Handle FFMPEG process errors
+    ffmpeg.on('error', (err) => {
+      elizaLogger.error('[SttTtsPlugin] FFMPEG process error:', err);
+      isInterrupted = true;
+    });
 
-    // Start the ElevenLabs API call with streaming response
-    const elevenLabsPromise = this.elevenLabsTtsStreaming(
-      text,
-      mp3Stream,
-      signal,
-    );
-
-    // Process FFmpeg output and store in buffer
+    // Process the PCM data from FFMPEG
     const processingPromise = new Promise<void>((resolve, reject) => {
       let pcmBuffer = Buffer.alloc(0);
 
       ffmpeg.stdout.on('data', (chunk: Buffer) => {
         try {
           if (isInterrupted || signal.aborted) return;
-
+          
           // Append new chunk to our buffer
           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
 
-          // Process complete frames
-          while (pcmBuffer.length >= FRAME_SIZE * 2) {
-            // 2 bytes per sample
-            // Extract a complete frame
-            const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
-            pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
+          // Process complete frames (480 samples = 10ms at 48kHz)
+          const FRAME_SIZE = 480;
+          const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2)); // 2 bytes per sample
+          
+          // Optimize for low latency by processing frames as soon as we have a small batch
+          if (frameCount > 0) {
+            for (let i = 0; i < frameCount; i++) {
+              // Convert to Int16Array and store in audio buffer
+              const frame = new Int16Array(
+                pcmBuffer.buffer.slice(
+                  i * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
+                  (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
+                ),
+              );
 
-            // Convert to Int16Array and store in audio buffer
-            const frame = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE,
-            );
-
-            // Create a copy of the frame to avoid shared buffer issues
-            const frameCopy = new Int16Array(FRAME_SIZE);
-            frameCopy.set(frame);
-
-            // Add to our ordered buffer queue only if not interrupted
-            if (!isInterrupted && !signal.aborted) {
+              // Create a copy to avoid buffer reference issues
+              const frameCopy = new Int16Array(FRAME_SIZE);
+              frameCopy.set(frame);
               audioBuffer.push(frameCopy);
             }
+            
+            // Remove processed frames from buffer
+            pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
           }
         } catch (error) {
           reject(error);
         }
       });
 
-      ffmpeg.stderr.on('data', (data) => {
-        if (data.toString().includes('Error')) {
-          console.error('[FFmpeg Streaming Error]', data.toString().trim());
-        }
-      });
-
-      ffmpeg.on('close', (code) => {
-        try {
-          if (code !== 0 && !signal.aborted && !isInterrupted) {
-            reject(
-              new Error(`ffmpeg streaming process exited with code ${code}`),
-            );
-            return;
-          }
-
-          // Process any remaining audio in the buffer
-          if (pcmBuffer.length > 0 && !signal.aborted && !isInterrupted) {
-            // Create a proper sized frame for any remaining data
-            const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
-            pcmBuffer.copy(
-              frameBuffer,
-              0,
-              0,
-              Math.min(pcmBuffer.length, FRAME_SIZE * 2),
-            );
-
-            const frame = new Int16Array(FRAME_SIZE);
-
-            // Copy from the buffer view to our frame
-            const srcView = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE,
-            );
-
-            frame.set(srcView);
+      ffmpeg.stdout.on('end', () => {
+        processingComplete = true;
+        
+        // Process any remaining data
+        if (pcmBuffer.length > 0) {
+          const remainingFrames = Math.floor(pcmBuffer.length / 2); // 2 bytes per sample
+          if (remainingFrames > 0) {
+            const frame = new Int16Array(remainingFrames);
+            for (let i = 0; i < remainingFrames; i++) {
+              frame[i] = pcmBuffer.readInt16LE(i * 2);
+            }
             audioBuffer.push(frame);
           }
-
-          processingComplete = true;
-          resolve();
-        } catch (error) {
-          reject(error);
         }
+        
+        resolve();
       });
 
-      ffmpeg.on('error', (err) => {
-        reject(new Error(`FFmpeg process error: ${err.message}`));
+      ffmpeg.stdout.on('error', (err) => {
+        elizaLogger.error('[SttTtsPlugin] FFMPEG stdout error:', err);
+        reject(err);
       });
     });
 
+    // Start the streaming request to ElevenLabs
     try {
-      // Wait for audio processing to complete (or at least start building the buffer)
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream?optimize_streaming_latency=3`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'xi-api-key': this.elevenLabsApiKey || '',
+          },
+          body: JSON.stringify({
+            text,
+            model_id: this.elevenLabsModel,
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          }),
+        },
+      );
+
+      if (!response.ok || !response.body) {
+        throw new Error(`ElevenLabs API error: ${response.status} ${response.statusText}`);
+      }
+
+      // Stream the response to the ffmpeg process
+      const reader = response.body.getReader();
+      
+      // Speed up the initial buffer filling by reading faster
+      const readStream = async () => {
+        try {
+          while (true) {
+            if (isInterrupted || signal.aborted) break;
+            
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            if (value) {
+              ffmpeg.stdin.write(value);
+            }
+          }
+        } catch (err) {
+          elizaLogger.error('[SttTtsPlugin] Error reading from ElevenLabs stream:', err);
+        } finally {
+          ffmpeg.stdin.end();
+        }
+      };
+      
+      readStream();
+
+      // Wait for initial processing or interruption - reduced wait time for faster start
       await Promise.race([
         processingPromise.catch((err) => {
           elizaLogger.error('[SttTtsPlugin] Processing error:', err);
@@ -532,10 +521,10 @@ export class SttTtsPlugin implements Plugin {
         // Also wait for a minimum buffer to build up before starting playback
         new Promise<void>((resolve) => {
           const checkBuffer = () => {
-            if (audioBuffer.length > 10 || signal.aborted || isInterrupted) {
+            if (audioBuffer.length > 3 || signal.aborted || isInterrupted) {
               resolve();
             } else {
-              setTimeout(checkBuffer, 50);
+              setTimeout(checkBuffer, 10);
             }
           };
           checkBuffer();
@@ -548,8 +537,7 @@ export class SttTtsPlugin implements Plugin {
 
       while (
         (frameIndex < audioBuffer.length || !processingComplete) &&
-        !signal.aborted &&
-        !isInterrupted
+        !isInterrupted && !signal.aborted
       ) {
         // If we've played all available frames but processing isn't complete, wait for more
         if (frameIndex >= audioBuffer.length && !processingComplete) {
@@ -558,25 +546,24 @@ export class SttTtsPlugin implements Plugin {
               if (
                 frameIndex < audioBuffer.length ||
                 processingComplete ||
-                signal.aborted ||
-                isInterrupted
+                isInterrupted ||
+                signal.aborted
               ) {
                 resolve();
               } else {
-                setTimeout(waitForMoreFrames, 20);
+                setTimeout(waitForMoreFrames, 10); // Check more frequently
               }
             };
             waitForMoreFrames();
           });
 
-          // If we're still out of frames after waiting, exit the loop
           if (frameIndex >= audioBuffer.length || signal.aborted || isInterrupted) {
             break;
           }
         }
 
         // Calculate the ideal playback time for this frame
-        const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
+        const idealPlaybackTime = startTime + frameIndex * 10; // 10ms per frame
         const currentTime = Date.now();
 
         // Adjust timing if we're behind or ahead
@@ -588,7 +575,7 @@ export class SttTtsPlugin implements Plugin {
         } else if (currentTime > idealPlaybackTime + 100) {
           // We're significantly behind, skip frames to catch up
           const framesToSkip = Math.floor(
-            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS,
+            (currentTime - idealPlaybackTime) / 10,
           );
           if (framesToSkip > 0) {
             elizaLogger.log(
@@ -599,160 +586,55 @@ export class SttTtsPlugin implements Plugin {
           }
         }
 
-        // Check for interruption before sending each frame
-        if (signal.aborted || isInterrupted) {
-          elizaLogger.log('[SttTtsPlugin] Streaming interrupted during frame playback');
-          break;
+        // Send audio frame to Janus if we have one
+        if (frameIndex < audioBuffer.length) {
+          try {
+            const frame = audioBuffer[frameIndex];
+            
+            if (!isInterrupted && !signal.aborted) {
+              // Use the enhanced interrupt detection
+              if (this.enhancedAnalyzeForInterruption(frame)) {
+                elizaLogger.log('[SttTtsPlugin] User interrupt detected during TTS playback');
+                isInterrupted = true;
+                break;
+              }
+              
+              // Send the frame to Janus - ensure proper frame size (480 samples)
+              const EXPECTED_SAMPLES = 480;
+              
+              // Check if we need to resize the frame
+              if (frame.length !== EXPECTED_SAMPLES) {
+                // Create properly sized frame
+                const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
+                
+                // Copy data, being careful not to overflow
+                const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
+                properSizedFrame.set(frame.subarray(0, copyLength));
+                
+                // Send properly sized frame
+                this.janus.pushLocalAudio(properSizedFrame, 48000);
+              } else {
+                // Frame already has correct size
+                this.janus.pushLocalAudio(frame, 48000);
+              }
+            } else {
+              break;
+            }
+          } catch (error) {
+            elizaLogger.error('[SttTtsPlugin] Error sending audio frame:', error);
+          }
         }
-
-        // Get the next frame
-        const frame = audioBuffer[frameIndex];
-
-        // Send to Janus
-        try {
-          await this.streamChunkToJanus(frame, SAMPLE_RATE);
-        } catch (error) {
-          elizaLogger.error(
-            '[SttTtsPlugin] Error sending frame to Janus:',
-            error,
-          );
-        }
-
         frameIndex++;
       }
 
       // If interrupted, log it
       if (signal.aborted || isInterrupted) {
         elizaLogger.log('[SttTtsPlugin] Audio streaming was interrupted before completion');
-      } else if (!isInterrupted) {
-        // Wait for any remaining processing to complete only if not interrupted
-        await processingPromise;
-        await elevenLabsPromise;
-
-        elizaLogger.log(
-          `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`,
-        );
+      } else {
+        elizaLogger.log('[SttTtsPlugin] Audio streaming completed successfully');
       }
     } catch (error) {
-      if (signal.aborted || isInterrupted) {
-        elizaLogger.log('[SttTtsPlugin] Audio streaming aborted');
-      } else {
-        elizaLogger.error('[SttTtsPlugin] Audio streaming error:', error);
-      }
-
-      // Make sure to end the stream on error
-      mp3Stream.end();
-      throw error;
-    } finally {
-      // Clean up event listeners
-      signal.removeEventListener('abort', abortListener);
-
-      // Ensure FFmpeg process is terminated
-      if (ffmpeg && !ffmpeg.killed) {
-        ffmpeg.kill('SIGTERM');
-      }
-    }
-  }
-
-  /**
-   * Modified ElevenLabs TTS function that streams the response to a writable stream
-   * instead of waiting for the full response
-   */
-  private async elevenLabsTtsStreaming(
-    text: string,
-    outputStream: NodeJS.WritableStream,
-    signal: AbortSignal,
-  ): Promise<void> {
-    try {
-      if (!this.elevenLabsApiKey) {
-        throw new Error('[SttTtsPlugin] No ElevenLabs API key');
-      }
-
-      // Set up ElevenLabs API request
-      const apiKey = this.elevenLabsApiKey;
-      const voiceId = this.voiceId;
-
-      // Use the streaming endpoint
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
-
-      elizaLogger.log(
-        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`,
-      );
-
-      // Make the API request
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          Accept: 'audio/mpeg',
-          'Content-Type': 'application/json',
-          'xi-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          text,
-          model_id: this.elevenLabsModel,
-          voice_settings: {
-            stability: 0.4,
-            similarity_boost: 0.8,
-          },
-        }),
-        signal,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`,
-        );
-      }
-
-      if (!response.body) {
-        throw new Error('Response body is null');
-      }
-
-      elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`,
-      );
-
-      // Stream the response directly to our output stream
-      const reader = response.body.getReader();
-
-      let done = false;
-      let bytesReceived = 0;
-
-      while (!done && !signal.aborted) {
-        const { value, done: readerDone } = await reader.read();
-        done = readerDone;
-
-        if (value && !signal.aborted) {
-          bytesReceived += value.length;
-
-          // Write chunk to our stream
-          outputStream.write(Buffer.from(value));
-
-          // Log progress periodically
-          if (bytesReceived % 10000 < 1000) {
-            elizaLogger.log(
-              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`,
-            );
-          }
-        }
-      }
-
-      // End the stream when done
-      outputStream.end();
-      elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`,
-      );
-    } catch (error) {
-      if (error.name === 'AbortError') {
-        elizaLogger.log('[SttTtsPlugin] ElevenLabs request aborted');
-      } else {
-        elizaLogger.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
-      }
-
-      // Make sure to end the stream on error
-      outputStream.end();
-      throw error;
+      elizaLogger.error('[SttTtsPlugin] Error streaming TTS to Janus:', error);
     }
   }
 
@@ -860,7 +742,7 @@ export class SttTtsPlugin implements Plugin {
         let ttsBuffer = '';
 
         // Minimum characters needed for natural speech synthesis
-        const minTtsChunkSize = 30;
+        const minTtsChunkSize = 20;
 
         // Flag to track if TTS is currently processing
         let isTtsProcessing = false;
@@ -876,8 +758,8 @@ export class SttTtsPlugin implements Plugin {
         };
 
         let progressiveTimeout: NodeJS.Timeout | null = null;
-        const minCharactersForProgressive = 15;
-        const progressiveDelay = 400; // ms
+        const minCharactersForProgressive = 10;
+        const progressiveDelay = 200; // ms
 
         const processTtsChunk = async () => {
           if (isTtsProcessing || ttsBuffer.length === 0) return;
@@ -890,13 +772,14 @@ export class SttTtsPlugin implements Plugin {
             ttsBuffer = '';
 
             // Add natural pauses at punctuation to make speech sound more natural
+            // Further reduced pause durations to improve latency
             const textWithPauses = textToProcess
-              .replace(/\.\s+/g, '. <break time="500ms"/> ')
-              .replace(/\?\s+/g, '? <break time="500ms"/> ')
-              .replace(/!\s+/g, '! <break time="500ms"/> ')
-              .replace(/:\s+/g, ': <break time="300ms"/> ')
-              .replace(/;\s+/g, '; <break time="300ms"/> ')
-              .replace(/,\s+/g, ', <break time="200ms"/> ');
+              .replace(/\.\s+/g, '. <break time="100ms"/> ')
+              .replace(/\?\s+/g, '? <break time="100ms"/> ')
+              .replace(/!\s+/g, '! <break time="100ms"/> ')
+              .replace(/:\s+/g, ': <break time="80ms"/> ')
+              .replace(/;\s+/g, '; <break time="80ms"/> ')
+              .replace(/,\s+/g, ', <break time="30ms"/> ');
 
             elizaLogger.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? '...' : ''}"`);
 
@@ -908,7 +791,7 @@ export class SttTtsPlugin implements Plugin {
               // Schedule the next chunk with a small delay to prevent audio overlap
               setTimeout(() => {
                 processTtsChunk();
-              }, 100);
+              }, 50);
             }
           } catch (error) {
             elizaLogger.error('[SttTtsPlugin] Error processing TTS chunk:', error);
@@ -1516,9 +1399,6 @@ export class SttTtsPlugin implements Plugin {
     const minCharactersForProgressive = 15;
     const progressiveDelay = 400; // ms
 
-    // Signal stream start
-    this.eventEmitter.emit('stream-start', streamId);
-
     const start = Date.now();
     
     // Check if the stream is still active before making the API call
@@ -1536,9 +1416,11 @@ export class SttTtsPlugin implements Plugin {
     });
 
     let fullResponse = '';
-    let jsonBuffer = '';
-    let isJsonResponse = false;
-    let textValue = '';
+    let bufferedText = '';
+    let potentialActionMarker = false;
+    let detectedAction = '';
+    
+    elizaLogger.log('[SttTtsPlugin] Starting Grok streaming response processing');
 
     // Process each chunk as it arrives
     for await (const chunk of stream) {
@@ -1547,148 +1429,80 @@ export class SttTtsPlugin implements Plugin {
 
       fullResponse += content;
 
-      // Check early chunks for JSON indicators
-      if (!isJsonResponse && jsonBuffer.length < 30) {
-        jsonBuffer += content;
-        if (
-          jsonBuffer.includes('```json') ||
-          jsonBuffer.includes('```\njson') ||
-          jsonBuffer.includes('```') ||
-          jsonBuffer.includes('{')
-        ) {
-          isJsonResponse = true;
-        }
-      }
-
-      // If it's not JSON, emit directly
-      if (!isJsonResponse) {
-        this.eventEmitter.emit('stream-chunk', content, streamId);
+      // Check if we should start buffering (seeing "action" word)
+      if (!potentialActionMarker && content.includes('action')) {
+        potentialActionMarker = true;
+        bufferedText += content;
         continue;
       }
 
-      // It's JSON, continue buffering
-      jsonBuffer += content;
-
-      // Try to extract the text field value
-      try {
-        // Look for "text": pattern
-        const textMatch = /"text":\s*"([^"]*)/.exec(jsonBuffer);
-
-        if (textMatch) {
-          // We found the text field
-          const capturedText = textMatch[1];
-
-          // If we have more text than before, emit the difference
-          if (capturedText.length > textValue.length) {
-            const newText = capturedText.substring(textValue.length);
-            this.eventEmitter.emit('stream-chunk', newText, streamId);
-            textValue = capturedText;
-          }
-        }
-
-        // Also check for a complete JSON object and parse it
-        if (
-          jsonBuffer.includes('}') &&
-          (jsonBuffer.includes('```') || jsonBuffer.endsWith('}'))
-        ) {
-          // Try to extract the complete JSON
-          let jsonStr = jsonBuffer;
-
-          // Clean up markdown code block syntax if present
-          if (jsonStr.includes('```json')) {
-            jsonStr = jsonStr.replace(/```json\s*/, '').replace(/\s*```$/, '');
-          } else if (jsonStr.includes('```')) {
-            jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
-          }
-
-          // Find the first { and last }
-          const firstBrace = jsonStr.indexOf('{');
-          const lastBrace = jsonStr.lastIndexOf('}');
-
-          if (firstBrace >= 0 && lastBrace > firstBrace) {
-            const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
-
-            try {
-              const parsed = JSON.parse(jsonObject);
-
-              // If we have a text field, emit any new content
-              if (parsed.text && parsed.text.length > textValue.length) {
-                const newText = parsed.text.substring(textValue.length);
-                this.eventEmitter.emit('stream-chunk', newText, streamId);
-                textValue = parsed.text;
-              }
-            } catch (e) {
-              // Incomplete or invalid JSON, continue buffering
+      // If we're buffering, check for actionIs: pattern
+      if (potentialActionMarker) {
+        bufferedText += content;
+        
+        // If we find the complete actionIs: pattern
+        if (bufferedText.includes('actionIs:')) {
+          const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
+          if (actionMatch) {
+            detectedAction = actionMatch[1];
+            elizaLogger.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
+            
+            // Emit only the text part before actionIs:
+            const textBeforeAction = bufferedText.split('actionIs:')[0].trim();
+            if (textBeforeAction) {
+              this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
             }
+            
+            // Clear buffer since we've handled it
+            bufferedText = '';
+            potentialActionMarker = false;
           }
+        } else if (bufferedText.length > 100) {
+          // If buffer gets too large without finding actionIs:, 
+          // it's probably not an action marker - emit it
+          this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
+          bufferedText = '';
+          potentialActionMarker = false;
         }
-      } catch (e) {
-        // Error in regex or parsing, continue buffering
+        continue;
       }
+
+      // Regular text processing - emit directly
+      this.eventEmitter.emit('stream-chunk', content, streamId);
     }
 
-    // If we never found a text field but have JSON, try one last time to parse it
-    if (isJsonResponse && jsonBuffer && !textValue) {
-      try {
-        // Clean up markdown code block syntax if present
-        let jsonStr = jsonBuffer;
-        if (jsonStr.includes('```json')) {
-          jsonStr = jsonStr.replace(/```json\s*/, '').replace(/\s*```$/, '');
-        } else if (jsonStr.includes('```')) {
-          jsonStr = jsonStr.replace(/```\s*/, '').replace(/\s*```$/, '');
+    // Process any remaining buffered text at the end
+    if (bufferedText) {
+      // Check if it contains an action marker
+      if (bufferedText.includes('actionIs:')) {
+        const textBeforeAction = bufferedText.split('actionIs:')[0].trim();
+        if (textBeforeAction) {
+          this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
         }
-
-        // Find the first { and last }
-        const firstBrace = jsonStr.indexOf('{');
-        const lastBrace = jsonStr.lastIndexOf('}');
-
-        if (firstBrace >= 0 && lastBrace > firstBrace) {
-          const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
-          const parsed = JSON.parse(jsonObject);
-
-          if (parsed.text) {
-            console.log(`Time took for emitting ${Date.now() - start}`);
-            this.eventEmitter.emit('stream-chunk', parsed.text, streamId);
-          } else {
-            // No text field found, emit the whole buffer as fallback
-            this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
-          }
-        } else {
-          // No valid JSON found, emit the whole buffer as fallback
-          this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
+        
+        // Extract action if any
+        const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
+        if (actionMatch) {
+          detectedAction = actionMatch[1];
+          elizaLogger.log(`[SttTtsPlugin] Final detected action: ${detectedAction}`);
         }
-      } catch (e) {
-        console.log(`Time took for emitting ${Date.now() - start}`);
-        // Parsing failed, emit the whole buffer as fallback
-        this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
+      } else {
+        // No action marker, emit the entire buffer
+        this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
       }
     }
 
     console.log(`Time took for completing LLM ${Date.now() - start}`);
+    
+    // Log the detected action if any
+    if (detectedAction) {
+      elizaLogger.log(`[SttTtsPlugin] Response contained action: ${detectedAction}`);
+      // Here you could trigger the appropriate action based on detectedAction
+      // For example: if (detectedAction === 'SEARCH_WEB') { /* trigger web search */ }
+    }
+    
     // Signal stream end
     this.eventEmitter.emit('stream-end', streamId);
-
-    // Save the complete response to memory
-    // if (fullResponse.trim()) {
-    //   const responseMemory: Memory = {
-    //     id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
-    //     agentId: this.runtime.agentId,
-    //     userId: this.runtime.agentId,
-    //     content: {
-    //       text: fullResponse,
-    //       source: 'twitter',
-    //       user: this.runtime.character.name,
-    //       inReplyTo: memory.id
-    //     },
-    //     roomId,
-    //     embedding: getEmbeddingZeroVector()
-    //   };
-
-    //   await this.runtime.messageManager.createMemory(responseMemory).catch(error => {
-    //     elizaLogger.warn(`Error when creating memory after response on spaces ${error} ignoring`)
-    //     return;
-    //   });
-    // }
   }
 
   /**

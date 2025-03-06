@@ -2987,16 +2987,12 @@ Note that {{agentName}} is capable of multiple tasks but in the context of space
 
 {{recentMessages}}
 
-# Instructions: Write the next message for {{agentName}}. Include an optional action if appropriate. {{actionNames}}
+# Instructions: Write the next message for {{agentName}}.
     
-Response format should be formatted in a valid JSON block like this:
-\`\`\`json
-{ "user": "{{agentName}}", "text": "<string>", "action": "<string>" }
-\`\`\`
-
-The \u201Caction\u201D field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.
-When you decide the action is something different than NONE, the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you
-need to sound like you are naturally buying time.`;
+If you decide that {{agentName}} should take an action other than "NONE", the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you have to sound like you are naturally buying time.
+You should always respond with a short and concise message.
+**Important** 
+If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`.`;
 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { PassThrough } from "stream";
@@ -3220,128 +3216,123 @@ var SttTtsPlugin = class {
     }
   }
   async streamTtsToJanus(text, signal) {
-    const SAMPLE_RATE = 48e3;
-    const FRAME_SIZE = 480;
-    const FRAME_DURATION_MS = 10;
+    elizaLogger6.log(`[SttTtsPlugin] Streaming text to Janus: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`);
+    if (!this.janus) {
+      elizaLogger6.error("[SttTtsPlugin] No Janus client available for streaming TTS");
+      return;
+    }
     const mp3Stream = new PassThrough();
-    const ffmpeg = spawn("ffmpeg", [
-      // Input stream settings
-      "-i",
-      "pipe:0",
-      "-f",
-      "mp3",
-      // Performance flags
-      "-threads",
-      "4",
-      "-loglevel",
-      "error",
-      "-nostdin",
-      "-fflags",
-      "+nobuffer",
-      "-flags",
-      "+low_delay",
-      "-probesize",
-      "32",
-      "-analyzeduration",
-      "0",
-      // Output settings - PCM audio
-      "-f",
-      "s16le",
-      "-ar",
-      SAMPLE_RATE.toString(),
-      "-ac",
-      "1",
-      "pipe:1"
-    ]);
-    mp3Stream.pipe(ffmpeg.stdin);
-    const audioBuffer = [];
     let processingComplete = false;
     let isInterrupted = false;
     if (signal.aborted) {
       mp3Stream.end();
       return;
     }
-    const abortListener = () => {
+    signal.addEventListener("abort", () => {
       isInterrupted = true;
-      elizaLogger6.log("[SttTtsPlugin] TTS streaming interrupted - cleaning up resources");
       mp3Stream.end();
-      if (ffmpeg && !ffmpeg.killed) {
-        ffmpeg.kill("SIGTERM");
-      }
-      audioBuffer.length = 0;
-      processingComplete = true;
-    };
-    signal.addEventListener("abort", abortListener);
-    const elevenLabsPromise = this.elevenLabsTtsStreaming(
-      text,
-      mp3Stream,
-      signal
-    );
+    });
+    elizaLogger6.log("[SttTtsPlugin] Starting ElevenLabs streaming request");
+    const audioBuffer = [];
+    const ffmpeg = spawn("ffmpeg", [
+      "-i",
+      "pipe:0",
+      "-f",
+      "s16le",
+      "-acodec",
+      "pcm_s16le",
+      "-ar",
+      "48000",
+      "-ac",
+      "1",
+      "pipe:1"
+    ]);
+    ffmpeg.on("error", (err) => {
+      elizaLogger6.error("[SttTtsPlugin] FFMPEG process error:", err);
+      isInterrupted = true;
+    });
     const processingPromise = new Promise((resolve, reject) => {
       let pcmBuffer = Buffer.alloc(0);
       ffmpeg.stdout.on("data", (chunk) => {
         try {
           if (isInterrupted || signal.aborted) return;
           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
-          while (pcmBuffer.length >= FRAME_SIZE * 2) {
-            const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
-            pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
-            const frame = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE
-            );
-            const frameCopy = new Int16Array(FRAME_SIZE);
-            frameCopy.set(frame);
-            if (!isInterrupted && !signal.aborted) {
+          const FRAME_SIZE = 480;
+          const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2));
+          if (frameCount > 0) {
+            for (let i = 0; i < frameCount; i++) {
+              const frame = new Int16Array(
+                pcmBuffer.buffer.slice(
+                  i * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
+                  (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset
+                )
+              );
+              const frameCopy = new Int16Array(FRAME_SIZE);
+              frameCopy.set(frame);
               audioBuffer.push(frameCopy);
             }
+            pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
           }
         } catch (error) {
           reject(error);
         }
       });
-      ffmpeg.stderr.on("data", (data) => {
-        if (data.toString().includes("Error")) {
-          console.error("[FFmpeg Streaming Error]", data.toString().trim());
-        }
-      });
-      ffmpeg.on("close", (code) => {
-        try {
-          if (code !== 0 && !signal.aborted && !isInterrupted) {
-            reject(
-              new Error(`ffmpeg streaming process exited with code ${code}`)
-            );
-            return;
-          }
-          if (pcmBuffer.length > 0 && !signal.aborted && !isInterrupted) {
-            const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
-            pcmBuffer.copy(
-              frameBuffer,
-              0,
-              0,
-              Math.min(pcmBuffer.length, FRAME_SIZE * 2)
-            );
-            const frame = new Int16Array(FRAME_SIZE);
-            const srcView = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE
-            );
-            frame.set(srcView);
+      ffmpeg.stdout.on("end", () => {
+        processingComplete = true;
+        if (pcmBuffer.length > 0) {
+          const remainingFrames = Math.floor(pcmBuffer.length / 2);
+          if (remainingFrames > 0) {
+            const frame = new Int16Array(remainingFrames);
+            for (let i = 0; i < remainingFrames; i++) {
+              frame[i] = pcmBuffer.readInt16LE(i * 2);
+            }
             audioBuffer.push(frame);
           }
-          processingComplete = true;
-          resolve();
-        } catch (error) {
-          reject(error);
         }
+        resolve();
       });
-      ffmpeg.on("error", (err) => {
-        reject(new Error(`FFmpeg process error: ${err.message}`));
+      ffmpeg.stdout.on("error", (err) => {
+        elizaLogger6.error("[SttTtsPlugin] FFMPEG stdout error:", err);
+        reject(err);
       });
     });
     try {
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream?optimize_streaming_latency=3`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "xi-api-key": this.elevenLabsApiKey || ""
+          },
+          body: JSON.stringify({
+            text,
+            model_id: this.elevenLabsModel,
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+          })
+        }
+      );
+      if (!response.ok || !response.body) {
+        throw new Error(`ElevenLabs API error: ${response.status} ${response.statusText}`);
+      }
+      const reader = response.body.getReader();
+      const readStream = async () => {
+        try {
+          while (true) {
+            if (isInterrupted || signal.aborted) break;
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              ffmpeg.stdin.write(value);
+            }
+          }
+        } catch (err) {
+          elizaLogger6.error("[SttTtsPlugin] Error reading from ElevenLabs stream:", err);
+        } finally {
+          ffmpeg.stdin.end();
+        }
+      };
+      readStream();
       await Promise.race([
         processingPromise.catch((err) => {
           elizaLogger6.error("[SttTtsPlugin] Processing error:", err);
@@ -3349,10 +3340,10 @@ var SttTtsPlugin = class {
         // Also wait for a minimum buffer to build up before starting playback
         new Promise((resolve) => {
           const checkBuffer = () => {
-            if (audioBuffer.length > 10 || signal.aborted || isInterrupted) {
+            if (audioBuffer.length > 3 || signal.aborted || isInterrupted) {
               resolve();
             } else {
-              setTimeout(checkBuffer, 50);
+              setTimeout(checkBuffer, 10);
             }
           };
           checkBuffer();
@@ -3360,14 +3351,14 @@ var SttTtsPlugin = class {
       ]);
       let frameIndex = 0;
       const startTime = Date.now();
-      while ((frameIndex < audioBuffer.length || !processingComplete) && !signal.aborted && !isInterrupted) {
+      while ((frameIndex < audioBuffer.length || !processingComplete) && !isInterrupted && !signal.aborted) {
         if (frameIndex >= audioBuffer.length && !processingComplete) {
           await new Promise((resolve) => {
             const waitForMoreFrames = () => {
-              if (frameIndex < audioBuffer.length || processingComplete || signal.aborted || isInterrupted) {
+              if (frameIndex < audioBuffer.length || processingComplete || isInterrupted || signal.aborted) {
                 resolve();
               } else {
-                setTimeout(waitForMoreFrames, 20);
+                setTimeout(waitForMoreFrames, 10);
               }
             };
             waitForMoreFrames();
@@ -3376,7 +3367,7 @@ var SttTtsPlugin = class {
             break;
           }
         }
-        const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
+        const idealPlaybackTime = startTime + frameIndex * 10;
         const currentTime = Date.now();
         if (currentTime < idealPlaybackTime) {
           await new Promise(
@@ -3384,7 +3375,7 @@ var SttTtsPlugin = class {
           );
         } else if (currentTime > idealPlaybackTime + 100) {
           const framesToSkip = Math.floor(
-            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS
+            (currentTime - idealPlaybackTime) / 10
           );
           if (framesToSkip > 0) {
             elizaLogger6.log(
@@ -3394,117 +3385,40 @@ var SttTtsPlugin = class {
             continue;
           }
         }
-        if (signal.aborted || isInterrupted) {
-          elizaLogger6.log("[SttTtsPlugin] Streaming interrupted during frame playback");
-          break;
-        }
-        const frame = audioBuffer[frameIndex];
-        try {
-          await this.streamChunkToJanus(frame, SAMPLE_RATE);
-        } catch (error) {
-          elizaLogger6.error(
-            "[SttTtsPlugin] Error sending frame to Janus:",
-            error
-          );
+        if (frameIndex < audioBuffer.length) {
+          try {
+            const frame = audioBuffer[frameIndex];
+            if (!isInterrupted && !signal.aborted) {
+              if (this.enhancedAnalyzeForInterruption(frame)) {
+                elizaLogger6.log("[SttTtsPlugin] User interrupt detected during TTS playback");
+                isInterrupted = true;
+                break;
+              }
+              const EXPECTED_SAMPLES = 480;
+              if (frame.length !== EXPECTED_SAMPLES) {
+                const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
+                const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
+                properSizedFrame.set(frame.subarray(0, copyLength));
+                this.janus.pushLocalAudio(properSizedFrame, 48e3);
+              } else {
+                this.janus.pushLocalAudio(frame, 48e3);
+              }
+            } else {
+              break;
+            }
+          } catch (error) {
+            elizaLogger6.error("[SttTtsPlugin] Error sending audio frame:", error);
+          }
         }
         frameIndex++;
       }
       if (signal.aborted || isInterrupted) {
         elizaLogger6.log("[SttTtsPlugin] Audio streaming was interrupted before completion");
-      } else if (!isInterrupted) {
-        await processingPromise;
-        await elevenLabsPromise;
-        elizaLogger6.log(
-          `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`
-        );
+      } else {
+        elizaLogger6.log("[SttTtsPlugin] Audio streaming completed successfully");
       }
     } catch (error) {
-      if (signal.aborted || isInterrupted) {
-        elizaLogger6.log("[SttTtsPlugin] Audio streaming aborted");
-      } else {
-        elizaLogger6.error("[SttTtsPlugin] Audio streaming error:", error);
-      }
-      mp3Stream.end();
-      throw error;
-    } finally {
-      signal.removeEventListener("abort", abortListener);
-      if (ffmpeg && !ffmpeg.killed) {
-        ffmpeg.kill("SIGTERM");
-      }
-    }
-  }
-  /**
-   * Modified ElevenLabs TTS function that streams the response to a writable stream
-   * instead of waiting for the full response
-   */
-  async elevenLabsTtsStreaming(text, outputStream, signal) {
-    try {
-      if (!this.elevenLabsApiKey) {
-        throw new Error("[SttTtsPlugin] No ElevenLabs API key");
-      }
-      const apiKey = this.elevenLabsApiKey;
-      const voiceId = this.voiceId;
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
-      elizaLogger6.log(
-        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`
-      );
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          Accept: "audio/mpeg",
-          "Content-Type": "application/json",
-          "xi-api-key": apiKey
-        },
-        body: JSON.stringify({
-          text,
-          model_id: this.elevenLabsModel,
-          voice_settings: {
-            stability: 0.4,
-            similarity_boost: 0.8
-          }
-        }),
-        signal
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`
-        );
-      }
-      if (!response.body) {
-        throw new Error("Response body is null");
-      }
-      elizaLogger6.log(
-        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`
-      );
-      const reader = response.body.getReader();
-      let done = false;
-      let bytesReceived = 0;
-      while (!done && !signal.aborted) {
-        const { value, done: readerDone } = await reader.read();
-        done = readerDone;
-        if (value && !signal.aborted) {
-          bytesReceived += value.length;
-          outputStream.write(Buffer.from(value));
-          if (bytesReceived % 1e4 < 1e3) {
-            elizaLogger6.log(
-              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`
-            );
-          }
-        }
-      }
-      outputStream.end();
-      elizaLogger6.log(
-        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`
-      );
-    } catch (error) {
-      if (error.name === "AbortError") {
-        elizaLogger6.log("[SttTtsPlugin] ElevenLabs request aborted");
-      } else {
-        elizaLogger6.error("[SttTtsPlugin] ElevenLabs streaming error:", error);
-      }
-      outputStream.end();
-      throw error;
+      elizaLogger6.error("[SttTtsPlugin] Error streaming TTS to Janus:", error);
     }
   }
   /**
@@ -3564,7 +3478,7 @@ var SttTtsPlugin = class {
         );
         let accumulatedText = "";
         let ttsBuffer = "";
-        const minTtsChunkSize = 30;
+        const minTtsChunkSize = 20;
         let isTtsProcessing = false;
         const isNaturalBreakPoint = (text) => {
           return /[.!?](\s|$)/.test(text) || // Strong sentence endings
@@ -3572,21 +3486,21 @@ var SttTtsPlugin = class {
           /[,](\s|$)/.test(text) && text.length > 80;
         };
         let progressiveTimeout = null;
-        const minCharactersForProgressive = 15;
-        const progressiveDelay = 400;
+        const minCharactersForProgressive = 10;
+        const progressiveDelay = 200;
         const processTtsChunk = async () => {
           if (isTtsProcessing || ttsBuffer.length === 0) return;
           isTtsProcessing = true;
           try {
             const textToProcess = ttsBuffer;
             ttsBuffer = "";
-            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="500ms"/> ').replace(/\?\s+/g, '? <break time="500ms"/> ').replace(/!\s+/g, '! <break time="500ms"/> ').replace(/:\s+/g, ': <break time="300ms"/> ').replace(/;\s+/g, '; <break time="300ms"/> ').replace(/,\s+/g, ', <break time="200ms"/> ');
+            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="100ms"/> ').replace(/\?\s+/g, '? <break time="100ms"/> ').replace(/!\s+/g, '! <break time="100ms"/> ').replace(/:\s+/g, ': <break time="80ms"/> ').replace(/;\s+/g, '; <break time="80ms"/> ').replace(/,\s+/g, ', <break time="30ms"/> ');
             elizaLogger6.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? "..." : ""}"`);
             await this.streamTtsToJanus(textWithPauses, signal);
             if (ttsBuffer.length > 0 && !signal.aborted) {
               setTimeout(() => {
                 processTtsChunk();
-              }, 100);
+              }, 50);
             }
           } catch (error) {
             elizaLogger6.error("[SttTtsPlugin] Error processing TTS chunk:", error);
@@ -4002,7 +3916,6 @@ var SttTtsPlugin = class {
     const progressiveTimeout = null;
     const minCharactersForProgressive = 15;
     const progressiveDelay = 400;
-    this.eventEmitter.emit("stream-start", streamId);
     const start = Date.now();
     if (!this.activeStreams.has(streamId) || ((_a = this.ttsAbortController) == null ? void 0 : _a.signal.aborted)) {
       elizaLogger6.log("[SttTtsPlugin] Stream was aborted before API call, cancelling");
@@ -4015,87 +3928,61 @@ var SttTtsPlugin = class {
       stream: true
     });
     let fullResponse = "";
-    let jsonBuffer = "";
-    let isJsonResponse = false;
-    let textValue = "";
+    let bufferedText = "";
+    let potentialActionMarker = false;
+    let detectedAction = "";
+    elizaLogger6.log("[SttTtsPlugin] Starting Grok streaming response processing");
     for await (const chunk of stream) {
       const content = ((_c = (_b = chunk.choices[0]) == null ? void 0 : _b.delta) == null ? void 0 : _c.content) || "";
       if (!content) continue;
       fullResponse += content;
-      if (!isJsonResponse && jsonBuffer.length < 30) {
-        jsonBuffer += content;
-        if (jsonBuffer.includes("```json") || jsonBuffer.includes("```\njson") || jsonBuffer.includes("```") || jsonBuffer.includes("{")) {
-          isJsonResponse = true;
-        }
-      }
-      if (!isJsonResponse) {
-        this.eventEmitter.emit("stream-chunk", content, streamId);
+      if (!potentialActionMarker && content.includes("action")) {
+        potentialActionMarker = true;
+        bufferedText += content;
         continue;
       }
-      jsonBuffer += content;
-      try {
-        const textMatch = /"text":\s*"([^"]*)/.exec(jsonBuffer);
-        if (textMatch) {
-          const capturedText = textMatch[1];
-          if (capturedText.length > textValue.length) {
-            const newText = capturedText.substring(textValue.length);
-            this.eventEmitter.emit("stream-chunk", newText, streamId);
-            textValue = capturedText;
-          }
-        }
-        if (jsonBuffer.includes("}") && (jsonBuffer.includes("```") || jsonBuffer.endsWith("}"))) {
-          let jsonStr = jsonBuffer;
-          if (jsonStr.includes("```json")) {
-            jsonStr = jsonStr.replace(/```json\s*/, "").replace(/\s*```$/, "");
-          } else if (jsonStr.includes("```")) {
-            jsonStr = jsonStr.replace(/```\s*/, "").replace(/\s*```$/, "");
-          }
-          const firstBrace = jsonStr.indexOf("{");
-          const lastBrace = jsonStr.lastIndexOf("}");
-          if (firstBrace >= 0 && lastBrace > firstBrace) {
-            const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
-            try {
-              const parsed = JSON.parse(jsonObject);
-              if (parsed.text && parsed.text.length > textValue.length) {
-                const newText = parsed.text.substring(textValue.length);
-                this.eventEmitter.emit("stream-chunk", newText, streamId);
-                textValue = parsed.text;
-              }
-            } catch (e) {
+      if (potentialActionMarker) {
+        bufferedText += content;
+        if (bufferedText.includes("actionIs:")) {
+          const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
+          if (actionMatch) {
+            detectedAction = actionMatch[1];
+            elizaLogger6.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
+            const textBeforeAction = bufferedText.split("actionIs:")[0].trim();
+            if (textBeforeAction) {
+              this.eventEmitter.emit("stream-chunk", textBeforeAction, streamId);
             }
+            bufferedText = "";
+            potentialActionMarker = false;
           }
+        } else if (bufferedText.length > 100) {
+          this.eventEmitter.emit("stream-chunk", bufferedText, streamId);
+          bufferedText = "";
+          potentialActionMarker = false;
         }
-      } catch (e) {
+        continue;
       }
+      this.eventEmitter.emit("stream-chunk", content, streamId);
     }
-    if (isJsonResponse && jsonBuffer && !textValue) {
-      try {
-        let jsonStr = jsonBuffer;
-        if (jsonStr.includes("```json")) {
-          jsonStr = jsonStr.replace(/```json\s*/, "").replace(/\s*```$/, "");
-        } else if (jsonStr.includes("```")) {
-          jsonStr = jsonStr.replace(/```\s*/, "").replace(/\s*```$/, "");
+    if (bufferedText) {
+      if (bufferedText.includes("actionIs:")) {
+        const textBeforeAction = bufferedText.split("actionIs:")[0].trim();
+        if (textBeforeAction) {
+          this.eventEmitter.emit("stream-chunk", textBeforeAction, streamId);
         }
-        const firstBrace = jsonStr.indexOf("{");
-        const lastBrace = jsonStr.lastIndexOf("}");
-        if (firstBrace >= 0 && lastBrace > firstBrace) {
-          const jsonObject = jsonStr.substring(firstBrace, lastBrace + 1);
-          const parsed = JSON.parse(jsonObject);
-          if (parsed.text) {
-            console.log(`Time took for emitting ${Date.now() - start}`);
-            this.eventEmitter.emit("stream-chunk", parsed.text, streamId);
-          } else {
-            this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
-          }
-        } else {
-          this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
+        const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
+        if (actionMatch) {
+          detectedAction = actionMatch[1];
+          elizaLogger6.log(`[SttTtsPlugin] Final detected action: ${detectedAction}`);
         }
-      } catch (e) {
-        console.log(`Time took for emitting ${Date.now() - start}`);
-        this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
+      } else {
+        this.eventEmitter.emit("stream-chunk", bufferedText, streamId);
       }
     }
     console.log(`Time took for completing LLM ${Date.now() - start}`);
+    if (detectedAction) {
+      elizaLogger6.log(`[SttTtsPlugin] Response contained action: ${detectedAction}`);
+    }
     this.eventEmitter.emit("stream-end", streamId);
   }
   /**
