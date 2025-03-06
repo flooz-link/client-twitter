@@ -2969,6 +2969,7 @@ var twitterVoiceHandlerTemplate = `# Task: Generate conversational voice dialog 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { PassThrough } from "stream";
 import { EventEmitter as EventEmitter2 } from "events";
+import OpenAI from "openai";
 var VOLUME_WINDOW_SIZE = 100;
 var SttTtsPlugin = class {
   name = "SttTtsPlugin";
@@ -3011,14 +3012,64 @@ var SttTtsPlugin = class {
   lastInterruptCheck = 0;
   audioBuffer = [];
   streamingInterval = null;
+  init(params) {
+    var _a;
+    elizaLogger6.log(
+      "[SttTtsPlugin] init => Space fully ready. Subscribing to events."
+    );
+    this.space = params.space;
+    this.janus = (_a = this.space) == null ? void 0 : _a.janusClient;
+    const config = params.pluginConfig;
+    this.runtime = config == null ? void 0 : config.runtime;
+    this.client = config == null ? void 0 : config.client;
+    this.spaceId = config == null ? void 0 : config.spaceId;
+    this.elevenLabsApiKey = config == null ? void 0 : config.elevenLabsApiKey;
+    this.transcriptionService = config.transcriptionService;
+    if (typeof (config == null ? void 0 : config.silenceThreshold) === "number") {
+      this.silenceThreshold = config.silenceThreshold;
+    }
+    if (typeof (config == null ? void 0 : config.silenceDetectionWindow) === "number") {
+      this.silenceDetectionThreshold = config.silenceDetectionWindow;
+    }
+    if (typeof (config == null ? void 0 : config.silenceThreshold)) {
+      if (config == null ? void 0 : config.voiceId) {
+        this.voiceId = config.voiceId;
+      }
+    }
+    if (config == null ? void 0 : config.elevenLabsModel) {
+      this.elevenLabsModel = config.elevenLabsModel;
+    }
+    if (config == null ? void 0 : config.chatContext) {
+      this.chatContext = config.chatContext;
+    }
+    this.grokApiKey = (config == null ? void 0 : config.grokApiKey) ?? this.runtime.getSetting("GROK_API_KEY");
+    this.grokBaseUrl = (config == null ? void 0 : config.grokBaseUrl) ?? this.runtime.getSetting("GROK_BASE_URL") ?? "https://api.x.ai/v1";
+    if (isEmpty(this.grokApiKey)) {
+      throw new Error("Grok API key is required");
+    }
+    if (isEmpty(this.grokBaseUrl)) {
+      throw new Error("Grok base URL is required");
+    }
+    this.openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl
+    });
+    this.volumeBuffers = /* @__PURE__ */ new Map();
+  }
   async processAudioQueue() {
     if (this.audioBuffer.length === 0) return;
     const chunk = this.audioBuffer.shift();
     if (chunk) {
       await this.streamToJanus(chunk);
     }
+    this.checkAndStopStreaming();
     if (this.audioBuffer.length > 0) {
       setTimeout(() => this.processAudioQueue(), 200);
+    }
+  }
+  checkAndStopStreaming() {
+    if (this.audioBuffer.length === 0) {
+      this.stopStreamingToJanus();
     }
   }
   streamToJanus(chunk) {

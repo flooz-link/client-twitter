@@ -118,14 +118,73 @@ export class SttTtsPlugin implements Plugin {
   private audioBuffer: Int16Array[] = [];
   private streamingInterval: NodeJS.Timeout | null = null;
 
+  init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
+    elizaLogger.log(
+      '[SttTtsPlugin] init => Space fully ready. Subscribing to events.',
+    );
+
+    this.space = params.space;
+    this.janus = (this.space as any)?.janusClient as JanusClient | undefined;
+
+    const config = params.pluginConfig as PluginConfig;
+    this.runtime = config?.runtime;
+    this.client = config?.client;
+    this.spaceId = config?.spaceId;
+    this.elevenLabsApiKey = config?.elevenLabsApiKey;
+    this.transcriptionService = config.transcriptionService;
+    if (typeof config?.silenceThreshold === 'number') {
+      this.silenceThreshold = config.silenceThreshold;
+    }
+    if (typeof config?.silenceDetectionWindow === 'number') {
+      this.silenceDetectionThreshold = config.silenceDetectionWindow;
+    }
+    if (typeof config?.silenceThreshold)
+      if (config?.voiceId) {
+        this.voiceId = config.voiceId;
+      }
+    if (config?.elevenLabsModel) {
+      this.elevenLabsModel = config.elevenLabsModel;
+    }
+    if (config?.chatContext) {
+      this.chatContext = config.chatContext;
+    }
+    this.grokApiKey =
+      config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
+    this.grokBaseUrl =
+      config?.grokBaseUrl ??
+      this.runtime.getSetting('GROK_BASE_URL') ??
+      'https://api.x.ai/v1';
+
+    if (isEmpty(this.grokApiKey)) {
+      throw new Error('Grok API key is required');
+    }
+    if (isEmpty(this.grokBaseUrl)) {
+      throw new Error('Grok base URL is required');
+    }
+
+    this.openai = new OpenAI({
+      apiKey: this.grokApiKey,
+      baseURL: this.grokBaseUrl,
+    });
+
+    this.volumeBuffers = new Map<string, number[]>();
+  }
+
   private async processAudioQueue() {
     if (this.audioBuffer.length === 0) return;
     const chunk = this.audioBuffer.shift();
     if (chunk) {
       await this.streamToJanus(chunk);
     }
+    this.checkAndStopStreaming();
     if (this.audioBuffer.length > 0) {
       setTimeout(() => this.processAudioQueue(), 200); // Add delay between streams
+    }
+  }
+
+  private checkAndStopStreaming() {
+    if (this.audioBuffer.length === 0) {
+      this.stopStreamingToJanus();
     }
   }
 
