@@ -275,9 +275,7 @@ export class SttTtsPlugin implements Plugin {
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
-    } else {
-      console.warn("Deepgram socket not ready, state:", this.socket ? this.socket.getReadyState() : "no socket");
-    }
+    } 
   }
 
   private calculateEnergy(samples: Int16Array): number {
