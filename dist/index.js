@@ -3019,7 +3019,8 @@ var SttTtsPlugin = class {
   /**
    * For ignoring near-silence frames (if amplitude < threshold)
    */
-  silenceThreshold = 50;
+  silenceThreshold = 30;
+  // Lowered from 50 to be more sensitive to quieter speech
   /**
    * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
    */
@@ -3107,14 +3108,21 @@ var SttTtsPlugin = class {
    * Called whenever we receive PCM from a speaker
    */
   onAudioData(data) {
+    elizaLogger6.debug(
+      `[SttTtsPlugin] Received audio data for user=${data.userId}, samples length=${data.samples.length}`
+    );
     if (this.isProcessingAudio) {
+      elizaLogger6.debug("[SttTtsPlugin] Currently processing audio, skipping this chunk");
       return;
     }
     let maxVal = 0;
+    let sumVal = 0;
     for (let i = 0; i < data.samples.length; i++) {
       const val = Math.abs(data.samples[i]);
+      sumVal += val;
       if (val > maxVal) maxVal = val;
     }
+    const avgVal = sumVal / data.samples.length;
     let volumeBuffer = this.volumeBuffers.get(data.userId);
     if (!volumeBuffer) {
       volumeBuffer = [];
@@ -3127,8 +3135,15 @@ var SttTtsPlugin = class {
     const avgVolume = volumeBuffer.reduce((sum, val) => sum + val, 0) / volumeBuffer.length;
     const variance = volumeBuffer.reduce((sum, val) => sum + Math.pow(val - avgVolume, 2), 0) / volumeBuffer.length;
     const stdDev = Math.sqrt(variance);
-    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
-    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
+    const stdDevThreshold = 30;
+    const isLikelyVoice = stdDev > stdDevThreshold || avgVolume > this.silenceThreshold * 1.2 || maxVal > this.silenceThreshold * 2;
+    if (maxVal > 0) {
+      elizaLogger6.debug(
+        `[SttTtsPlugin] Audio metrics: maxVal=${maxVal}, avgVal=${avgVal.toFixed(2)}, avgVolume=${avgVolume.toFixed(2)}, stdDev=${stdDev.toFixed(2)}, threshold=${this.silenceThreshold}, isLikelyVoice=${isLikelyVoice}`
+      );
+    }
+    if (maxVal < 10) {
+      elizaLogger6.debug("[SttTtsPlugin] Completely silent frame, skipping");
       return;
     }
     if (this.userSpeakingTimer) {
@@ -3140,6 +3155,9 @@ var SttTtsPlugin = class {
       this.pcmBuffers.set(data.userId, arr);
     }
     arr.push(data.samples);
+    elizaLogger6.debug(
+      `[SttTtsPlugin] Added audio chunk for user=${data.userId}, buffer now has ${arr.length} chunks`
+    );
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
         const chunks = this.pcmBuffers.get(data.userId) || [];
@@ -3147,18 +3165,19 @@ var SttTtsPlugin = class {
           (sum, chunk) => sum + chunk.length,
           0
         );
-        const minSamplesToProcess = 48e3 * 0.5;
+        const minSamplesToProcess = 48e3 * 0.25;
         if (totalAudioLength < minSamplesToProcess) {
           elizaLogger6.log(
             "[SttTtsPlugin] Audio too short, skipping processing for user =>",
             data.userId,
-            `(${totalAudioLength} samples)`
+            `(${totalAudioLength} samples, need ${minSamplesToProcess})`
           );
           return;
         }
         elizaLogger6.log(
           "[SttTtsPlugin] start processing audio for user =>",
-          data.userId
+          data.userId,
+          `(${totalAudioLength} samples)`
         );
         this.userSpeakingTimer = null;
         this.processAudio(data.userId).catch(
@@ -3449,12 +3468,23 @@ var SttTtsPlugin = class {
         this.isProcessingAudio = false;
         return;
       }
+      const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
       elizaLogger6.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}, total samples=${totalSamples}`
       );
+      if (totalSamples === 0) {
+        elizaLogger6.warn("[SttTtsPlugin] Empty audio chunks for user =>", userId);
+        this.isProcessingAudio = false;
+        return;
+      }
       const mergeBufferPromise = this.mergeAudioChunks(chunks);
       this.volumeBuffers.delete(userId);
       const merged = await mergeBufferPromise;
+      if (!merged || merged.length === 0) {
+        elizaLogger6.error("[SttTtsPlugin] Failed to merge audio chunks for user =>", userId);
+        this.isProcessingAudio = false;
+        return;
+      }
       elizaLogger6.debug(
         `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, estimated duration=${(merged.length / 48e3).toFixed(2)}s`
       );
@@ -3463,9 +3493,20 @@ var SttTtsPlugin = class {
       let wavBuffer;
       let sttText;
       try {
+        const sampleRate = optimizedPcm === merged ? 48e3 : 16e3;
         wavBuffer = await this.convertPcmToWavInMemory(
           optimizedPcm,
-          optimizedPcm === merged ? 48e3 : 16e3
+          sampleRate
+        );
+        if (!wavBuffer || wavBuffer.byteLength <= 44) {
+          elizaLogger6.error(
+            `[SttTtsPlugin] Invalid WAV buffer generated for user ${userId}: size=${wavBuffer ? wavBuffer.byteLength : "undefined"} bytes`
+          );
+          this.isProcessingAudio = false;
+          return;
+        }
+        elizaLogger6.debug(
+          `[SttTtsPlugin] Sending WAV buffer to transcription service: size=${wavBuffer.byteLength} bytes, sample rate=${sampleRate}Hz`
         );
         const start = Date.now();
         sttText = await this.transcriptionService.transcribe(wavBuffer);
@@ -3708,6 +3749,25 @@ var SttTtsPlugin = class {
    * Convert to WAV format
    */
   async convertPcmToWavInMemory(pcmData, sampleRate) {
+    if (!pcmData || pcmData.length === 0) {
+      elizaLogger6.error("[SttTtsPlugin] Error: Empty PCM data provided to WAV converter");
+      const emptyBuffer = new ArrayBuffer(44 + 32);
+      const emptyView = new DataView(emptyBuffer);
+      this.writeString(emptyView, 0, "RIFF");
+      emptyView.setUint32(4, 36 + 32, true);
+      this.writeString(emptyView, 8, "WAVE");
+      this.writeString(emptyView, 12, "fmt ");
+      emptyView.setUint32(16, 16, true);
+      emptyView.setUint16(20, 1, true);
+      emptyView.setUint16(22, 1, true);
+      emptyView.setUint32(24, sampleRate, true);
+      emptyView.setUint32(28, sampleRate * 2, true);
+      emptyView.setUint16(32, 2, true);
+      emptyView.setUint16(34, 16, true);
+      this.writeString(emptyView, 36, "data");
+      emptyView.setUint32(40, 32, true);
+      return emptyBuffer;
+    }
     const numChannels = 1;
     const byteRate = sampleRate * numChannels * 2;
     const blockAlign = numChannels * 2;
@@ -3730,6 +3790,10 @@ var SttTtsPlugin = class {
     let offset = 44;
     for (let i = 0; i < pcmData.length; i++, offset += 2) {
       view.setInt16(offset, pcmData[i], true);
+    }
+    const isValidWav = buffer.byteLength >= 44 && String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)) === "RIFF" && String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11)) === "WAVE";
+    if (!isValidWav) {
+      elizaLogger6.error("[SttTtsPlugin] Error: Generated invalid WAV format");
     }
     elizaLogger6.debug(
       `[SttTtsPlugin] Created WAV buffer: size=${buffer.byteLength} bytes, sample rate=${sampleRate}Hz, channels=${numChannels}, samples=${pcmData.length}, duration=${(pcmData.length / sampleRate).toFixed(2)}s`
@@ -4013,7 +4077,7 @@ var SttTtsPlugin = class {
       `[SttTtsPlugin] Merged ${chunks.length} audio chunks, total samples: ${totalLength}, max amplitude: ${maxAmplitude}`
     );
     if (maxAmplitude < 5e3) {
-      const gainFactor = Math.min(3, 1e4 / Math.max(1, maxAmplitude));
+      const gainFactor = Math.min(5, 15e3 / Math.max(1, maxAmplitude));
       elizaLogger6.debug(
         `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`
       );
@@ -4023,6 +4087,9 @@ var SttTtsPlugin = class {
           Math.min(32767, Math.round(result[i] * gainFactor))
         );
       }
+    }
+    if (result.length === 0 || maxAmplitude === 0) {
+      elizaLogger6.warn("[SttTtsPlugin] Warning: Audio data is empty or silent");
     }
     return result;
   }

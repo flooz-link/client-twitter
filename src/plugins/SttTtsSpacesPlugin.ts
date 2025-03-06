@@ -86,7 +86,7 @@ export class SttTtsPlugin implements Plugin {
   /**
    * For ignoring near-silence frames (if amplitude < threshold)
    */
-  private silenceThreshold = 50;
+  private silenceThreshold = 30; // Lowered from 50 to be more sensitive to quieter speech
 
   /**
    * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
@@ -195,16 +195,26 @@ export class SttTtsPlugin implements Plugin {
    * Called whenever we receive PCM from a speaker
    */
   onAudioData(data: AudioDataWithUser): void {
+    // Debug the incoming audio data
+    elizaLogger.debug(
+      `[SttTtsPlugin] Received audio data for user=${data.userId}, ` +
+      `samples length=${data.samples.length}`
+    );
+
     if (this.isProcessingAudio) {
+      elizaLogger.debug('[SttTtsPlugin] Currently processing audio, skipping this chunk');
       return;
     }
 
     // Calculate the maximum amplitude in this audio chunk
     let maxVal = 0;
+    let sumVal = 0;
     for (let i = 0; i < data.samples.length; i++) {
       const val = Math.abs(data.samples[i]);
+      sumVal += val;
       if (val > maxVal) maxVal = val;
     }
+    const avgVal = sumVal / data.samples.length;
 
     // Initialize or get the volume buffer for this user
     let volumeBuffer = this.volumeBuffers.get(data.userId);
@@ -231,11 +241,29 @@ export class SttTtsPlugin implements Plugin {
       volumeBuffer.length;
     const stdDev = Math.sqrt(variance);
 
+    // More permissive voice detection - lower standard deviation threshold
     // Voice typically has higher variance than background noise
-    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
+    const stdDevThreshold = 30; // Further lowered from 50 to be more sensitive
+    
+    // Multiple conditions to detect voice - any of these could indicate speech
+    const isLikelyVoice = 
+      stdDev > stdDevThreshold || 
+      avgVolume > this.silenceThreshold * 1.2 ||
+      maxVal > this.silenceThreshold * 2;
 
-    // Skip processing if below threshold or likely not voice
-    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
+    // Add debug logging to help diagnose audio detection issues
+    if (maxVal > 0) {
+      elizaLogger.debug(
+        `[SttTtsPlugin] Audio metrics: maxVal=${maxVal}, avgVal=${avgVal.toFixed(2)}, ` +
+        `avgVolume=${avgVolume.toFixed(2)}, stdDev=${stdDev.toFixed(2)}, ` +
+        `threshold=${this.silenceThreshold}, isLikelyVoice=${isLikelyVoice}`
+      );
+    }
+
+    // ALWAYS collect audio data if it's not completely silent
+    // This ensures we don't miss any speech, even if it's quiet
+    if (maxVal < 10) { // Only reject completely silent frames
+      elizaLogger.debug('[SttTtsPlugin] Completely silent frame, skipping');
       return;
     }
 
@@ -250,6 +278,12 @@ export class SttTtsPlugin implements Plugin {
     }
     arr.push(data.samples);
 
+    // Log when we add audio to the buffer
+    elizaLogger.debug(
+      `[SttTtsPlugin] Added audio chunk for user=${data.userId}, ` +
+      `buffer now has ${arr.length} chunks`
+    );
+
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
         // Only process if we have enough audio data (prevents processing very short noises)
@@ -259,14 +293,15 @@ export class SttTtsPlugin implements Plugin {
           0,
         );
 
-        // Require at least 0.5 seconds of audio (24000 samples at 48kHz) to process
-        const minSamplesToProcess = 48000 * 0.5;
+        // Require at least 0.25 seconds of audio (12000 samples at 48kHz) to process
+        // Reduced from 0.5 seconds to be more responsive
+        const minSamplesToProcess = 48000 * 0.25;
 
         if (totalAudioLength < minSamplesToProcess) {
           elizaLogger.log(
             '[SttTtsPlugin] Audio too short, skipping processing for user =>',
             data.userId,
-            `(${totalAudioLength} samples)`,
+            `(${totalAudioLength} samples, need ${minSamplesToProcess})`,
           );
           return;
         }
@@ -274,6 +309,7 @@ export class SttTtsPlugin implements Plugin {
         elizaLogger.log(
           '[SttTtsPlugin] start processing audio for user =>',
           data.userId,
+          `(${totalAudioLength} samples)`,
         );
         this.userSpeakingTimer = null;
         this.processAudio(data.userId).catch((err) =>
@@ -683,9 +719,17 @@ export class SttTtsPlugin implements Plugin {
         return;
       }
 
+      // Validate that we have actual audio data in the chunks
+      const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
       elizaLogger.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`,
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}, total samples=${totalSamples}`,
       );
+
+      if (totalSamples === 0) {
+        elizaLogger.warn('[SttTtsPlugin] Empty audio chunks for user =>', userId);
+        this.isProcessingAudio = false; // Reset flag on early return
+        return;
+      }
 
       // ---- Optimize parallel operations ----
 
@@ -698,6 +742,13 @@ export class SttTtsPlugin implements Plugin {
 
       // 3. Wait for buffer merging to complete
       const merged = await mergeBufferPromise;
+
+      // Validate merged audio data
+      if (!merged || merged.length === 0) {
+        elizaLogger.error('[SttTtsPlugin] Failed to merge audio chunks for user =>', userId);
+        this.isProcessingAudio = false; // Reset flag on error
+        return;
+      }
 
       // Log audio properties before processing
       elizaLogger.debug(
@@ -717,9 +768,26 @@ export class SttTtsPlugin implements Plugin {
 
       try {
         // Convert to WAV format
+        const sampleRate = optimizedPcm === merged ? 48000 : 16000;
         wavBuffer = await this.convertPcmToWavInMemory(
           optimizedPcm,
-          optimizedPcm === merged ? 48000 : 16000,
+          sampleRate,
+        );
+
+        // Validate WAV buffer
+        if (!wavBuffer || wavBuffer.byteLength <= 44) {
+          // 44 is the size of the WAV header without any audio data
+          elizaLogger.error(
+            `[SttTtsPlugin] Invalid WAV buffer generated for user ${userId}: ` +
+            `size=${wavBuffer ? wavBuffer.byteLength : 'undefined'} bytes`
+          );
+          this.isProcessingAudio = false; // Reset flag on error
+          return;
+        }
+
+        elizaLogger.debug(
+          `[SttTtsPlugin] Sending WAV buffer to transcription service: ` +
+          `size=${wavBuffer.byteLength} bytes, sample rate=${sampleRate}Hz`
         );
 
         const start = Date.now();
@@ -1114,6 +1182,28 @@ export class SttTtsPlugin implements Plugin {
     pcmData: Int16Array,
     sampleRate: number,
   ): Promise<ArrayBuffer> {
+    // Ensure we have valid audio data
+    if (!pcmData || pcmData.length === 0) {
+      elizaLogger.error('[SttTtsPlugin] Error: Empty PCM data provided to WAV converter');
+      // Return a minimal valid WAV file with silence to avoid crashes
+      const emptyBuffer = new ArrayBuffer(44 + 32); // Header + minimal data
+      const emptyView = new DataView(emptyBuffer);
+      this.writeString(emptyView, 0, 'RIFF');
+      emptyView.setUint32(4, 36 + 32, true);
+      this.writeString(emptyView, 8, 'WAVE');
+      this.writeString(emptyView, 12, 'fmt ');
+      emptyView.setUint32(16, 16, true);
+      emptyView.setUint16(20, 1, true);
+      emptyView.setUint16(22, 1, true); // 1 channel
+      emptyView.setUint32(24, sampleRate, true);
+      emptyView.setUint32(28, sampleRate * 2, true);
+      emptyView.setUint16(32, 2, true);
+      emptyView.setUint16(34, 16, true);
+      this.writeString(emptyView, 36, 'data');
+      emptyView.setUint32(40, 32, true);
+      return emptyBuffer;
+    }
+
     // number of channels
     const numChannels = 1;
     // byte rate = (sampleRate * numChannels * bitsPerSample/8)
@@ -1149,6 +1239,16 @@ export class SttTtsPlugin implements Plugin {
     let offset = 44;
     for (let i = 0; i < pcmData.length; i++, offset += 2) {
       view.setInt16(offset, pcmData[i], true);
+    }
+
+    // Verify the WAV buffer is correctly formatted
+    const isValidWav = 
+      buffer.byteLength >= 44 && 
+      String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)) === 'RIFF' &&
+      String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11)) === 'WAVE';
+
+    if (!isValidWav) {
+      elizaLogger.error('[SttTtsPlugin] Error: Generated invalid WAV format');
     }
 
     // Log WAV buffer details for debugging
@@ -1555,10 +1655,10 @@ export class SttTtsPlugin implements Plugin {
         `max amplitude: ${maxAmplitude}`,
     );
 
-    // If the audio is very quiet, amplify it
+    // If the audio is very quiet, amplify it more aggressively
     if (maxAmplitude < 5000) {
       // Less than ~15% of max Int16 value
-      const gainFactor = Math.min(3.0, 10000 / Math.max(1, maxAmplitude));
+      const gainFactor = Math.min(5.0, 15000 / Math.max(1, maxAmplitude));
       elizaLogger.debug(
         `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`,
       );
@@ -1570,6 +1670,11 @@ export class SttTtsPlugin implements Plugin {
           Math.min(32767, Math.round(result[i] * gainFactor)),
         );
       }
+    }
+
+    // Validate the audio data
+    if (result.length === 0 || maxAmplitude === 0) {
+      elizaLogger.warn('[SttTtsPlugin] Warning: Audio data is empty or silent');
     }
 
     return result;
