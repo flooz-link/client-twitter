@@ -86,7 +86,7 @@ export class SttTtsPlugin implements Plugin {
   /**
    * For ignoring near-silence frames (if amplitude < threshold)
    */
-  private silenceThreshold = 30; // Lowered from 50 to be more sensitive to quieter speech
+  private silenceThreshold = 50;
 
   /**
    * Time to wait before detecting silence, defaults to 1 second, i.e. if no one speaks for 1 second then agent checks if it should respond
@@ -115,12 +115,12 @@ export class SttTtsPlugin implements Plugin {
   private audioBuffer: Int16Array[] = [];
   private streamingInterval: NodeJS.Timeout | null = null;
 
-  // Transcription buffer system to handle pauses in speech
+  // Transcription buffer system to maintain context for 5 minutes
   private transcriptionBuffers: Map<string, {
     text: string;
     timestamp: number;
   }> = new Map();
-  private transcriptionBufferTimeout = 5000; // 5 seconds buffer window
+  private transcriptionBufferTimeout = 5 * 60 * 1000; // 5 minutes in milliseconds
 
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
     elizaLogger.log(
@@ -195,29 +195,16 @@ export class SttTtsPlugin implements Plugin {
    * Called whenever we receive PCM from a speaker
    */
   onAudioData(data: AudioDataWithUser): void {
-    // Debug the incoming audio data
-    elizaLogger.debug(
-      `[SttTtsPlugin] Received audio data for user=${data.userId}, ` +
-      `samples length=${data.samples.length}`
-    );
-
-    // CRITICAL FIX: Don't skip audio chunks when processing audio
-    // This was causing the race condition where chunks were being lost
-    // We'll still log it but continue processing
     if (this.isProcessingAudio) {
-      elizaLogger.debug('[SttTtsPlugin] Currently processing audio, but still collecting this chunk');
-      // Don't return here - continue to process this chunk
+      return;
     }
 
     // Calculate the maximum amplitude in this audio chunk
     let maxVal = 0;
-    let sumVal = 0;
     for (let i = 0; i < data.samples.length; i++) {
       const val = Math.abs(data.samples[i]);
-      sumVal += val;
       if (val > maxVal) maxVal = val;
     }
-    const avgVal = sumVal / data.samples.length;
 
     // Initialize or get the volume buffer for this user
     let volumeBuffer = this.volumeBuffers.get(data.userId);
@@ -244,29 +231,11 @@ export class SttTtsPlugin implements Plugin {
       volumeBuffer.length;
     const stdDev = Math.sqrt(variance);
 
-    // More permissive voice detection - lower standard deviation threshold
     // Voice typically has higher variance than background noise
-    const stdDevThreshold = 30; // Further lowered from 50 to be more sensitive
-    
-    // Multiple conditions to detect voice - any of these could indicate speech
-    const isLikelyVoice = 
-      stdDev > stdDevThreshold || 
-      avgVolume > this.silenceThreshold * 1.2 ||
-      maxVal > this.silenceThreshold * 2;
+    const isLikelyVoice = stdDev > 100 && avgVolume > this.silenceThreshold;
 
-    // Add debug logging to help diagnose audio detection issues
-    if (maxVal > 0) {
-      elizaLogger.debug(
-        `[SttTtsPlugin] Audio metrics: maxVal=${maxVal}, avgVal=${avgVal.toFixed(2)}, ` +
-        `avgVolume=${avgVolume.toFixed(2)}, stdDev=${stdDev.toFixed(2)}, ` +
-        `threshold=${this.silenceThreshold}, isLikelyVoice=${isLikelyVoice}`
-      );
-    }
-
-    // ALWAYS collect audio data if it's not completely silent
-    // This ensures we don't miss any speech, even if it's quiet
-    if (maxVal < 10) { // Only reject completely silent frames
-      elizaLogger.debug('[SttTtsPlugin] Completely silent frame, skipping');
+    // Skip processing if below threshold or likely not voice
+    if (maxVal < this.silenceThreshold || !isLikelyVoice) {
       return;
     }
 
@@ -281,12 +250,6 @@ export class SttTtsPlugin implements Plugin {
     }
     arr.push(data.samples);
 
-    // Log when we add audio to the buffer
-    elizaLogger.debug(
-      `[SttTtsPlugin] Added audio chunk for user=${data.userId}, ` +
-      `buffer now has ${arr.length} chunks`
-    );
-
     if (!this.isSpeaking) {
       this.userSpeakingTimer = setTimeout(() => {
         // Only process if we have enough audio data (prevents processing very short noises)
@@ -296,15 +259,14 @@ export class SttTtsPlugin implements Plugin {
           0,
         );
 
-        // Require at least 0.25 seconds of audio (12000 samples at 48kHz) to process
-        // Reduced from 0.5 seconds to be more responsive
-        const minSamplesToProcess = 48000 * 0.25;
+        // Require at least 0.5 seconds of audio (24000 samples at 48kHz) to process
+        const minSamplesToProcess = 48000 * 0.5;
 
         if (totalAudioLength < minSamplesToProcess) {
           elizaLogger.log(
             '[SttTtsPlugin] Audio too short, skipping processing for user =>',
             data.userId,
-            `(${totalAudioLength} samples, need ${minSamplesToProcess})`,
+            `(${totalAudioLength} samples)`,
           );
           return;
         }
@@ -312,7 +274,6 @@ export class SttTtsPlugin implements Plugin {
         elizaLogger.log(
           '[SttTtsPlugin] start processing audio for user =>',
           data.userId,
-          `(${totalAudioLength} samples)`,
         );
         this.userSpeakingTimer = null;
         this.processAudio(data.userId).catch((err) =>
@@ -650,7 +611,7 @@ export class SttTtsPlugin implements Plugin {
               
               // Check if we need to resize the frame
               if (frame.length !== EXPECTED_SAMPLES) {
-                // Create a new buffer with exactly the right size
+                // Create properly sized frame
                 const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
                 
                 // Copy data from original samples, being careful not to overflow
@@ -712,31 +673,19 @@ export class SttTtsPlugin implements Plugin {
 
       elizaLogger.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
 
-      // CRITICAL FIX: Make a copy of the chunks before clearing the buffer
-      // This prevents race conditions where new audio data might be added while we're processing
-      const userPcmBuffers = this.pcmBuffers.get(userId) || [];
-      const chunks = [...userPcmBuffers]; // Create a copy of the array
-      
-      // Only clear the buffer AFTER we've made a copy
+      // Get chunks and clear only this user's buffer
+      const chunks = this.pcmBuffers.get(userId) || [];
       this.pcmBuffers.delete(userId);
 
       if (!chunks.length) {
         elizaLogger.warn('[SttTtsPlugin] No audio chunks for user =>', userId);
-        this.isProcessingAudio = false; // Reset flag on early return
+        this.isProcessingAudio = false; // Make sure to reset the flag when returning early
         return;
       }
 
-      // Validate that we have actual audio data in the chunks
-      const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
       elizaLogger.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}, total samples=${totalSamples}`,
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`,
       );
-
-      if (totalSamples === 0) {
-        elizaLogger.warn('[SttTtsPlugin] Empty audio chunks for user =>', userId);
-        this.isProcessingAudio = false; // Reset flag on early return
-        return;
-      }
 
       // ---- Optimize parallel operations ----
 
@@ -750,56 +699,29 @@ export class SttTtsPlugin implements Plugin {
       // 3. Wait for buffer merging to complete
       const merged = await mergeBufferPromise;
 
-      // Validate merged audio data
-      if (!merged || merged.length === 0) {
-        elizaLogger.error('[SttTtsPlugin] Failed to merge audio chunks for user =>', userId);
-        this.isProcessingAudio = false; // Reset flag on error
-        return;
-      }
-
       // Log audio properties before processing
       elizaLogger.debug(
         `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, ` +
           `estimated duration=${(merged.length / 48000).toFixed(2)}s`,
       );
 
-      // 4. Apply noise reduction to improve speech recognition
-      const noiselessPcm = this.applyNoiseReduction(merged, 300);
+      // 4. Optimize audio (downsample if needed)
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
 
-      // 5. Optimize audio (downsample if needed)
-      const optimizedPcm = this.maybeDownsampleAudio(noiselessPcm, 48000, 16000);
-
-      // 6. Convert to WAV format - declare outside try block so it's accessible in catch
+      // 5. Convert to WAV format - declare outside try block so it's accessible in catch
       let wavBuffer: ArrayBuffer;
       let sttText: string;
 
       try {
         // Convert to WAV format
-        const sampleRate = optimizedPcm === merged ? 48000 : 16000;
         wavBuffer = await this.convertPcmToWavInMemory(
           optimizedPcm,
-          sampleRate,
-        );
-
-        // Validate WAV buffer
-        if (!wavBuffer || wavBuffer.byteLength <= 44) {
-          // 44 is the size of the WAV header without any audio data
-          elizaLogger.error(
-            `[SttTtsPlugin] Invalid WAV buffer generated for user ${userId}: ` +
-            `size=${wavBuffer ? wavBuffer.byteLength : 'undefined'} bytes`
-          );
-          this.isProcessingAudio = false; // Reset flag on error
-          return;
-        }
-
-        elizaLogger.debug(
-          `[SttTtsPlugin] Sending WAV buffer to transcription service: ` +
-          `size=${wavBuffer.byteLength} bytes, sample rate=${sampleRate}Hz`
+          optimizedPcm === merged ? 48000 : 16000,
         );
 
         const start = Date.now();
 
-        // 7. Transcribe audio
+        // 6. Transcribe audio
         sttText = await this.transcriptionService.transcribe(wavBuffer);
 
         console.log(`Transcription took: ${Date.now() - start} ms`);
@@ -811,7 +733,7 @@ export class SttTtsPlugin implements Plugin {
               `audio buffer size: ${wavBuffer.byteLength} bytes, ` +
               `transcription time: ${Date.now() - start}ms`,
           );
-          this.isProcessingAudio = false; // Reset flag on early return
+          this.isProcessingAudio = false; // Make sure to reset the flag when returning early
           return;
         }
 
@@ -822,27 +744,31 @@ export class SttTtsPlugin implements Plugin {
         // Check if we have a previous transcription buffer for this user
         const now = Date.now();
         const prevBuffer = this.transcriptionBuffers.get(userId);
+        let contextualText = sttText;
         
         // If we have a previous buffer that's still within our time window, append to it
         if (prevBuffer && (now - prevBuffer.timestamp) < this.transcriptionBufferTimeout) {
           // Append the new transcription to the existing buffer
-          sttText = prevBuffer.text + " " + sttText;
+          contextualText = prevBuffer.text + " " + sttText;
           elizaLogger.log(
-            `[SttTtsPlugin] Appended to transcription buffer for user=${userId}, combined text="${sttText}"`,
+            `[SttTtsPlugin] Added context from previous transcription for user=${userId}, ` +
+            `combined text="${contextualText.substring(0, 100)}${contextualText.length > 100 ? '...' : ''}"`,
           );
         }
         
         // Update the transcription buffer with the current (possibly combined) text
         this.transcriptionBuffers.set(userId, {
-          text: sttText,
+          text: contextualText,
           timestamp: now
         });
 
-        // 8. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
+        // 7. Set up direct streaming pipeline from Grok to ElevenLabs to Janus
         // Use the abort controller that was created in abortPreviousStreams
 
         // Track accumulated text for logging
         let accumulatedText = '';
+
+        // Buffer for accumulating text until we have enough for natural TTS
         let ttsBuffer = '';
 
         // Minimum characters needed for natural speech synthesis
@@ -985,8 +911,8 @@ export class SttTtsPlugin implements Plugin {
           this.eventEmitter.removeAllListeners('stream-end');
         });
 
-        // Start the streaming response from Grok
-        await this.handleUserMessageStreaming(sttText, userId);
+        // Start the streaming response from Grok with contextual text to maintain conversation flow
+        await this.handleUserMessageStreaming(contextualText, userId);
       } catch (error) {
         // Handle both transcription errors and general errors
         if (
@@ -1008,6 +934,7 @@ export class SttTtsPlugin implements Plugin {
       }
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
+      this.isProcessingAudio = false; // Make sure to reset the flag in case of error
     }
   }
 
@@ -1032,28 +959,98 @@ export class SttTtsPlugin implements Plugin {
     this.activeStreams.clear();
     this.currentStreamId = null;
     
-    // Clear all event listeners
-    this.eventEmitter.removeAllListeners();
-    
-    // Clear any timers
-    if (this.userSpeakingTimer) {
-      clearTimeout(this.userSpeakingTimer);
-      this.userSpeakingTimer = null;
-    }
-    
-    if (this.streamingInterval) {
-      clearInterval(this.streamingInterval);
-      this.streamingInterval = null;
-    }
-    
-    // Clear buffers
-    this.pcmBuffers.clear();
-    this.volumeBuffers.clear();
-    this.audioBuffer = [];
-    
-    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
+    // NOTE: We're not clearing transcriptionBuffers here 
+    // as we want to preserve context between interactions
   }
 
+  /**
+   * Stream a single chunk of audio to Janus
+   * Fixed to ensure exact byte length requirement is met
+   */
+  private async streamChunkToJanus(
+    samples: Int16Array,
+    sampleRate: number,
+  ): Promise<void> {
+    // Janus expects exactly 480 samples (960 bytes)
+    const EXPECTED_SAMPLES = 480;
+    const EXPECTED_BYTES = EXPECTED_SAMPLES * 2; // 960 bytes
+
+    return new Promise<void>((resolve, reject) => {
+      try {
+        // Check if we need to create a properly sized buffer
+        if (
+          samples.length !== EXPECTED_SAMPLES ||
+          samples.buffer.byteLength !== EXPECTED_BYTES
+        ) {
+          // Create a new buffer with exactly the right size
+          const properSizedSamples = new Int16Array(EXPECTED_SAMPLES);
+
+          // Copy data from original samples, being careful not to overflow
+          const copySamples = Math.min(samples.length, EXPECTED_SAMPLES);
+          for (let i = 0; i < copySamples; i++) {
+            properSizedSamples[i] = samples[i];
+          }
+
+          // Create a buffer view that's EXACTLY 960 bytes (480 samples)
+          // This is crucial - we need the buffer to be exactly 960 bytes
+          const bufferView = new Int16Array(
+            properSizedSamples.buffer,
+            0,
+            EXPECTED_SAMPLES,
+          );
+
+          // Send the properly sized buffer to Janus
+          this.janus?.pushLocalAudio(bufferView, sampleRate);
+        } else {
+          // The buffer is already the right size
+          this.janus?.pushLocalAudio(samples, sampleRate);
+        }
+
+        resolve();
+      } catch (error) {
+        console.error('[SttTtsPlugin] Error sending audio to Janus:', error);
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Helper method to convert audio chunk to Int16Array format required by Janus
+   */
+  private convertAudioChunkToInt16(audioChunk: any): Int16Array {
+    // If already Int16Array, return as is
+    if (audioChunk instanceof Int16Array) {
+      return audioChunk;
+    }
+
+    // If it's a Float32Array (common format from Web Audio API)
+    if (audioChunk instanceof Float32Array) {
+      const int16Chunk = new Int16Array(audioChunk.length);
+      for (let i = 0; i < audioChunk.length; i++) {
+        // Convert from float [-1.0, 1.0] to int16 [-32768, 32767]
+        int16Chunk[i] = Math.max(
+          -32768,
+          Math.min(32767, Math.round(audioChunk[i] * 32767)),
+        );
+      }
+      return int16Chunk;
+    }
+
+    // If it's an ArrayBuffer or other binary format
+    if (audioChunk instanceof ArrayBuffer || ArrayBuffer.isView(audioChunk)) {
+      // Assume it's PCM data that needs to be converted to Int16Array
+      // This may need adjustment based on the actual format from your TTS service
+      return new Int16Array(
+        audioChunk instanceof ArrayBuffer ? audioChunk : audioChunk.buffer,
+      );
+    }
+
+    // Fallback for unknown formats - return empty array
+    elizaLogger.warn(
+      '[SttTtsPlugin] Unknown audio chunk format, returning empty array',
+    );
+    return new Int16Array(0);
+  }
 
   /**
    * Downsample audio if needed for Whisper
@@ -1109,77 +1106,33 @@ export class SttTtsPlugin implements Plugin {
         maxAmplitude = absValue;
       }
     }
-  
-    // Target amplitude (about 50-70% of max Int16 value for headroom)
-    const targetAmplitude = 22000; // ~67% of max Int16 value
-  
-    // Calculate gain factor to reach target amplitude
+
+    // Default gain factor (no change)
     let gainFactor = 1.0;
-    if (maxAmplitude > 0) {
-      gainFactor = targetAmplitude / maxAmplitude;
-    }
-  
-    // Apply normalization only if needed
-    if (Math.abs(gainFactor - 1.0) > 0.1) { // Only normalize if gain change is significant
+
+    // If the audio is already loud enough, return it as is
+    if (maxAmplitude > 10000) {
+      // Less than ~15% of max Int16 value
+      gainFactor = Math.min(3.0, 10000 / Math.max(1, maxAmplitude));
       elizaLogger.debug(
-        `[SttTtsPlugin] Normalizing audio by factor of ${gainFactor.toFixed(2)}, max amplitude: ${maxAmplitude}`,
+        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`,
       );
-  
-      // Create a new array to avoid modifying the original
-      const normalizedAudio = new Int16Array(audio.length);
+
       for (let i = 0; i < audio.length; i++) {
         // Apply gain and clamp to Int16 range
-        normalizedAudio[i] = Math.max(
+        audio[i] = Math.max(
           -32768,
           Math.min(32767, Math.round(audio[i] * gainFactor)),
         );
       }
-      return normalizedAudio;
     }
-  
-    return audio;
-  }
 
-  
-  /**
-   * Apply noise reduction to improve speech recognition
-   * This implements a simple noise gate with smoothing to reduce background noise
-   */
-  private applyNoiseReduction(audio: Int16Array, threshold = 300): Int16Array {
-    // Create a copy to avoid modifying the original
-    const result = new Int16Array(audio.length);
-    
-    // Simple exponential moving average for smoothing
-    let smoothedEnergy = 0;
-    const smoothingFactor = 0.2; // Lower = more smoothing
-    
-    // Process each sample
-    for (let i = 0; i < audio.length; i++) {
-      // Calculate instantaneous energy (absolute value)
-      const energy = Math.abs(audio[i]);
-      
-      // Update smoothed energy estimate
-      smoothedEnergy = smoothingFactor * energy + (1 - smoothingFactor) * smoothedEnergy;
-      
-      // Apply soft noise gate
-      if (smoothedEnergy > threshold) {
-        // Calculate attenuation factor (soft knee)
-        const attenuationFactor = Math.min(1.0, (smoothedEnergy - threshold) / threshold);
-        
-        // Apply the attenuation
-        result[i] = Math.round(audio[i] * attenuationFactor);
-      } else {
-        // Below threshold - attenuate significantly but not completely
-        // This prevents unnatural "holes" in the audio
-        result[i] = Math.round(audio[i] * 0.1);
-      }
-    }
-    
     elizaLogger.debug(
-      `[SttTtsPlugin] Applied noise reduction with threshold ${threshold}`
+      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, ` +
+        `scale factor: ${gainFactor.toFixed(2)}`,
     );
-    
-    return result;
+
+    return audio;
   }
 
   /**
@@ -1189,28 +1142,6 @@ export class SttTtsPlugin implements Plugin {
     pcmData: Int16Array,
     sampleRate: number,
   ): Promise<ArrayBuffer> {
-    // Ensure we have valid audio data
-    if (!pcmData || pcmData.length === 0) {
-      elizaLogger.error('[SttTtsPlugin] Error: Empty PCM data provided to WAV converter');
-      // Return a minimal valid WAV file with silence to avoid crashes
-      const emptyBuffer = new ArrayBuffer(44 + 32); // Header + minimal data
-      const emptyView = new DataView(emptyBuffer);
-      this.writeString(emptyView, 0, 'RIFF');
-      emptyView.setUint32(4, 36 + 32, true);
-      this.writeString(emptyView, 8, 'WAVE');
-      this.writeString(emptyView, 12, 'fmt ');
-      emptyView.setUint32(16, 16, true);
-      emptyView.setUint16(20, 1, true);
-      emptyView.setUint16(22, 1, true); // 1 channel
-      emptyView.setUint32(24, sampleRate, true);
-      emptyView.setUint32(28, sampleRate * 2, true);
-      emptyView.setUint16(32, 2, true);
-      emptyView.setUint16(34, 16, true);
-      this.writeString(emptyView, 36, 'data');
-      emptyView.setUint32(40, 32, true);
-      return emptyBuffer;
-    }
-
     // number of channels
     const numChannels = 1;
     // byte rate = (sampleRate * numChannels * bitsPerSample/8)
@@ -1248,16 +1179,6 @@ export class SttTtsPlugin implements Plugin {
       view.setInt16(offset, pcmData[i], true);
     }
 
-    // Verify the WAV buffer is correctly formatted
-    const isValidWav = 
-      buffer.byteLength >= 44 && 
-      String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)) === 'RIFF' &&
-      String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11)) === 'WAVE';
-
-    if (!isValidWav) {
-      elizaLogger.error('[SttTtsPlugin] Error: Generated invalid WAV format');
-    }
-
     // Log WAV buffer details for debugging
     elizaLogger.debug(
       `[SttTtsPlugin] Created WAV buffer: size=${buffer.byteLength} bytes, ` +
@@ -1275,6 +1196,122 @@ export class SttTtsPlugin implements Plugin {
     for (let i = 0; i < string.length; i++) {
       view.setUint8(offset + i, string.charCodeAt(i));
     }
+  }
+
+  /**
+   * Handle User Message
+   */
+  private async handleUserMessage(
+    userText: string,
+    userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
+  ): Promise<string> {
+    // Extract the numeric ID part
+    const numericId = userId.replace('tw-', '');
+    const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
+
+    // Create consistent UUID for the user
+    const userUuid = stringToUuid(`twitter-user-${numericId}`);
+
+    // Ensure the user exists in the accounts table
+    // Ensure room exists and user is in it
+
+    await Promise.all([
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId, // Use full Twitter ID as username
+        `Twitter User ${numericId}`,
+        'twitter',
+      ),
+      this.runtime.ensureRoomExists(roomId),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId),
+    ]);
+
+    let start = Date.now();
+
+    const memory = {
+      id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
+      agentId: this.runtime.agentId,
+      content: {
+        text: userText,
+        source: 'twitter',
+      },
+      userId: userUuid,
+      roomId,
+      embedding: getEmbeddingZeroVector(),
+      createdAt: Date.now(),
+    };
+
+    let [state] = await Promise.all([
+      this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: userText, source: 'twitter' },
+          userId: userUuid,
+          roomId,
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name,
+        },
+      ),
+      this.runtime.messageManager.createMemory(memory),
+    ]);
+    console.log(
+      `Compose state and create memory took ${Date.now() - start} ms`,
+    );
+
+    start = Date.now();
+    state = await this.runtime.updateRecentMessageState(state);
+    console.log(`Recent messages state update took ${Date.now() - start} ms`);
+
+    const shouldIgnore = await this._shouldIgnore(memory);
+
+    if (shouldIgnore) {
+      return '';
+    }
+
+    // const shouldRespond = await this._shouldRespond(userText, state);
+
+    // console.log(`should Respond took ${Date.now() - start} ms`);
+
+    // if (!shouldRespond) {
+    //   return '';
+    // }
+
+    start = Date.now();
+    const context = composeContext({
+      state,
+      template:
+        this.runtime.character.templates?.twitterVoiceHandlerTemplate ||
+        this.runtime.character.templates?.messageHandlerTemplate ||
+        twitterVoiceHandlerTemplate,
+    });
+
+    const responseContent = await this._generateResponse(memory, context);
+
+    console.log(`Generating Response took ${Date.now() - start} ms`);
+
+    const responseMemory: Memory = {
+      id: stringToUuid(`${memory.id}-voice-response-${Date.now()}`),
+      agentId: this.runtime.agentId,
+      userId: this.runtime.agentId,
+      content: {
+        ...responseContent,
+        user: this.runtime.character.name,
+        inReplyTo: memory.id,
+      },
+      roomId,
+      embedding: getEmbeddingZeroVector(),
+    };
+
+    const reply = responseMemory.content.text?.trim();
+    if (reply) {
+      await this.runtime.messageManager.createMemory(responseMemory);
+    }
+
+    this.eventEmitter.emit('response', reply);
+
+    return reply;
   }
 
   /**
@@ -1303,7 +1340,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Ensure the user exists in the accounts table
     // Ensure room exists and user is in it
-
     await Promise.all([
       this.runtime.ensureUserExists(
         userUuid,
@@ -1313,7 +1349,12 @@ export class SttTtsPlugin implements Plugin {
       ),
       this.runtime.ensureRoomExists(roomId),
       this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]);
+    ]).catch((error) => {
+      elizaLogger.warn(
+        `Error when handling streaming for spaces error ${error} ignoring`,
+      );
+      return;
+    });
 
     const memory = {
       id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
@@ -1353,7 +1394,6 @@ export class SttTtsPlugin implements Plugin {
     //   return state;
     // });
     const shouldIgnore = await this._shouldIgnore(memory);
-
     if (shouldIgnore) {
       return;
     }
@@ -1383,6 +1423,11 @@ export class SttTtsPlugin implements Plugin {
     };
 
     const messages = [...this.chatContext, systemMessage, userMessage];
+
+    // Progressive timeout mechanism
+    const progressiveTimeout: NodeJS.Timeout | null = null;
+    const minCharactersForProgressive = 15;
+    const progressiveDelay = 400; // ms
 
     const start = Date.now();
     
@@ -1490,6 +1535,39 @@ export class SttTtsPlugin implements Plugin {
     this.eventEmitter.emit('stream-end', streamId);
   }
 
+  /**
+   * Generate Response
+   */
+  private async _generateResponse(
+    message: Memory,
+    context: string,
+  ): Promise<Content> {
+    const { userId, roomId } = message;
+
+    const response = await generateMessageResponse({
+      runtime: this.runtime,
+      context,
+      modelClass: ModelClass.SMALL,
+    });
+
+    response.source = 'discord';
+
+    if (!response) {
+      elizaLogger.error(
+        '[SttTtsPlugin] No response from generateMessageResponse',
+      );
+      return;
+    }
+
+    await this.runtime.databaseAdapter.log({
+      body: { message, context, response },
+      userId: userId,
+      roomId,
+      type: 'response',
+    });
+
+    return response;
+  }
 
   /**
    * Should Ignore
@@ -1546,7 +1624,24 @@ export class SttTtsPlugin implements Plugin {
     return false;
   }
 
+  /**
+   * Add a message (system, user or assistant) to the chat context.
+   * E.g. to store conversation history or inject a persona.
+   */
+  public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
+    this.chatContext.push({ role, content });
+    elizaLogger.log(
+      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`,
+    );
+  }
 
+  /**
+   * Clear the chat context if needed.
+   */
+  public clearChatContext() {
+    this.chatContext = [];
+    elizaLogger.log('[SttTtsPlugin] clearChatContext => done');
+  }
 
   /**
    * Enhanced analysis for detecting user interruptions in audio
@@ -1630,7 +1725,6 @@ export class SttTtsPlugin implements Plugin {
     this.pcmBuffers.clear();
     this.volumeBuffers.clear();
     this.audioBuffer = [];
-    this.transcriptionBuffers.clear();
     
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
@@ -1656,16 +1750,16 @@ export class SttTtsPlugin implements Plugin {
         maxAmplitude = absValue;
       }
     }
-  
+
     elizaLogger.debug(
       `[SttTtsPlugin] Merged ${chunks.length} audio chunks, total samples: ${totalLength}, ` +
         `max amplitude: ${maxAmplitude}`,
     );
 
-    // If the audio is very quiet, amplify it more aggressively
+    // If the audio is very quiet, amplify it
     if (maxAmplitude < 5000) {
       // Less than ~15% of max Int16 value
-      const gainFactor = Math.min(5.0, 15000 / Math.max(1, maxAmplitude));
+      const gainFactor = Math.min(3.0, 10000 / Math.max(1, maxAmplitude));
       elizaLogger.debug(
         `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`,
       );
@@ -1677,11 +1771,6 @@ export class SttTtsPlugin implements Plugin {
           Math.min(32767, Math.round(result[i] * gainFactor)),
         );
       }
-    }
-
-    // Validate the audio data
-    if (result.length === 0 || maxAmplitude === 0) {
-      elizaLogger.warn('[SttTtsPlugin] Warning: Audio data is empty or silent');
     }
 
     return result;
