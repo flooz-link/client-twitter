@@ -2994,12 +2994,15 @@ Response format should be formatted in a valid JSON block like this:
 { "user": "{{agentName}}", "text": "<string>", "action": "<string>" }
 \`\`\`
 
-The \u201Caction\u201D field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.`;
+The \u201Caction\u201D field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.
+When you decide the action is something different than NONE, the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you
+need to sound like you are naturally buying time.`;
 
 // src/plugins/SttTtsSpacesPlugin.ts
 import { PassThrough } from "stream";
 import { EventEmitter as EventEmitter2 } from "events";
 import OpenAI from "openai";
+import { v4 as uuidv4 } from "uuid";
 var VOLUME_WINDOW_SIZE = 100;
 var SttTtsPlugin = class {
   name = "SttTtsPlugin";
@@ -3034,6 +3037,7 @@ var SttTtsPlugin = class {
   userSpeakingTimer = null;
   volumeBuffers;
   ttsAbortController = null;
+  currentStreamId = null;
   eventEmitter = new EventEmitter2();
   openai;
   transcriptionService;
@@ -3419,6 +3423,7 @@ var SttTtsPlugin = class {
       } else {
         elizaLogger6.error("[SttTtsPlugin] Audio streaming error:", error);
       }
+      mp3Stream.end();
       throw error;
     } finally {
       signal.removeEventListener("abort", abortListener);
@@ -3506,19 +3511,19 @@ var SttTtsPlugin = class {
    */
   async processAudio(userId) {
     var _a;
-    if (this.isProcessingAudio) {
-      elizaLogger6.log(
-        "[SttTtsPlugin] Already processing audio, skipping for user:",
-        userId
-      );
-      return;
-    }
-    this.isProcessingAudio = true;
     try {
-      elizaLogger6.log(
-        "[SttTtsPlugin] Starting audio processing for user:",
-        userId
-      );
+      if (this.isProcessingAudio) {
+        elizaLogger6.log("[SttTtsPlugin] Interrupting previous audio processing");
+        if (this.ttsAbortController) {
+          this.ttsAbortController.abort();
+          this.ttsAbortController = null;
+        }
+        this.eventEmitter.removeAllListeners("stream-chunk");
+        this.eventEmitter.removeAllListeners("stream-start");
+        this.eventEmitter.removeAllListeners("stream-end");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      this.isProcessingAudio = true;
       const chunks = this.pcmBuffers.get(userId) || [];
       this.pcmBuffers.delete(userId);
       if (!chunks.length) {
@@ -3557,6 +3562,9 @@ var SttTtsPlugin = class {
         );
         this.ttsAbortController = new AbortController();
         const signal = this.ttsAbortController.signal;
+        const streamId = uuidv4();
+        this.currentStreamId = streamId;
+        elizaLogger6.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
         let accumulatedText = "";
         let ttsBuffer = "";
         const minTtsChunkSize = 30;
@@ -3606,18 +3614,39 @@ var SttTtsPlugin = class {
             }, progressiveDelay);
           }
         };
-        this.eventEmitter.once("stream-start", () => {
+        this.eventEmitter.once("stream-start", (startStreamId) => {
+          if (startStreamId && startStreamId !== streamId) {
+            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-start from outdated stream`);
+            return;
+          }
           elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
         });
-        this.eventEmitter.on("stream-chunk", (chunk) => {
-          if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted)
+        this.eventEmitter.on("stream-chunk", (chunk, chunkStreamId) => {
+          if (streamId !== this.currentStreamId) {
+            elizaLogger6.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
             return;
+          }
+          if (chunkStreamId && chunkStreamId !== streamId) {
+            elizaLogger6.debug(`[SttTtsPlugin] Ignoring chunk from different stream ID`);
+            return;
+          }
+          if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted) {
+            return;
+          }
           accumulatedText += chunk;
           ttsBuffer += chunk;
           manageTtsBuffer();
         });
-        this.eventEmitter.once("stream-end", () => {
-          if (ttsBuffer.length > 0) {
+        this.eventEmitter.once("stream-end", (endStreamId) => {
+          if (streamId !== this.currentStreamId) {
+            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
+            return;
+          }
+          if (endStreamId && endStreamId !== streamId) {
+            elizaLogger6.debug(`[SttTtsPlugin] Ignoring stream-end from different stream ID`);
+            return;
+          }
+          if (ttsBuffer.length > 0 && !signal.aborted) {
             processTtsChunk();
           }
           elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
@@ -3746,22 +3775,23 @@ var SttTtsPlugin = class {
         maxAmplitude = absValue;
       }
     }
+    let gainFactor = 1;
     if (maxAmplitude > 1e4) {
-      return audio;
-    }
-    const targetAmplitude = 24e3;
-    const scaleFactor = maxAmplitude > 0 ? targetAmplitude / maxAmplitude : 1;
-    const result = new Int16Array(audio.length);
-    for (let i = 0; i < audio.length; i++) {
-      result[i] = Math.max(
-        -32768,
-        Math.min(32767, Math.round(audio[i] * scaleFactor))
+      gainFactor = Math.min(3, 1e4 / Math.max(1, maxAmplitude));
+      elizaLogger6.debug(
+        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`
       );
+      for (let i = 0; i < audio.length; i++) {
+        audio[i] = Math.max(
+          -32768,
+          Math.min(32767, Math.round(audio[i] * gainFactor))
+        );
+      }
     }
     elizaLogger6.debug(
-      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, scale factor: ${scaleFactor.toFixed(2)}`
+      `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, scale factor: ${gainFactor.toFixed(2)}`
     );
-    return result;
+    return audio;
   }
   /**
    * Convert to WAV format
@@ -3891,6 +3921,12 @@ var SttTtsPlugin = class {
    */
   async handleUserMessageStreaming(userText, userId) {
     var _a, _b;
+    const streamId = this.currentStreamId;
+    if (!streamId) {
+      elizaLogger6.error("[SttTtsPlugin] No current stream ID found");
+      return;
+    }
+    elizaLogger6.log(`[SttTtsPlugin] Handling user message with stream ID: ${streamId}`);
     const numericId = userId.replace("tw-", "");
     const roomId = stringToUuid6(`twitter_generate_room-${this.spaceId}`);
     const userUuid = stringToUuid6(`twitter-user-${numericId}`);
@@ -3965,7 +4001,7 @@ var SttTtsPlugin = class {
     const progressiveTimeout = null;
     const minCharactersForProgressive = 15;
     const progressiveDelay = 400;
-    this.eventEmitter.emit("stream-start");
+    this.eventEmitter.emit("stream-start", streamId);
     const start = Date.now();
     const stream = await this.openai.chat.completions.create({
       model: "grok-2-latest",
@@ -3987,7 +4023,7 @@ var SttTtsPlugin = class {
         }
       }
       if (!isJsonResponse) {
-        this.eventEmitter.emit("stream-chunk", content);
+        this.eventEmitter.emit("stream-chunk", content, streamId);
         continue;
       }
       jsonBuffer += content;
@@ -3997,7 +4033,7 @@ var SttTtsPlugin = class {
           const capturedText = textMatch[1];
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
-            this.eventEmitter.emit("stream-chunk", newText);
+            this.eventEmitter.emit("stream-chunk", newText, streamId);
             textValue = capturedText;
           }
         }
@@ -4016,7 +4052,7 @@ var SttTtsPlugin = class {
               const parsed = JSON.parse(jsonObject);
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
-                this.eventEmitter.emit("stream-chunk", newText);
+                this.eventEmitter.emit("stream-chunk", newText, streamId);
                 textValue = parsed.text;
               }
             } catch (e) {
@@ -4041,20 +4077,20 @@ var SttTtsPlugin = class {
           const parsed = JSON.parse(jsonObject);
           if (parsed.text) {
             console.log(`Time took for emitting ${Date.now() - start}`);
-            this.eventEmitter.emit("stream-chunk", parsed.text);
+            this.eventEmitter.emit("stream-chunk", parsed.text, streamId);
           } else {
-            this.eventEmitter.emit("stream-chunk", jsonBuffer);
+            this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
           }
         } else {
-          this.eventEmitter.emit("stream-chunk", jsonBuffer);
+          this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
         }
       } catch (e) {
         console.log(`Time took for emitting ${Date.now() - start}`);
-        this.eventEmitter.emit("stream-chunk", jsonBuffer);
+        this.eventEmitter.emit("stream-chunk", jsonBuffer, streamId);
       }
     }
     console.log(`Time took for completing LLM ${Date.now() - start}`);
-    this.eventEmitter.emit("stream-end");
+    this.eventEmitter.emit("stream-end", streamId);
   }
   /**
    * Generate Response

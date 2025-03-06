@@ -1,5 +1,3 @@
-// src/plugins/SttTtsPlugin.ts
-
 import { spawn } from 'child_process';
 import {
   type ITranscriptionService,
@@ -28,6 +26,7 @@ import { isEmpty } from '../utils';
 import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
+import { v4 as uuidv4 } from 'uuid';
 
 // No Web Audio API polyfill needed, using native Node.js capabilities
 
@@ -102,6 +101,7 @@ export class SttTtsPlugin implements Plugin {
   private userSpeakingTimer: NodeJS.Timeout | null = null;
   private volumeBuffers: Map<string, number[]>;
   private ttsAbortController: AbortController | null = null;
+  private currentStreamId: string | null = null;
 
   private eventEmitter = new EventEmitter();
   private openai: OpenAI;
@@ -638,6 +638,9 @@ export class SttTtsPlugin implements Plugin {
       } else {
         elizaLogger.error('[SttTtsPlugin] Audio streaming error:', error);
       }
+
+      // Make sure to end the stream on error
+      mp3Stream.end();
       throw error;
     } finally {
       // Clean up event listeners
@@ -756,24 +759,27 @@ export class SttTtsPlugin implements Plugin {
    * On speaker silence => flush STT => GPT => TTS => push to Janus
    */
   private async processAudio(userId: string): Promise<void> {
-    // Since the agent is shared in a single Twitter space, we don't need per-user locks
-    // Instead, use a single isProcessingAudio flag for the entire plugin
-    if (this.isProcessingAudio) {
-      elizaLogger.log(
-        '[SttTtsPlugin] Already processing audio, skipping for user:',
-        userId,
-      );
-      return;
-    }
-
-    // Set global processing flag
-    this.isProcessingAudio = true;
-
     try {
-      elizaLogger.log(
-        '[SttTtsPlugin] Starting audio processing for user:',
-        userId,
-      );
+      if (this.isProcessingAudio) {
+        elizaLogger.log('[SttTtsPlugin] Interrupting previous audio processing');
+        
+        // If we're already processing audio, abort the previous TTS
+        if (this.ttsAbortController) {
+          this.ttsAbortController.abort();
+          this.ttsAbortController = null;
+        }
+        
+        // Remove all existing event listeners to prevent old events from being processed
+        this.eventEmitter.removeAllListeners('stream-chunk');
+        this.eventEmitter.removeAllListeners('stream-start');
+        this.eventEmitter.removeAllListeners('stream-end');
+        
+        // Wait a moment for cleanup to complete
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Set the global processing flag
+      this.isProcessingAudio = true;
 
       // Get chunks and clear only this user's buffer
       const chunks = this.pcmBuffers.get(userId) || [];
@@ -845,6 +851,12 @@ export class SttTtsPlugin implements Plugin {
         // Create a TTS abort controller for this session
         this.ttsAbortController = new AbortController();
         const signal = this.ttsAbortController.signal;
+
+        // Create a unique ID for this stream session
+        const streamId = uuidv4();
+        this.currentStreamId = streamId;
+
+        elizaLogger.log(`[SttTtsPlugin] Starting new stream with ID: ${streamId}`);
 
         // Track accumulated text for logging
         let accumulatedText = '';
@@ -937,14 +949,32 @@ export class SttTtsPlugin implements Plugin {
         };
 
         // Set up event listeners for the streaming response
-        this.eventEmitter.once('stream-start', () => {
+        this.eventEmitter.once('stream-start', (startStreamId?: string) => {
+          // Only process if this is the current stream
+          if (startStreamId && startStreamId !== streamId) {
+            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-start from outdated stream`);
+            return;
+          }
           elizaLogger.log('[SttTtsPlugin] Stream started for user:', userId);
         });
 
         // Handle each chunk as it comes in from Grok
-        this.eventEmitter.on('stream-chunk', (chunk: string) => {
-          if (typeof chunk !== 'string' || isEmpty(chunk) || signal.aborted)
+        this.eventEmitter.on('stream-chunk', (chunk: string, chunkStreamId?: string) => {
+          // Ignore chunks if this stream is no longer current
+          if (streamId !== this.currentStreamId) {
+            elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
             return;
+          }
+          
+          // Ignore chunks from different streams
+          if (chunkStreamId && chunkStreamId !== streamId) {
+            elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from different stream ID`);
+            return;
+          }
+
+          if (typeof chunk !== 'string' || isEmpty(chunk) || signal.aborted) {
+            return;
+          }
 
           // Add to accumulated text for logging
           accumulatedText += chunk;
@@ -957,9 +987,21 @@ export class SttTtsPlugin implements Plugin {
         });
 
         // Clean up when stream ends
-        this.eventEmitter.once('stream-end', () => {
+        this.eventEmitter.once('stream-end', (endStreamId?: string) => {
+          // Ignore end events if this stream is no longer current
+          if (streamId !== this.currentStreamId) {
+            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
+            return;
+          }
+          
+          // Ignore end events from different streams
+          if (endStreamId && endStreamId !== streamId) {
+            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from different stream ID`);
+            return;
+          }
+
           // Process any remaining text in the buffer
-          if (ttsBuffer.length > 0) {
+          if (ttsBuffer.length > 0 && !signal.aborted) {
             processTtsChunk();
           }
 
@@ -1149,32 +1191,32 @@ export class SttTtsPlugin implements Plugin {
       }
     }
 
+    // Default gain factor (no change)
+    let gainFactor = 1.0;
+
     // If the audio is already loud enough, return it as is
     if (maxAmplitude > 10000) {
-      return audio;
-    }
-
-    // Calculate a scaling factor to normalize the audio
-    // Target around 50-75% of maximum possible amplitude for Int16 (-32768 to 32767)
-    const targetAmplitude = 24000; // ~75% of max Int16 value
-    const scaleFactor = maxAmplitude > 0 ? targetAmplitude / maxAmplitude : 1;
-
-    // Apply the scaling factor to normalize the audio
-    const result = new Int16Array(audio.length);
-    for (let i = 0; i < audio.length; i++) {
-      // Scale and clamp to Int16 range
-      result[i] = Math.max(
-        -32768,
-        Math.min(32767, Math.round(audio[i] * scaleFactor)),
+      // Less than ~15% of max Int16 value
+      gainFactor = Math.min(3.0, 10000 / Math.max(1, maxAmplitude));
+      elizaLogger.debug(
+        `[SttTtsPlugin] Amplifying quiet audio by factor of ${gainFactor.toFixed(2)}`,
       );
+
+      for (let i = 0; i < audio.length; i++) {
+        // Apply gain and clamp to Int16 range
+        audio[i] = Math.max(
+          -32768,
+          Math.min(32767, Math.round(audio[i] * gainFactor)),
+        );
+      }
     }
 
     elizaLogger.debug(
       `[SttTtsPlugin] Normalized audio levels, max amplitude: ${maxAmplitude}, ` +
-        `scale factor: ${scaleFactor.toFixed(2)}`,
+        `scale factor: ${gainFactor.toFixed(2)}`,
     );
 
-    return result;
+    return audio;
   }
 
   /**
@@ -1363,6 +1405,16 @@ export class SttTtsPlugin implements Plugin {
     userText: string,
     userId: string, // This is the raw Twitter user ID like 'tw-1865462035586142208'
   ): Promise<void> {
+    // Use the current stream ID
+    const streamId = this.currentStreamId;
+    
+    if (!streamId) {
+      elizaLogger.error('[SttTtsPlugin] No current stream ID found');
+      return;
+    }
+    
+    elizaLogger.log(`[SttTtsPlugin] Handling user message with stream ID: ${streamId}`);
+
     // Extract the numeric ID part
     const numericId = userId.replace('tw-', '');
     const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
@@ -1462,7 +1514,7 @@ export class SttTtsPlugin implements Plugin {
     const progressiveDelay = 400; // ms
 
     // Signal stream start
-    this.eventEmitter.emit('stream-start');
+    this.eventEmitter.emit('stream-start', streamId);
 
     const start = Date.now();
     // Make streaming request to Grok
@@ -1499,7 +1551,7 @@ export class SttTtsPlugin implements Plugin {
 
       // If it's not JSON, emit directly
       if (!isJsonResponse) {
-        this.eventEmitter.emit('stream-chunk', content);
+        this.eventEmitter.emit('stream-chunk', content, streamId);
         continue;
       }
 
@@ -1518,7 +1570,7 @@ export class SttTtsPlugin implements Plugin {
           // If we have more text than before, emit the difference
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
-            this.eventEmitter.emit('stream-chunk', newText);
+            this.eventEmitter.emit('stream-chunk', newText, streamId);
             textValue = capturedText;
           }
         }
@@ -1551,7 +1603,7 @@ export class SttTtsPlugin implements Plugin {
               // If we have a text field, emit any new content
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
-                this.eventEmitter.emit('stream-chunk', newText);
+                this.eventEmitter.emit('stream-chunk', newText, streamId);
                 textValue = parsed.text;
               }
             } catch (e) {
@@ -1585,25 +1637,25 @@ export class SttTtsPlugin implements Plugin {
 
           if (parsed.text) {
             console.log(`Time took for emitting ${Date.now() - start}`);
-            this.eventEmitter.emit('stream-chunk', parsed.text);
+            this.eventEmitter.emit('stream-chunk', parsed.text, streamId);
           } else {
             // No text field found, emit the whole buffer as fallback
-            this.eventEmitter.emit('stream-chunk', jsonBuffer);
+            this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
           }
         } else {
           // No valid JSON found, emit the whole buffer as fallback
-          this.eventEmitter.emit('stream-chunk', jsonBuffer);
+          this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
         }
       } catch (e) {
         console.log(`Time took for emitting ${Date.now() - start}`);
         // Parsing failed, emit the whole buffer as fallback
-        this.eventEmitter.emit('stream-chunk', jsonBuffer);
+        this.eventEmitter.emit('stream-chunk', jsonBuffer, streamId);
       }
     }
 
     console.log(`Time took for completing LLM ${Date.now() - start}`);
     // Signal stream end
-    this.eventEmitter.emit('stream-end');
+    this.eventEmitter.emit('stream-end', streamId);
 
     // Save the complete response to memory
     // if (fullResponse.trim()) {

@@ -120,4 +120,6 @@ Response format should be formatted in a valid JSON block like this:
 { "user": "{{agentName}}", "text": "<string>", "action": "<string>" }
 \`\`\`
 
-The “action” field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.`
+The “action” field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.
+When you decide the action is something different than NONE, the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you
+need to sound like you are naturally buying time.`
