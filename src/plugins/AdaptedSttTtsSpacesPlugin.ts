@@ -31,7 +31,7 @@ import OpenAI from 'openai';
 import {
   DeepgramStreamingClient,
   DeepgramStreamingOptions,
-} from '../services/DeepgramStreamingClient';
+} from './DeepgramStreamingClient';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
