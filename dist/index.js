@@ -3184,149 +3184,6 @@ var SttTtsPlugin = class {
       this.isSpeaking = false;
     }
   }
-  /**
-   * On speaker silence => flush STT => GPT => TTS => push to Janus
-   */
-  async processAudio(userId) {
-    var _a;
-    if (this.isProcessingAudio) {
-      elizaLogger6.log(
-        "[SttTtsPlugin] Already processing audio, skipping for user:",
-        userId
-      );
-      return;
-    }
-    this.isProcessingAudio = true;
-    try {
-      elizaLogger6.log(
-        "[SttTtsPlugin] Starting audio processing for user:",
-        userId
-      );
-      const chunks = this.pcmBuffers.get(userId) || [];
-      this.pcmBuffers.delete(userId);
-      if (!chunks.length) {
-        elizaLogger6.warn("[SttTtsPlugin] No audio chunks for user =>", userId);
-        return;
-      }
-      elizaLogger6.log(
-        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`
-      );
-      const mergeBufferPromise = this.mergeAudioChunks(chunks);
-      this.volumeBuffers.delete(userId);
-      const merged = await mergeBufferPromise;
-      elizaLogger6.debug(
-        `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, estimated duration=${(merged.length / 48e3).toFixed(2)}s`
-      );
-      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
-      let wavBuffer;
-      let sttText;
-      try {
-        wavBuffer = await this.convertPcmToWavInMemory(
-          optimizedPcm,
-          optimizedPcm === merged ? 48e3 : 16e3
-        );
-        const start = Date.now();
-        sttText = await this.transcriptionService.transcribe(wavBuffer);
-        console.log(`Transcription took: ${Date.now() - start} ms`);
-        elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
-        if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
-          elizaLogger6.warn(
-            `[SttTtsPlugin] No speech recognized for user => ${userId}, audio buffer size: ${wavBuffer.byteLength} bytes, transcription time: ${Date.now() - start}ms`
-          );
-          return;
-        }
-        elizaLogger6.log(
-          `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
-        );
-        this.ttsAbortController = new AbortController();
-        const signal = this.ttsAbortController.signal;
-        let accumulatedText = "";
-        let ttsBuffer = "";
-        const minTtsChunkSize = 30;
-        let isTtsProcessing = false;
-        const isNaturalBreakPoint = (text) => {
-          return /[.!?](\s|$)/.test(text) || // Strong sentence endings
-          /[;:](\s|$)/.test(text) && text.length > 40 || // Medium pauses with sufficient context
-          /[,](\s|$)/.test(text) && text.length > 80;
-        };
-        let progressiveTimeout = null;
-        const minCharactersForProgressive = 15;
-        const progressiveDelay = 400;
-        const processTtsChunk = async () => {
-          if (progressiveTimeout) {
-            clearTimeout(progressiveTimeout);
-            progressiveTimeout = null;
-          }
-          const textToProcess = ttsBuffer;
-          ttsBuffer = "";
-          const textWithPauses = textToProcess.replace(/([.!?])(\s|$)/g, '$1<break time="0.4s"/>$2').replace(/([;:])(\s|$)/g, '$1<break time="0.3s"/>$2').replace(/([,])(\s|$)/g, '$1<break time="0.15s"/>$2');
-          isTtsProcessing = true;
-          try {
-            await this.streamTtsToJanus(textWithPauses, signal);
-            if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
-              processTtsChunk();
-            }
-          } finally {
-            isTtsProcessing = false;
-          }
-        };
-        const processTtsBuffer = async () => {
-          if (ttsBuffer.length === 0 || isTtsProcessing) return;
-          processTtsChunk();
-        };
-        this.eventEmitter.once("stream-start", () => {
-          elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
-        });
-        this.eventEmitter.on("stream-chunk", (chunk) => {
-          if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted)
-            return;
-          accumulatedText += chunk;
-          ttsBuffer += chunk;
-          if (progressiveTimeout === null) {
-            progressiveTimeout = setTimeout(() => {
-              if (ttsBuffer.length >= minCharactersForProgressive) {
-                processTtsChunk();
-              }
-            }, progressiveDelay);
-          }
-          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
-            processTtsBuffer();
-          }
-        });
-        this.eventEmitter.once("stream-end", () => {
-          if (ttsBuffer.length > 0) {
-            processTtsBuffer();
-          }
-          elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
-          elizaLogger6.log(
-            `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`
-          );
-          this.eventEmitter.removeAllListeners("stream-chunk");
-          this.eventEmitter.removeAllListeners("stream-start");
-          this.eventEmitter.removeAllListeners("stream-end");
-        });
-        await this.handleUserMessageStreaming(sttText, userId);
-      } catch (error) {
-        if (error.name === "TranscriptionError" || ((_a = error.message) == null ? void 0 : _a.includes("transcription"))) {
-          elizaLogger6.error(`[SttTtsPlugin] Transcription error: ${error}`, {
-            userId,
-            audioBufferSize: (wavBuffer == null ? void 0 : wavBuffer.byteLength) || 0,
-            sampleRate: optimizedPcm === merged ? 48e3 : 16e3,
-            error
-          });
-        } else {
-          elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
-        }
-      } finally {
-        if (this.ttsAbortController) {
-          this.ttsAbortController = null;
-        }
-        this.isProcessingAudio = false;
-      }
-    } catch (error) {
-      elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
-    }
-  }
   async streamTtsToJanus(text, signal) {
     const SAMPLE_RATE = 48e3;
     const FRAME_SIZE = 480;
@@ -3581,6 +3438,155 @@ var SttTtsPlugin = class {
       }
       outputStream.end();
       throw error;
+    }
+  }
+  /**
+   * On speaker silence => flush STT => GPT => TTS => push to Janus
+   */
+  async processAudio(userId) {
+    var _a;
+    if (this.isProcessingAudio) {
+      elizaLogger6.log(
+        "[SttTtsPlugin] Already processing audio, skipping for user:",
+        userId
+      );
+      return;
+    }
+    this.isProcessingAudio = true;
+    try {
+      elizaLogger6.log(
+        "[SttTtsPlugin] Starting audio processing for user:",
+        userId
+      );
+      const chunks = this.pcmBuffers.get(userId) || [];
+      this.pcmBuffers.delete(userId);
+      if (!chunks.length) {
+        elizaLogger6.warn("[SttTtsPlugin] No audio chunks for user =>", userId);
+        return;
+      }
+      elizaLogger6.log(
+        `[SttTtsPlugin] Processing audio for user=${userId}, chunks=${chunks.length}`
+      );
+      const mergeBufferPromise = this.mergeAudioChunks(chunks);
+      this.volumeBuffers.delete(userId);
+      const merged = await mergeBufferPromise;
+      elizaLogger6.debug(
+        `[SttTtsPlugin] Merged audio buffer: length=${merged.length} samples, estimated duration=${(merged.length / 48e3).toFixed(2)}s`
+      );
+      const optimizedPcm = this.maybeDownsampleAudio(merged, 48e3, 16e3);
+      let wavBuffer;
+      let sttText;
+      try {
+        wavBuffer = await this.convertPcmToWavInMemory(
+          optimizedPcm,
+          optimizedPcm === merged ? 48e3 : 16e3
+        );
+        const start = Date.now();
+        sttText = await this.transcriptionService.transcribe(wavBuffer);
+        console.log(`Transcription took: ${Date.now() - start} ms`);
+        elizaLogger6.log(`[SttTtsPlugin] Transcription result: "${sttText}"`);
+        if (isEmpty(sttText == null ? void 0 : sttText.trim())) {
+          elizaLogger6.warn(
+            `[SttTtsPlugin] No speech recognized for user => ${userId}, audio buffer size: ${wavBuffer.byteLength} bytes, transcription time: ${Date.now() - start}ms`
+          );
+          return;
+        }
+        elizaLogger6.log(
+          `[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`
+        );
+        this.ttsAbortController = new AbortController();
+        const signal = this.ttsAbortController.signal;
+        let accumulatedText = "";
+        let ttsBuffer = "";
+        const minTtsChunkSize = 30;
+        let isTtsProcessing = false;
+        const isNaturalBreakPoint = (text) => {
+          return /[.!?](\s|$)/.test(text) || // Strong sentence endings
+          /[;:](\s|$)/.test(text) && text.length > 40 || // Medium pauses with sufficient context
+          /[,](\s|$)/.test(text) && text.length > 80;
+        };
+        let progressiveTimeout = null;
+        const minCharactersForProgressive = 15;
+        const progressiveDelay = 400;
+        const processTtsChunk = async () => {
+          if (isTtsProcessing || ttsBuffer.length === 0) return;
+          isTtsProcessing = true;
+          try {
+            const textToProcess = ttsBuffer;
+            ttsBuffer = "";
+            const textWithPauses = textToProcess.replace(/\.\s+/g, '. <break time="500ms"/> ').replace(/\?\s+/g, '? <break time="500ms"/> ').replace(/!\s+/g, '! <break time="500ms"/> ').replace(/:\s+/g, ': <break time="300ms"/> ').replace(/;\s+/g, '; <break time="300ms"/> ').replace(/,\s+/g, ', <break time="200ms"/> ');
+            elizaLogger6.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? "..." : ""}"`);
+            await this.streamTtsToJanus(textWithPauses, signal);
+            if (ttsBuffer.length > 0 && !signal.aborted) {
+              setTimeout(() => {
+                processTtsChunk();
+              }, 100);
+            }
+          } catch (error) {
+            elizaLogger6.error("[SttTtsPlugin] Error processing TTS chunk:", error);
+          } finally {
+            isTtsProcessing = false;
+          }
+        };
+        const manageTtsBuffer = () => {
+          if (isTtsProcessing || signal.aborted) return;
+          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
+            if (progressiveTimeout !== null) {
+              clearTimeout(progressiveTimeout);
+              progressiveTimeout = null;
+            }
+            processTtsChunk();
+          } else if (ttsBuffer.length >= minCharactersForProgressive && progressiveTimeout === null) {
+            progressiveTimeout = setTimeout(() => {
+              progressiveTimeout = null;
+              if (ttsBuffer.length > 0 && !isTtsProcessing) {
+                processTtsChunk();
+              }
+            }, progressiveDelay);
+          }
+        };
+        this.eventEmitter.once("stream-start", () => {
+          elizaLogger6.log("[SttTtsPlugin] Stream started for user:", userId);
+        });
+        this.eventEmitter.on("stream-chunk", (chunk) => {
+          if (typeof chunk !== "string" || isEmpty(chunk) || signal.aborted)
+            return;
+          accumulatedText += chunk;
+          ttsBuffer += chunk;
+          manageTtsBuffer();
+        });
+        this.eventEmitter.once("stream-end", () => {
+          if (ttsBuffer.length > 0) {
+            processTtsChunk();
+          }
+          elizaLogger6.log("[SttTtsPlugin] Stream ended for user:", userId);
+          elizaLogger6.log(
+            `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`
+          );
+          this.eventEmitter.removeAllListeners("stream-chunk");
+          this.eventEmitter.removeAllListeners("stream-start");
+          this.eventEmitter.removeAllListeners("stream-end");
+        });
+        await this.handleUserMessageStreaming(sttText, userId);
+      } catch (error) {
+        if (error.name === "TranscriptionError" || ((_a = error.message) == null ? void 0 : _a.includes("transcription"))) {
+          elizaLogger6.error(`[SttTtsPlugin] Transcription error: ${error}`, {
+            userId,
+            audioBufferSize: (wavBuffer == null ? void 0 : wavBuffer.byteLength) || 0,
+            sampleRate: optimizedPcm === merged ? 48e3 : 16e3,
+            error
+          });
+        } else {
+          elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
+        }
+      } finally {
+        if (this.ttsAbortController) {
+          this.ttsAbortController = null;
+        }
+        this.isProcessingAudio = false;
+      }
+    } catch (error) {
+      elizaLogger6.error("[SttTtsPlugin] processAudio error =>", error);
     }
   }
   /**
@@ -3930,7 +3936,6 @@ var SttTtsPlugin = class {
           const capturedText = textMatch[1];
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
-            console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit("stream-chunk", newText);
             textValue = capturedText;
           }
@@ -3950,7 +3955,6 @@ var SttTtsPlugin = class {
               const parsed = JSON.parse(jsonObject);
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
-                console.log(`Time took for emitting ${Date.now() - start}`);
                 this.eventEmitter.emit("stream-chunk", newText);
                 textValue = parsed.text;
               }
@@ -3978,11 +3982,9 @@ var SttTtsPlugin = class {
             console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit("stream-chunk", parsed.text);
           } else {
-            console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit("stream-chunk", jsonBuffer);
           }
         } else {
-          console.log(`Time took for emitting ${Date.now() - start}`);
           this.eventEmitter.emit("stream-chunk", jsonBuffer);
         }
       } catch (e) {

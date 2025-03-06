@@ -346,6 +346,364 @@ export class SttTtsPlugin implements Plugin {
       }
     }
 
+    private async streamTtsToJanus(
+      text: string,
+      signal: AbortSignal,
+    ): Promise<void> {
+      const SAMPLE_RATE = 48000;
+      const FRAME_SIZE = 480; // 10ms at 48kHz
+      const FRAME_DURATION_MS = 10; // Actual playback duration of each frame
+  
+      // Create a PassThrough stream for the MP3 data
+      const mp3Stream = new PassThrough();
+  
+      // Set up FFmpeg process for streaming conversion
+      const ffmpeg = spawn('ffmpeg', [
+        // Input stream settings
+        '-i',
+        'pipe:0',
+        '-f',
+        'mp3',
+  
+        // Performance flags
+        '-threads',
+        '4',
+        '-loglevel',
+        'error',
+        '-nostdin',
+        '-fflags',
+        '+nobuffer',
+        '-flags',
+        '+low_delay',
+        '-probesize',
+        '32',
+        '-analyzeduration',
+        '0',
+  
+        // Output settings - PCM audio
+        '-f',
+        's16le',
+        '-ar',
+        SAMPLE_RATE.toString(),
+        '-ac',
+        '1',
+        'pipe:1',
+      ]);
+  
+      // Connect MP3 stream to FFmpeg input
+      mp3Stream.pipe(ffmpeg.stdin);
+  
+      // Create a buffer to store audio frames
+      const audioBuffer: Int16Array[] = [];
+  
+      // Flag to track if processing is complete
+      let processingComplete = false;
+  
+      // Start the ElevenLabs API call with streaming response
+      const elevenLabsPromise = this.elevenLabsTtsStreaming(
+        text,
+        mp3Stream,
+        signal,
+      );
+  
+      // Process FFmpeg output and store in buffer
+      const processingPromise = new Promise<void>((resolve, reject) => {
+        let pcmBuffer = Buffer.alloc(0);
+  
+        ffmpeg.stdout.on('data', (chunk: Buffer) => {
+          try {
+            if (signal.aborted) return;
+  
+            // Append new chunk to our buffer
+            pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+  
+            // Process complete frames
+            while (pcmBuffer.length >= FRAME_SIZE * 2) {
+              // 2 bytes per sample
+              // Extract a complete frame
+              const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
+              pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
+  
+              // Convert to Int16Array and store in audio buffer
+              const frame = new Int16Array(
+                frameBuffer.buffer,
+                frameBuffer.byteOffset,
+                FRAME_SIZE,
+              );
+  
+              // Create a copy of the frame to avoid shared buffer issues
+              const frameCopy = new Int16Array(FRAME_SIZE);
+              frameCopy.set(frame);
+  
+              // Add to our ordered buffer queue
+              audioBuffer.push(frameCopy);
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
+  
+        ffmpeg.stderr.on('data', (data) => {
+          if (data.toString().includes('Error')) {
+            console.error('[FFmpeg Streaming Error]', data.toString().trim());
+          }
+        });
+  
+        ffmpeg.on('close', (code) => {
+          try {
+            if (code !== 0 && !signal.aborted) {
+              reject(
+                new Error(`ffmpeg streaming process exited with code ${code}`),
+              );
+              return;
+            }
+  
+            // Process any remaining audio in the buffer
+            if (pcmBuffer.length > 0 && !signal.aborted) {
+              // Create a proper sized frame for any remaining data
+              const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
+              pcmBuffer.copy(
+                frameBuffer,
+                0,
+                0,
+                Math.min(pcmBuffer.length, FRAME_SIZE * 2),
+              );
+  
+              const frame = new Int16Array(FRAME_SIZE);
+  
+              // Copy from the buffer view to our frame
+              const srcView = new Int16Array(
+                frameBuffer.buffer,
+                frameBuffer.byteOffset,
+                FRAME_SIZE,
+              );
+  
+              frame.set(srcView);
+              audioBuffer.push(frame);
+            }
+  
+            processingComplete = true;
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+  
+        ffmpeg.on('error', (err) => {
+          reject(new Error(`FFmpeg process error: ${err.message}`));
+        });
+      });
+  
+      try {
+        // Wait for audio processing to complete (or at least start building the buffer)
+        await Promise.race([
+          processingPromise.catch((err) => {
+            elizaLogger.error('[SttTtsPlugin] Processing error:', err);
+          }),
+          // Also wait for a minimum buffer to build up before starting playback
+          new Promise<void>((resolve) => {
+            const checkBuffer = () => {
+              if (audioBuffer.length > 10 || signal.aborted) {
+                resolve();
+              } else {
+                setTimeout(checkBuffer, 50);
+              }
+            };
+            checkBuffer();
+          }),
+        ]);
+  
+        // Stream the audio frames with proper timing
+        let frameIndex = 0;
+        const startTime = Date.now();
+  
+        while (
+          (frameIndex < audioBuffer.length || !processingComplete) &&
+          !signal.aborted
+        ) {
+          // If we've played all available frames but processing isn't complete, wait for more
+          if (frameIndex >= audioBuffer.length && !processingComplete) {
+            await new Promise<void>((resolve) => {
+              const waitForMoreFrames = () => {
+                if (
+                  frameIndex < audioBuffer.length ||
+                  processingComplete ||
+                  signal.aborted
+                ) {
+                  resolve();
+                } else {
+                  setTimeout(waitForMoreFrames, 20);
+                }
+              };
+              waitForMoreFrames();
+            });
+  
+            // If we're still out of frames after waiting, exit the loop
+            if (frameIndex >= audioBuffer.length) {
+              break;
+            }
+          }
+  
+          // Calculate the ideal playback time for this frame
+          const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
+          const currentTime = Date.now();
+  
+          // Adjust timing if we're behind or ahead
+          if (currentTime < idealPlaybackTime) {
+            // We're ahead of schedule, wait until the right time
+            await new Promise((r) =>
+              setTimeout(r, idealPlaybackTime - currentTime),
+            );
+          } else if (currentTime > idealPlaybackTime + 100) {
+            // We're significantly behind, skip frames to catch up
+            const framesToSkip = Math.floor(
+              (currentTime - idealPlaybackTime) / FRAME_DURATION_MS,
+            );
+            if (framesToSkip > 0) {
+              elizaLogger.log(
+                `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`,
+              );
+              frameIndex += framesToSkip;
+              continue;
+            }
+          }
+  
+          // Get the next frame
+          const frame = audioBuffer[frameIndex];
+  
+          // Send to Janus
+          try {
+            await this.streamChunkToJanus(frame, SAMPLE_RATE);
+          } catch (error) {
+            elizaLogger.error(
+              '[SttTtsPlugin] Error sending frame to Janus:',
+              error,
+            );
+          }
+  
+          frameIndex++;
+        }
+  
+        // Wait for any remaining processing to complete
+        await processingPromise;
+        await elevenLabsPromise;
+  
+        elizaLogger.log(
+          `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`,
+        );
+      } catch (error) {
+        if (signal.aborted) {
+          elizaLogger.log('[SttTtsPlugin] Audio streaming aborted');
+        } else {
+          elizaLogger.error('[SttTtsPlugin] Audio streaming error:', error);
+        }
+        throw error;
+      }
+    }
+
+
+  /**
+   * Modified ElevenLabs TTS function that streams the response to a writable stream
+   * instead of waiting for the full response
+   */
+  private async elevenLabsTtsStreaming(
+    text: string,
+    outputStream: NodeJS.WritableStream,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      if (!this.elevenLabsApiKey) {
+        throw new Error('[SttTtsPlugin] No ElevenLabs API key');
+      }
+
+      // Set up ElevenLabs API request
+      const apiKey = this.elevenLabsApiKey;
+      const voiceId = this.voiceId;
+
+      // Use the streaming endpoint
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+
+      elizaLogger.log(
+        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`,
+      );
+
+      // Make the API request
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          text,
+          model_id: this.elevenLabsModel,
+          voice_settings: {
+            stability: 0.4,
+            similarity_boost: 0.8,
+          },
+        }),
+        signal,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`,
+        );
+      }
+
+      if (!response.body) {
+        throw new Error('Response body is null');
+      }
+
+      elizaLogger.log(
+        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`,
+      );
+
+      // Stream the response directly to our output stream
+      const reader = response.body.getReader();
+
+      let done = false;
+      let bytesReceived = 0;
+
+      while (!done && !signal.aborted) {
+        const { value, done: readerDone } = await reader.read();
+        done = readerDone;
+
+        if (value && !signal.aborted) {
+          bytesReceived += value.length;
+
+          // Write chunk to our stream
+          outputStream.write(Buffer.from(value));
+
+          // Log progress periodically
+          if (bytesReceived % 10000 < 1000) {
+            elizaLogger.log(
+              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`,
+            );
+          }
+        }
+      }
+
+      // End the stream when done
+      outputStream.end();
+      elizaLogger.log(
+        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`,
+      );
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        elizaLogger.log('[SttTtsPlugin] ElevenLabs request aborted');
+      } else {
+        elizaLogger.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
+      }
+
+      // Make sure to end the stream on error
+      outputStream.end();
+      throw error;
+    }
+  }
+
   /**
    * On speaker silence => flush STT => GPT => TTS => push to Janus
    */
@@ -467,41 +825,67 @@ export class SttTtsPlugin implements Plugin {
         const progressiveDelay = 400; // ms
 
         const processTtsChunk = async () => {
-          if (progressiveTimeout) {
-            clearTimeout(progressiveTimeout);
-            progressiveTimeout = null;
-          }
-
-          const textToProcess = ttsBuffer;
-          ttsBuffer = '';
-
-          const textWithPauses = textToProcess
-            .replace(/([.!?])(\s|$)/g, '$1<break time="0.4s"/>$2')
-            .replace(/([;:])(\s|$)/g, '$1<break time="0.3s"/>$2')
-            .replace(/([,])(\s|$)/g, '$1<break time="0.15s"/>$2');
-
+          if (isTtsProcessing || ttsBuffer.length === 0) return;
+          
           isTtsProcessing = true;
-
+          
           try {
+            // Extract the current buffer content and reset it
+            const textToProcess = ttsBuffer;
+            ttsBuffer = '';
+            
+            // Add natural pauses at punctuation to make speech sound more natural
+            const textWithPauses = textToProcess
+              .replace(/\.\s+/g, '. <break time="500ms"/> ')
+              .replace(/\?\s+/g, '? <break time="500ms"/> ')
+              .replace(/!\s+/g, '! <break time="500ms"/> ')
+              .replace(/:\s+/g, ': <break time="300ms"/> ')
+              .replace(/;\s+/g, '; <break time="300ms"/> ')
+              .replace(/,\s+/g, ', <break time="200ms"/> ');
+            
+            elizaLogger.log(`[SttTtsPlugin] Processing TTS chunk: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? '...' : ''}"`);
+            
+            // Stream to TTS and Janus
             await this.streamTtsToJanus(textWithPauses, signal);
-
-            // Immediately process next chunk if buffer has content
-            if (
-              ttsBuffer.length >= minTtsChunkSize ||
-              isNaturalBreakPoint(ttsBuffer)
-            ) {
-              processTtsChunk();
+            
+            // Check if we have more text waiting to be processed
+            if (ttsBuffer.length > 0 && !signal.aborted) {
+              // Schedule the next chunk with a small delay to prevent audio overlap
+              setTimeout(() => {
+                processTtsChunk();
+              }, 100);
             }
+          } catch (error) {
+            elizaLogger.error('[SttTtsPlugin] Error processing TTS chunk:', error);
           } finally {
             isTtsProcessing = false;
           }
         };
-
-        const processTtsBuffer = async () => {
-          if (ttsBuffer.length === 0 || isTtsProcessing) return;
-
-          // Process immediately if conditions met
-          processTtsChunk();
+        
+        // Buffer management function - decides when to process text
+        const manageTtsBuffer = () => {
+          // Don't process if already processing or if aborted
+          if (isTtsProcessing || signal.aborted) return;
+          
+          // Process if we have enough text or hit a natural break point
+          if (ttsBuffer.length >= minTtsChunkSize || isNaturalBreakPoint(ttsBuffer)) {
+            // Clear any pending timeouts
+            if (progressiveTimeout !== null) {
+              clearTimeout(progressiveTimeout);
+              progressiveTimeout = null;
+            }
+            
+            // Process the chunk
+            processTtsChunk();
+          } else if (ttsBuffer.length >= minCharactersForProgressive && progressiveTimeout === null) {
+            // Set a timeout to process smaller chunks after a delay
+            progressiveTimeout = setTimeout(() => {
+              progressiveTimeout = null;
+              if (ttsBuffer.length > 0 && !isTtsProcessing) {
+                processTtsChunk();
+              }
+            }, progressiveDelay);
+          }
         };
 
         // Set up event listeners for the streaming response
@@ -519,30 +903,16 @@ export class SttTtsPlugin implements Plugin {
 
           // Add to TTS buffer
           ttsBuffer += chunk;
-
-          // Start progressive timeout on first chunk
-          if (progressiveTimeout === null) {
-            progressiveTimeout = setTimeout(() => {
-              if (ttsBuffer.length >= minCharactersForProgressive) {
-                processTtsChunk();
-              }
-            }, progressiveDelay);
-          }
-
-          // Process TTS when we have enough text or hit a natural break point
-          if (
-            ttsBuffer.length >= minTtsChunkSize ||
-            isNaturalBreakPoint(ttsBuffer)
-          ) {
-            processTtsBuffer();
-          }
+          
+          // Manage the buffer - this will decide when to process
+          manageTtsBuffer();
         });
 
         // Clean up when stream ends
         this.eventEmitter.once('stream-end', () => {
           // Process any remaining text in the buffer
           if (ttsBuffer.length > 0) {
-            processTtsBuffer();
+            processTtsChunk();
           }
 
           elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
@@ -584,363 +954,6 @@ export class SttTtsPlugin implements Plugin {
       }
     } catch (error) {
       elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
-    }
-  }
-
-  private async streamTtsToJanus(
-    text: string,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const SAMPLE_RATE = 48000;
-    const FRAME_SIZE = 480; // 10ms at 48kHz
-    const FRAME_DURATION_MS = 10; // Actual playback duration of each frame
-
-    // Create a PassThrough stream for the MP3 data
-    const mp3Stream = new PassThrough();
-
-    // Set up FFmpeg process for streaming conversion
-    const ffmpeg = spawn('ffmpeg', [
-      // Input stream settings
-      '-i',
-      'pipe:0',
-      '-f',
-      'mp3',
-
-      // Performance flags
-      '-threads',
-      '4',
-      '-loglevel',
-      'error',
-      '-nostdin',
-      '-fflags',
-      '+nobuffer',
-      '-flags',
-      '+low_delay',
-      '-probesize',
-      '32',
-      '-analyzeduration',
-      '0',
-
-      // Output settings - PCM audio
-      '-f',
-      's16le',
-      '-ar',
-      SAMPLE_RATE.toString(),
-      '-ac',
-      '1',
-      'pipe:1',
-    ]);
-
-    // Connect MP3 stream to FFmpeg input
-    mp3Stream.pipe(ffmpeg.stdin);
-
-    // Create a buffer to store audio frames
-    const audioBuffer: Int16Array[] = [];
-
-    // Flag to track if processing is complete
-    let processingComplete = false;
-
-    // Start the ElevenLabs API call with streaming response
-    const elevenLabsPromise = this.elevenLabsTtsStreaming(
-      text,
-      mp3Stream,
-      signal,
-    );
-
-    // Process FFmpeg output and store in buffer
-    const processingPromise = new Promise<void>((resolve, reject) => {
-      let pcmBuffer = Buffer.alloc(0);
-
-      ffmpeg.stdout.on('data', (chunk: Buffer) => {
-        try {
-          if (signal.aborted) return;
-
-          // Append new chunk to our buffer
-          pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
-
-          // Process complete frames
-          while (pcmBuffer.length >= FRAME_SIZE * 2) {
-            // 2 bytes per sample
-            // Extract a complete frame
-            const frameBuffer = pcmBuffer.slice(0, FRAME_SIZE * 2);
-            pcmBuffer = pcmBuffer.slice(FRAME_SIZE * 2);
-
-            // Convert to Int16Array and store in audio buffer
-            const frame = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE,
-            );
-
-            // Create a copy of the frame to avoid shared buffer issues
-            const frameCopy = new Int16Array(FRAME_SIZE);
-            frameCopy.set(frame);
-
-            // Add to our ordered buffer queue
-            audioBuffer.push(frameCopy);
-          }
-        } catch (error) {
-          reject(error);
-        }
-      });
-
-      ffmpeg.stderr.on('data', (data) => {
-        if (data.toString().includes('Error')) {
-          console.error('[FFmpeg Streaming Error]', data.toString().trim());
-        }
-      });
-
-      ffmpeg.on('close', (code) => {
-        try {
-          if (code !== 0 && !signal.aborted) {
-            reject(
-              new Error(`ffmpeg streaming process exited with code ${code}`),
-            );
-            return;
-          }
-
-          // Process any remaining audio in the buffer
-          if (pcmBuffer.length > 0 && !signal.aborted) {
-            // Create a proper sized frame for any remaining data
-            const frameBuffer = Buffer.alloc(FRAME_SIZE * 2);
-            pcmBuffer.copy(
-              frameBuffer,
-              0,
-              0,
-              Math.min(pcmBuffer.length, FRAME_SIZE * 2),
-            );
-
-            const frame = new Int16Array(FRAME_SIZE);
-
-            // Copy from the buffer view to our frame
-            const srcView = new Int16Array(
-              frameBuffer.buffer,
-              frameBuffer.byteOffset,
-              FRAME_SIZE,
-            );
-
-            frame.set(srcView);
-            audioBuffer.push(frame);
-          }
-
-          processingComplete = true;
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      });
-
-      ffmpeg.on('error', (err) => {
-        reject(new Error(`FFmpeg process error: ${err.message}`));
-      });
-    });
-
-    try {
-      // Wait for audio processing to complete (or at least start building the buffer)
-      await Promise.race([
-        processingPromise.catch((err) => {
-          elizaLogger.error('[SttTtsPlugin] Processing error:', err);
-        }),
-        // Also wait for a minimum buffer to build up before starting playback
-        new Promise<void>((resolve) => {
-          const checkBuffer = () => {
-            if (audioBuffer.length > 10 || signal.aborted) {
-              resolve();
-            } else {
-              setTimeout(checkBuffer, 50);
-            }
-          };
-          checkBuffer();
-        }),
-      ]);
-
-      // Stream the audio frames with proper timing
-      let frameIndex = 0;
-      const startTime = Date.now();
-
-      while (
-        (frameIndex < audioBuffer.length || !processingComplete) &&
-        !signal.aborted
-      ) {
-        // If we've played all available frames but processing isn't complete, wait for more
-        if (frameIndex >= audioBuffer.length && !processingComplete) {
-          await new Promise<void>((resolve) => {
-            const waitForMoreFrames = () => {
-              if (
-                frameIndex < audioBuffer.length ||
-                processingComplete ||
-                signal.aborted
-              ) {
-                resolve();
-              } else {
-                setTimeout(waitForMoreFrames, 20);
-              }
-            };
-            waitForMoreFrames();
-          });
-
-          // If we're still out of frames after waiting, exit the loop
-          if (frameIndex >= audioBuffer.length) {
-            break;
-          }
-        }
-
-        // Calculate the ideal playback time for this frame
-        const idealPlaybackTime = startTime + frameIndex * FRAME_DURATION_MS;
-        const currentTime = Date.now();
-
-        // Adjust timing if we're behind or ahead
-        if (currentTime < idealPlaybackTime) {
-          // We're ahead of schedule, wait until the right time
-          await new Promise((r) =>
-            setTimeout(r, idealPlaybackTime - currentTime),
-          );
-        } else if (currentTime > idealPlaybackTime + 100) {
-          // We're significantly behind, skip frames to catch up
-          const framesToSkip = Math.floor(
-            (currentTime - idealPlaybackTime) / FRAME_DURATION_MS,
-          );
-          if (framesToSkip > 0) {
-            elizaLogger.log(
-              `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`,
-            );
-            frameIndex += framesToSkip;
-            continue;
-          }
-        }
-
-        // Get the next frame
-        const frame = audioBuffer[frameIndex];
-
-        // Send to Janus
-        try {
-          await this.streamChunkToJanus(frame, SAMPLE_RATE);
-        } catch (error) {
-          elizaLogger.error(
-            '[SttTtsPlugin] Error sending frame to Janus:',
-            error,
-          );
-        }
-
-        frameIndex++;
-      }
-
-      // Wait for any remaining processing to complete
-      await processingPromise;
-      await elevenLabsPromise;
-
-      elizaLogger.log(
-        `[SttTtsPlugin] Audio streaming completed: ${audioBuffer.length} frames played`,
-      );
-    } catch (error) {
-      if (signal.aborted) {
-        elizaLogger.log('[SttTtsPlugin] Audio streaming aborted');
-      } else {
-        elizaLogger.error('[SttTtsPlugin] Audio streaming error:', error);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Modified ElevenLabs TTS function that streams the response to a writable stream
-   * instead of waiting for the full response
-   */
-  private async elevenLabsTtsStreaming(
-    text: string,
-    outputStream: NodeJS.WritableStream,
-    signal: AbortSignal,
-  ): Promise<void> {
-    try {
-      if (!this.elevenLabsApiKey) {
-        throw new Error('[SttTtsPlugin] No ElevenLabs API key');
-      }
-
-      // Set up ElevenLabs API request
-      const apiKey = this.elevenLabsApiKey;
-      const voiceId = this.voiceId;
-
-      // Use the streaming endpoint
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
-
-      elizaLogger.log(
-        `[SttTtsPlugin] Starting ElevenLabs streaming TTS request`,
-      );
-
-      // Make the API request
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          Accept: 'audio/mpeg',
-          'Content-Type': 'application/json',
-          'xi-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          text,
-          model_id: this.elevenLabsModel,
-          voice_settings: {
-            stability: 0.4,
-            similarity_boost: 0.8,
-          },
-        }),
-        signal,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `ElevenLabs API error: ${response.status} ${response.statusText} - ${errorText}`,
-        );
-      }
-
-      if (!response.body) {
-        throw new Error('Response body is null');
-      }
-
-      elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs response received, streaming to FFmpeg`,
-      );
-
-      // Stream the response directly to our output stream
-      const reader = response.body.getReader();
-
-      let done = false;
-      let bytesReceived = 0;
-
-      while (!done && !signal.aborted) {
-        const { value, done: readerDone } = await reader.read();
-        done = readerDone;
-
-        if (value && !signal.aborted) {
-          bytesReceived += value.length;
-
-          // Write chunk to our stream
-          outputStream.write(Buffer.from(value));
-
-          // Log progress periodically
-          if (bytesReceived % 10000 < 1000) {
-            elizaLogger.log(
-              `[SttTtsPlugin] Streaming TTS: ${bytesReceived} bytes received`,
-            );
-          }
-        }
-      }
-
-      // End the stream when done
-      outputStream.end();
-      elizaLogger.log(
-        `[SttTtsPlugin] ElevenLabs streaming completed: ${bytesReceived} total bytes`,
-      );
-    } catch (error) {
-      if (error.name === 'AbortError') {
-        elizaLogger.log('[SttTtsPlugin] ElevenLabs request aborted');
-      } else {
-        elizaLogger.error('[SttTtsPlugin] ElevenLabs streaming error:', error);
-      }
-
-      // Make sure to end the stream on error
-      outputStream.end();
-      throw error;
     }
   }
 
@@ -1459,7 +1472,6 @@ export class SttTtsPlugin implements Plugin {
           // If we have more text than before, emit the difference
           if (capturedText.length > textValue.length) {
             const newText = capturedText.substring(textValue.length);
-            console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit('stream-chunk', newText);
             textValue = capturedText;
           }
@@ -1493,7 +1505,6 @@ export class SttTtsPlugin implements Plugin {
               // If we have a text field, emit any new content
               if (parsed.text && parsed.text.length > textValue.length) {
                 const newText = parsed.text.substring(textValue.length);
-                console.log(`Time took for emitting ${Date.now() - start}`);
                 this.eventEmitter.emit('stream-chunk', newText);
                 textValue = parsed.text;
               }
@@ -1530,12 +1541,10 @@ export class SttTtsPlugin implements Plugin {
             console.log(`Time took for emitting ${Date.now() - start}`);
             this.eventEmitter.emit('stream-chunk', parsed.text);
           } else {
-            console.log(`Time took for emitting ${Date.now() - start}`);
             // No text field found, emit the whole buffer as fallback
             this.eventEmitter.emit('stream-chunk', jsonBuffer);
           }
         } else {
-          console.log(`Time took for emitting ${Date.now() - start}`);
           // No valid JSON found, emit the whole buffer as fallback
           this.eventEmitter.emit('stream-chunk', jsonBuffer);
         }
