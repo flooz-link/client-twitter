@@ -3042,6 +3042,21 @@ var SttTtsPlugin = class {
   inactivityDuration = 500;
   // ms of inactivity before flushing buffer
   lastTranscriptionTime = /* @__PURE__ */ new Map();
+  // Smart text buffering for TTS
+  textBuffer = "";
+  textBufferTimeout = null;
+  MIN_TTS_BUFFER_SIZE = 20;
+  // Minimum characters before sending to TTS
+  MAX_TTS_BUFFER_SIZE = 150;
+  // Maximum buffer size to prevent too long chunks
+  TTS_BUFFER_TIMEOUT = 500;
+  // ms to wait before flushing buffer if no natural breaks
+  // Audio processing system
+  audioDataBuffer = [];
+  isProcessingAudioData = false;
+  AUDIO_PROCESSING_INTERVAL = 100;
+  // ms between audio processing checks
+  audioProcessingTimer = null;
   init(params) {
     var _a, _b;
     elizaLogger6.log("[SttTtsPlugin] init => Space fully ready. Subscribing to events.");
@@ -3075,6 +3090,7 @@ var SttTtsPlugin = class {
       baseURL: this.grokBaseUrl
     });
     this.initializeDeepgram();
+    this.initAudioProcessing();
   }
   initializeDeepgram() {
     try {
@@ -3153,6 +3169,50 @@ var SttTtsPlugin = class {
     }
   }
   /**
+   * Initialize the audio processing system
+   */
+  initAudioProcessing() {
+    if (this.audioProcessingTimer) {
+      clearInterval(this.audioProcessingTimer);
+    }
+    this.audioProcessingTimer = setInterval(() => {
+      this.processAudioDataBuffer();
+    }, this.AUDIO_PROCESSING_INTERVAL);
+    console.log("[SttTtsPlugin] Audio processing system initialized");
+  }
+  /**
+   * Process the audio data buffer
+   */
+  async processAudioDataBuffer() {
+    if (this.isProcessingAudioData || this.audioDataBuffer.length === 0) {
+      return;
+    }
+    try {
+      this.isProcessingAudioData = true;
+      const frames = [...this.audioDataBuffer];
+      this.audioDataBuffer = [];
+      if (frames.length === 0) {
+        return;
+      }
+      const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
+      console.log(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
+      const combinedBuffer = new Int16Array(totalLength);
+      let offset = 0;
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        combinedBuffer.set(frame, offset);
+        offset += frame.length;
+      }
+      if (this.janus) {
+        await this.janus.pushLocalAudio(combinedBuffer, 48e3);
+      }
+    } catch (err) {
+      console.error("[SttTtsPlugin] Error processing audio data buffer:", err);
+    } finally {
+      this.isProcessingAudioData = false;
+    }
+  }
+  /**
    * Called whenever we receive PCM from a speaker
    */
   onAudioData(data) {
@@ -3177,7 +3237,7 @@ var SttTtsPlugin = class {
           if (data.samples.length === 0 || isSilent) {
             return;
           }
-          this.socket.send(data.samples.buffer);
+          this.audioDataBuffer.push(data.samples);
         }
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
@@ -3290,14 +3350,24 @@ var SttTtsPlugin = class {
           return;
         }
         console.log(`[SttTtsPlugin] Processing stream chunk: "${chunk}"`);
-        this.speakText(chunk);
+        this.bufferTextForTTS(chunk, streamId);
       });
       this.eventEmitter.once("stream-end", (endStreamId) => {
         if (endStreamId !== streamId) {
           console.log("[SttTtsPlugin] Ignoring stream-end from different stream", endStreamId);
           return;
         }
-        console.log("[SttTtsPlugin] Stream ended, removing listeners");
+        console.log("[SttTtsPlugin] Stream ended, flushing any remaining buffered text");
+        if (this.textBuffer.length > 0) {
+          console.log(`[SttTtsPlugin] Flushing final text buffer: "${this.textBuffer}"`);
+          this.speakText(this.textBuffer);
+          this.textBuffer = "";
+        }
+        if (this.textBufferTimeout) {
+          clearTimeout(this.textBufferTimeout);
+          this.textBufferTimeout = null;
+        }
+        console.log("[SttTtsPlugin] Removing event listeners");
         this.eventEmitter.removeAllListeners("stream-chunk");
         this.eventEmitter.removeAllListeners("stream-end");
       });
@@ -3306,6 +3376,41 @@ var SttTtsPlugin = class {
       elizaLogger6.error("[SttTtsPlugin] processTranscription error:", error);
     } finally {
       this.isProcessingAudio = false;
+    }
+  }
+  /**
+   * Smart text buffering for TTS
+   * This buffers text until we have a natural break point or enough characters
+   */
+  bufferTextForTTS(text, streamId) {
+    this.textBuffer += text;
+    if (this.textBufferTimeout) {
+      clearTimeout(this.textBufferTimeout);
+      this.textBufferTimeout = null;
+    }
+    const flushBuffer = () => {
+      if (this.textBuffer.length > 0) {
+        console.log(`[SttTtsPlugin] Flushing text buffer to TTS: "${this.textBuffer.substring(0, 50)}${this.textBuffer.length > 50 ? "..." : ""}"`);
+        this.speakText(this.textBuffer);
+        this.textBuffer = "";
+      }
+    };
+    const hasStrongPunctuation = /[.!?](\s|$)/.test(this.textBuffer);
+    const hasMediumPunctuation = /[;:](\s|$)/.test(this.textBuffer);
+    const hasWeakPunctuation = /[,](\s|$)/.test(this.textBuffer);
+    if (
+      // Strong punctuation (end of sentence) and enough characters
+      hasStrongPunctuation && this.textBuffer.length >= 10 || // Medium punctuation and enough characters
+      hasMediumPunctuation && this.textBuffer.length >= 15 || // Weak punctuation and enough characters
+      hasWeakPunctuation && this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE || // Buffer getting too large
+      this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
+    ) {
+      flushBuffer();
+    } else {
+      this.textBufferTimeout = setTimeout(() => {
+        console.log("[SttTtsPlugin] Buffer timeout reached, flushing buffer");
+        flushBuffer();
+      }, this.TTS_BUFFER_TIMEOUT);
     }
   }
   /**

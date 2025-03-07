@@ -88,6 +88,19 @@ export class SttTtsPlugin implements Plugin {
   private inactivityDuration = 500; // ms of inactivity before flushing buffer
   private lastTranscriptionTime: Map<string, number> = new Map();
 
+  // Smart text buffering for TTS
+  private textBuffer = '';
+  private textBufferTimeout: NodeJS.Timeout | null = null;
+  private readonly MIN_TTS_BUFFER_SIZE = 20; // Minimum characters before sending to TTS
+  private readonly MAX_TTS_BUFFER_SIZE = 150; // Maximum buffer size to prevent too long chunks
+  private readonly TTS_BUFFER_TIMEOUT = 500; // ms to wait before flushing buffer if no natural breaks
+
+  // Audio processing system
+  private audioDataBuffer: Int16Array[] = [];
+  private isProcessingAudioData = false;
+  private readonly AUDIO_PROCESSING_INTERVAL = 100; // ms between audio processing checks
+  private audioProcessingTimer: NodeJS.Timeout | null = null;
+
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
     elizaLogger.log('[SttTtsPlugin] init => Space fully ready. Subscribing to events.');
 
@@ -126,6 +139,9 @@ export class SttTtsPlugin implements Plugin {
 
     // Initialize Deepgram
     this.initializeDeepgram();
+
+    // Initialize audio processing system
+    this.initAudioProcessing();
   }
 
   private initializeDeepgram(): void {
@@ -225,6 +241,72 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
+   * Initialize the audio processing system
+   */
+  private initAudioProcessing(): void {
+    // Clear any existing timer
+    if (this.audioProcessingTimer) {
+      clearInterval(this.audioProcessingTimer);
+    }
+    
+    // Start a periodic timer to process buffered audio data
+    this.audioProcessingTimer = setInterval(() => {
+      this.processAudioDataBuffer();
+    }, this.AUDIO_PROCESSING_INTERVAL);
+    
+    console.log('[SttTtsPlugin] Audio processing system initialized');
+  }
+
+  /**
+   * Process the audio data buffer
+   */
+  private async processAudioDataBuffer(): Promise<void> {
+    // Don't process if already processing or no data
+    if (this.isProcessingAudioData || this.audioDataBuffer.length === 0) {
+      return;
+    }
+    
+    try {
+      this.isProcessingAudioData = true;
+      
+      // Get all frames from the buffer
+      const frames = [...this.audioDataBuffer];
+      this.audioDataBuffer = [];
+      
+      // Skip if no frames
+      if (frames.length === 0) {
+        return;
+      }
+      
+      // Calculate total length
+      const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
+      console.log(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
+      
+      // Create a combined buffer for smoother audio
+      const combinedBuffer = new Int16Array(totalLength);
+      let offset = 0;
+      
+      // Copy frames with crossfade between adjacent frames to reduce clicks/pops
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        
+        // Simple copy for now, could implement crossfade for smoother transitions
+        combinedBuffer.set(frame, offset);
+        offset += frame.length;
+      }
+      
+      // Now send to Janus directly, bypassing the per-chunk processing
+      if (this.janus) {
+        await this.janus.pushLocalAudio(combinedBuffer, 48000);
+      }
+    } catch (err) {
+      console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
+    } finally {
+      this.isProcessingAudioData = false;
+    }
+  }
+
+  /**
    * Called whenever we receive PCM from a speaker
    */
   public onAudioData(data: AudioDataWithUser): void {
@@ -260,7 +342,7 @@ export class SttTtsPlugin implements Plugin {
 
           // Since the audio data is already in Int16Array format, send it directly
           // No need for conversion from Float32Array
-          this.socket.send(data.samples.buffer);
+          this.audioDataBuffer.push(data.samples);
         }
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
@@ -421,7 +503,7 @@ export class SttTtsPlugin implements Plugin {
         
         console.log(`[SttTtsPlugin] Processing stream chunk: "${chunk}"`);
         // Add the text to the TTS queue for processing
-        this.speakText(chunk);
+        this.bufferTextForTTS(chunk, streamId);
       });
       
       // Clean up when the stream ends
@@ -432,7 +514,22 @@ export class SttTtsPlugin implements Plugin {
           return;
         }
         
-        console.log('[SttTtsPlugin] Stream ended, removing listeners');
+        console.log('[SttTtsPlugin] Stream ended, flushing any remaining buffered text');
+        
+        // Flush any remaining text in the buffer
+        if (this.textBuffer.length > 0) {
+          console.log(`[SttTtsPlugin] Flushing final text buffer: "${this.textBuffer}"`);
+          this.speakText(this.textBuffer);
+          this.textBuffer = '';
+        }
+        
+        // Clear any pending timeout
+        if (this.textBufferTimeout) {
+          clearTimeout(this.textBufferTimeout);
+          this.textBufferTimeout = null;
+        }
+        
+        console.log('[SttTtsPlugin] Removing event listeners');
         // Clean up the listeners when we're done
         this.eventEmitter.removeAllListeners('stream-chunk');
         this.eventEmitter.removeAllListeners('stream-end');
@@ -444,6 +541,55 @@ export class SttTtsPlugin implements Plugin {
       elizaLogger.error('[SttTtsPlugin] processTranscription error:', error);
     } finally {
       this.isProcessingAudio = false;
+    }
+  }
+
+  /**
+   * Smart text buffering for TTS
+   * This buffers text until we have a natural break point or enough characters
+   */
+  private bufferTextForTTS(text: string, streamId: string): void {
+    // Append new text to buffer
+    this.textBuffer += text;
+    
+    // Clear any existing timeout
+    if (this.textBufferTimeout) {
+      clearTimeout(this.textBufferTimeout);
+      this.textBufferTimeout = null;
+    }
+    
+    // Function to flush the buffer to TTS
+    const flushBuffer = () => {
+      if (this.textBuffer.length > 0) {
+        console.log(`[SttTtsPlugin] Flushing text buffer to TTS: "${this.textBuffer.substring(0, 50)}${this.textBuffer.length > 50 ? '...' : ''}"`);
+        this.speakText(this.textBuffer);
+        this.textBuffer = '';
+      }
+    };
+    
+    // Determine if we have a natural break point
+    const hasStrongPunctuation = /[.!?](\s|$)/.test(this.textBuffer);
+    const hasMediumPunctuation = /[;:](\s|$)/.test(this.textBuffer);
+    const hasWeakPunctuation = /[,](\s|$)/.test(this.textBuffer);
+    
+    // Decision logic for when to flush the buffer
+    if (
+      // Strong punctuation (end of sentence) and enough characters
+      (hasStrongPunctuation && this.textBuffer.length >= 10) ||
+      // Medium punctuation and enough characters
+      (hasMediumPunctuation && this.textBuffer.length >= 15) ||
+      // Weak punctuation and enough characters
+      (hasWeakPunctuation && this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE) ||
+      // Buffer getting too large
+      this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
+    ) {
+      flushBuffer();
+    } else {
+      // Set a timeout to flush the buffer if no more text arrives
+      this.textBufferTimeout = setTimeout(() => {
+        console.log('[SttTtsPlugin] Buffer timeout reached, flushing buffer');
+        flushBuffer();
+      }, this.TTS_BUFFER_TIMEOUT);
     }
   }
 
