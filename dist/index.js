@@ -3413,14 +3413,10 @@ var SttTtsPlugin = class {
       this.clearUserTimeouts(userId);
       if (isFinal) {
         this.processBufferedTranscription(userId);
-        const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-        this.eventEmitter.emit("transcription-complete", userId, finalTranscript);
       } else {
         const timeout = setTimeout(() => {
           elizaLogger6.log(`[SttTtsPlugin] Processing transcript due to timeout: ${this.transcriptBuffer.get(userId)}`);
           this.processBufferedTranscription(userId);
-          const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-          this.eventEmitter.emit("transcription-complete", userId, finalTranscript);
         }, this.timeoutDuration);
         this.processingTimeout.set(userId, timeout);
         const inactivityTimeout = setTimeout(() => {
@@ -3429,8 +3425,6 @@ var SttTtsPlugin = class {
           if (elapsed >= this.inactivityDuration && this.transcriptBuffer.has(userId)) {
             elizaLogger6.log(`[SttTtsPlugin] Processing transcript due to inactivity (${elapsed}ms): ${this.transcriptBuffer.get(userId)}`);
             this.processBufferedTranscription(userId);
-            const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-            this.eventEmitter.emit("transcription-complete", userId, finalTranscript);
           }
         }, this.inactivityDuration);
         this.inactivityTimer.set(userId, inactivityTimeout);
@@ -3604,7 +3598,8 @@ var SttTtsPlugin = class {
    * Stream TTS to Janus
    */
   async streamTtsToJanus(text, signal) {
-    elizaLogger6.log(`[SttTtsPlugin] Streaming text to Janus: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`);
+    const textWithPauses = text.replace(/\.\s+/g, '. <break time="30ms"/> ').replace(/,\s+/g, ', <break time="5ms"/> ').replace(/\?\s+/g, '? <break time="25ms"/> ').replace(/!\s+/g, '! <break time="25ms"/> ').replace(/;\s+/g, '; <break time="15ms"/> ').replace(/:\s+/g, ': <break time="10ms"/> ');
+    elizaLogger6.log(`[SttTtsPlugin] Streaming text to Janus: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? "..." : ""}"`);
     if (!this.janus) {
       elizaLogger6.error("[SttTtsPlugin] No Janus client available for streaming TTS");
       return;
@@ -3724,7 +3719,7 @@ var SttTtsPlugin = class {
           "xi-api-key": this.elevenLabsApiKey || ""
         },
         body: JSON.stringify({
-          text,
+          text: textWithPauses,
           model_id: this.elevenLabsModel,
           voice_settings: { stability: 0.5, similarity_boost: 0.75 }
         })

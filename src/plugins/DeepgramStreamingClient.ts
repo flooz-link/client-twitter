@@ -492,7 +492,7 @@ export class SttTtsPlugin implements Plugin {
       
       // Calculate total length
       const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
-      elizaLogger.debug(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
+      console.log(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
       
       // Create a combined buffer for smoother audio
       const combinedBuffer = new Int16Array(totalLength);
@@ -507,59 +507,15 @@ export class SttTtsPlugin implements Plugin {
         offset += frame.length;
       }
       
-      // Now send to Janus - ensuring we send the correct frame size (480 samples)
+      // Now send to Janus directly, bypassing the per-chunk processing
       if (this.janus) {
-        const JANUS_FRAME_SIZE = 480; // Janus expects frames of 480 samples
-        
-        // Process the combined buffer in chunks of the correct frame size
-        for (let i = 0; i < combinedBuffer.length; i += JANUS_FRAME_SIZE) {
-          // Create a slice of the appropriate size
-          const frameSize = Math.min(JANUS_FRAME_SIZE, combinedBuffer.length - i);
-          const frame = combinedBuffer.subarray(i, i + frameSize);
-          
-          // Only send complete frames of the expected size
-          if (frame.length === JANUS_FRAME_SIZE) {
-            try {
-              await this.janus.pushLocalAudio(frame, 48000);
-            } catch (err) {
-              elizaLogger.error(`[SttTtsPlugin] Error pushing audio frame to Janus:`, err);
-              // Continue processing other frames even if one fails
-            }
-          } else if (frame.length > 0) {
-            // Handle partial frame at the end by padding to expected size
-            const paddedFrame = new Int16Array(JANUS_FRAME_SIZE);
-            paddedFrame.set(frame);
-            // Fill the rest with silence (zeros)
-            for (let j = frame.length; j < JANUS_FRAME_SIZE; j++) {
-              paddedFrame[j] = 0;
-            }
-            
-            try {
-              await this.janus.pushLocalAudio(paddedFrame, 48000);
-            } catch (err) {
-              elizaLogger.error(`[SttTtsPlugin] Error pushing padded audio frame to Janus:`, err);
-            }
-          }
-        }
-        
-        elizaLogger.debug(`[SttTtsPlugin] Sent ${Math.ceil(combinedBuffer.length / JANUS_FRAME_SIZE)} frames to Janus`);
+        await this.janus.pushLocalAudio(combinedBuffer, 48000);
       }
     } catch (err) {
-      elizaLogger.error('[SttTtsPlugin] Error processing audio data buffer:', err);
+      console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
     } finally {
       this.isProcessingAudioData = false;
     }
-  }
-
-  /**
-   * Calculate the energy of an audio frame
-   */
-  private calculateEnergy(samples: Int16Array): number {
-    let sum = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sum += Math.abs(samples[i]);
-    }
-    return sum / samples.length;
   }
 
   /**
@@ -584,8 +540,10 @@ export class SttTtsPlugin implements Plugin {
 
     // Make sure socket is ready before sending data
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
+
       try {
         if (this.botProfile.id !== data.userId) {
+
           // Check if buffer is empty or contains no voice
           const energy = this.calculateEnergy(data.samples);
           const isSilent = energy < 50; // Adjust this threshold based on your audio environment
@@ -599,9 +557,17 @@ export class SttTtsPlugin implements Plugin {
           this.audioDataBuffer.push(data.samples);
         }
       } catch (error) {
-        elizaLogger.error("Error sending audio to Deepgram:", error);
+        console.error("Error sending audio to Deepgram:", error);
       }
     }
+  }
+
+  private calculateEnergy(samples: Int16Array): number {
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sum += Math.abs(samples[i]);
+    }
+    return sum / samples.length;
   }
 
   /**
@@ -641,19 +607,11 @@ export class SttTtsPlugin implements Plugin {
       // If final, process immediately
       if (isFinal) {
         this.processBufferedTranscription(userId);
-        
-        // Emit transcription-complete event to resolve any pending promises
-        const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-        this.eventEmitter.emit('transcription-complete', userId, finalTranscript);
       } else {
         // Otherwise set a timeout to process if no utterance end is received
         const timeout = setTimeout(() => {
           elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout: ${this.transcriptBuffer.get(userId)}`);
           this.processBufferedTranscription(userId);
-          
-          // Emit transcription-complete event for timeout case
-          const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-          this.eventEmitter.emit('transcription-complete', userId, finalTranscript);
         }, this.timeoutDuration);
         
         this.processingTimeout.set(userId, timeout);
@@ -666,10 +624,6 @@ export class SttTtsPlugin implements Plugin {
           if (elapsed >= this.inactivityDuration && this.transcriptBuffer.has(userId)) {
             elizaLogger.log(`[SttTtsPlugin] Processing transcript due to inactivity (${elapsed}ms): ${this.transcriptBuffer.get(userId)}`);
             this.processBufferedTranscription(userId);
-            
-            // Emit transcription-complete event for inactivity case
-            const finalTranscript = this.transcriptBuffer.get(userId) || transcript;
-            this.eventEmitter.emit('transcription-complete', userId, finalTranscript);
           }
         }, this.inactivityDuration);
         
@@ -900,7 +854,16 @@ export class SttTtsPlugin implements Plugin {
    * Stream TTS to Janus
    */
   private async streamTtsToJanus(text: string, signal: AbortSignal): Promise<void> {
-    elizaLogger.log(`[SttTtsPlugin] Streaming text to Janus: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+    // Add natural pauses at punctuation to make speech sound more natural
+    const textWithPauses = text
+      .replace(/\.\s+/g, '. <break time="30ms"/> ')
+      .replace(/,\s+/g, ', <break time="5ms"/> ')
+      .replace(/\?\s+/g, '? <break time="25ms"/> ')
+      .replace(/!\s+/g, '! <break time="25ms"/> ')
+      .replace(/;\s+/g, '; <break time="15ms"/> ')
+      .replace(/:\s+/g, ': <break time="10ms"/> ');
+    
+    elizaLogger.log(`[SttTtsPlugin] Streaming text to Janus: "${textWithPauses.substring(0, 50)}${textWithPauses.length > 50 ? '...' : ''}"`);
 
     if (!this.janus) {
       elizaLogger.error('[SttTtsPlugin] No Janus client available for streaming TTS');
@@ -1040,7 +1003,7 @@ export class SttTtsPlugin implements Plugin {
           'xi-api-key': this.elevenLabsApiKey || '',
         },
         body: JSON.stringify({
-          text,
+          text: textWithPauses,
           model_id: this.elevenLabsModel,
           voice_settings: { stability: 0.5, similarity_boost: 0.75 },
         }),
