@@ -140,7 +140,10 @@ export class SttTtsPlugin implements Plugin {
           encoding: "linear16",  // PCM 16-bit
           sample_rate: 48000,    // Adjust to match your Janus audio configuration
           channels: 1,           // Mono audio
-          interim_results: true
+          interim_results: true,
+          utterance_end_ms:1000,
+          vad_events:true,          
+          endpointing:300 //Time in milliseconds of silence to wait for before finalizing speech
         });
         
         console.log("Deepgram socket created");
@@ -157,6 +160,13 @@ export class SttTtsPlugin implements Plugin {
         if (data && this.lastSpeaker) {
           this.handleTranscription(data?.channel?.alternatives?.[0]?.transcript, data.is_final, this.lastSpeaker);
         }
+      });
+
+      this.socket.addListener(LiveTranscriptionEvents.UtteranceEnd, (data: TranscriptData) => {
+        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript}`);
+        // if (data && this.lastSpeaker) {
+        //   this.handleTranscription(data?.channel?.alternatives?.[0]?.transcript, data.is_final, this.lastSpeaker);
+        // }
       });
 
       this.socket.addListener(LiveTranscriptionEvents.Close, async (test) => {
