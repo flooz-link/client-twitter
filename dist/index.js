@@ -3033,6 +3033,15 @@ var SttTtsPlugin = class {
   keepAlive = null;
   deepgramApiKey;
   botProfile;
+  // Added for transcript buffering
+  transcriptBuffer = /* @__PURE__ */ new Map();
+  processingTimeout = /* @__PURE__ */ new Map();
+  timeoutDuration = 2e3;
+  // ms to wait before processing if no utterance end
+  inactivityTimer = /* @__PURE__ */ new Map();
+  inactivityDuration = 500;
+  // ms of inactivity before flushing buffer
+  lastTranscriptionTime = /* @__PURE__ */ new Map();
   init(params) {
     var _a, _b;
     elizaLogger6.log("[SttTtsPlugin] init => Space fully ready. Subscribing to events.");
@@ -3089,7 +3098,7 @@ var SttTtsPlugin = class {
         utterance_end_ms: 1e3,
         vad_events: true,
         endpointing: 300
-        //Time in milliseconds of silence to wait for before finalizing speech
+        // Time in milliseconds of silence to wait for before finalizing speech
       });
       console.log("Deepgram socket created");
       if (this.keepAlive) clearInterval(this.keepAlive);
@@ -3104,8 +3113,15 @@ var SttTtsPlugin = class {
         }
       });
       this.socket.addListener(LiveTranscriptionEvents.UtteranceEnd, (data) => {
-        var _a, _b, _c;
-        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${(_c = (_b = (_a = data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript}`);
+        var _a, _b, _c, _d;
+        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${(_c = (_b = (_a = data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript} data: ${JSON.stringify(data)}`);
+        if (data && this.lastSpeaker) {
+          const hasBuffer = this.transcriptBuffer.has(this.lastSpeaker) && isNotEmpty((_d = this.transcriptBuffer.get(this.lastSpeaker)) == null ? void 0 : _d.trim());
+          if (hasBuffer) {
+            elizaLogger6.log(`[SttTtsPlugin] Processing due to utterance end: ${this.transcriptBuffer.get(this.lastSpeaker)}`);
+            this.processBufferedTranscription(this.lastSpeaker);
+          }
+        }
       });
       this.socket.addListener(LiveTranscriptionEvents.Close, async (test) => {
         console.log("deepgram: disconnected", test);
@@ -3180,11 +3196,63 @@ var SttTtsPlugin = class {
    */
   handleTranscription(transcript, isFinal, userId) {
     elizaLogger6.log(`[SttTtsPlugin] Transcription (${isFinal ? "final" : "interim"}): ${transcript} for user ${userId}`);
+    this.lastTranscriptionTime.set(userId, Date.now());
     if (this.isSpeaking && isEmpty(transcript == null ? void 0 : transcript.trim())) {
       this.stopSpeaking();
     }
-    if (isFinal && !isNotEmpty(transcript == null ? void 0 : transcript.trim())) {
-      this.processTranscription(userId, transcript).catch(
+    const currentBuffer = this.transcriptBuffer.get(userId) || "";
+    if (isNotEmpty(transcript == null ? void 0 : transcript.trim())) {
+      if (!isFinal && (currentBuffer.includes(transcript) || transcript.includes(currentBuffer))) {
+        this.transcriptBuffer.set(userId, transcript);
+      } else if (transcript !== currentBuffer) {
+        const separator = currentBuffer && !currentBuffer.endsWith(" ") && !transcript.startsWith(" ") ? " " : "";
+        this.transcriptBuffer.set(userId, currentBuffer + separator + transcript);
+      }
+      this.clearUserTimeouts(userId);
+      if (isFinal) {
+        this.processBufferedTranscription(userId);
+      } else {
+        const timeout = setTimeout(() => {
+          elizaLogger6.log(`[SttTtsPlugin] Processing transcript due to timeout: ${this.transcriptBuffer.get(userId)}`);
+          this.processBufferedTranscription(userId);
+        }, this.timeoutDuration);
+        this.processingTimeout.set(userId, timeout);
+        const inactivityTimeout = setTimeout(() => {
+          const lastTime = this.lastTranscriptionTime.get(userId) || 0;
+          const elapsed = Date.now() - lastTime;
+          if (elapsed >= this.inactivityDuration && this.transcriptBuffer.has(userId)) {
+            elizaLogger6.log(`[SttTtsPlugin] Processing transcript due to inactivity (${elapsed}ms): ${this.transcriptBuffer.get(userId)}`);
+            this.processBufferedTranscription(userId);
+          }
+        }, this.inactivityDuration);
+        this.inactivityTimer.set(userId, inactivityTimeout);
+      }
+    }
+  }
+  /**
+   * Clear all timeouts for a user
+   */
+  clearUserTimeouts(userId) {
+    if (this.processingTimeout.has(userId)) {
+      clearTimeout(this.processingTimeout.get(userId));
+      this.processingTimeout.delete(userId);
+    }
+    if (this.inactivityTimer.has(userId)) {
+      clearTimeout(this.inactivityTimer.get(userId));
+      this.inactivityTimer.delete(userId);
+    }
+  }
+  /**
+   * Process the buffered transcription for a user
+   */
+  processBufferedTranscription(userId) {
+    const bufferedTranscript = this.transcriptBuffer.get(userId);
+    this.transcriptBuffer.delete(userId);
+    this.clearUserTimeouts(userId);
+    this.lastTranscriptionTime.delete(userId);
+    if (isNotEmpty(bufferedTranscript == null ? void 0 : bufferedTranscript.trim())) {
+      elizaLogger6.log(`[SttTtsPlugin] Processing buffered transcription: ${bufferedTranscript}`);
+      this.processTranscription(userId, bufferedTranscript).catch(
         (err) => elizaLogger6.error("[SttTtsPlugin] processTranscription error:", err)
       );
     }

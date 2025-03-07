@@ -45,7 +45,9 @@ type TranscriptData = {
   is_final: boolean;
 };
 
-
+/**
+ * Speech-to-text (Deepgram) + conversation + TTS (ElevenLabs)
+ */
 export class SttTtsPlugin implements Plugin {
   name = 'SttTtsPlugin';
   description = 'Speech-to-text (Deepgram) + conversation + TTS (ElevenLabs)';
@@ -74,11 +76,17 @@ export class SttTtsPlugin implements Plugin {
   private interruptionThreshold = 3000; // Energy threshold for detecting speech (configurable)
   private consecutiveFramesForInterruption = 5; // Number of consecutive frames to confirm interruption (e.g., 5 frames of 10ms each)
   private interruptionCounter = 0; // Counter for consecutive high-energy frames
-
   private keepAlive: NodeJS.Timeout | null = null;
   deepgramApiKey: any;
   private botProfile: TwitterProfile;
 
+  // Added for transcript buffering
+  private transcriptBuffer: Map<string, string> = new Map();
+  private processingTimeout: Map<string, NodeJS.Timeout> = new Map();
+  private timeoutDuration = 2000; // ms to wait before processing if no utterance end
+  private inactivityTimer: Map<string, NodeJS.Timeout> = new Map();
+  private inactivityDuration = 500; // ms of inactivity before flushing buffer
+  private lastTranscriptionTime: Map<string, number> = new Map();
 
   init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
     elizaLogger.log('[SttTtsPlugin] init => Space fully ready. Subscribing to events.');
@@ -120,40 +128,39 @@ export class SttTtsPlugin implements Plugin {
     this.initializeDeepgram();
   }
 
-
   private initializeDeepgram(): void {
     try {
       // Initialize Deepgram
-      this.deepgramApiKey = this.runtime.getSetting('DEEPGRAM_API_KEY');  
+      this.deepgramApiKey = this.runtime.getSetting('DEEPGRAM_API_KEY');
       console.log("Initializing Deepgram with API key:", this.deepgramApiKey);
       this.deepgram = createClient(this.deepgramApiKey);
-        
-        // Configure Deepgram with proper audio settings
-        // Note: Make sure these settings match your audio format from Janus
-        this.socket = this.deepgram.listen.live({
-          language: "en",
-          punctuate: true,
-          smart_format: false,
-          filler_words: true,
-          unknown_words: true,
-          model: "nova-3",
-          encoding: "linear16",  // PCM 16-bit
-          sample_rate: 48000,    // Adjust to match your Janus audio configuration
-          channels: 1,           // Mono audio
-          interim_results: true,
-          utterance_end_ms:1000,
-          vad_events:true,          
-          endpointing:300 //Time in milliseconds of silence to wait for before finalizing speech
-        });
-        
-        console.log("Deepgram socket created");
-        
-        if (this.keepAlive) clearInterval(this.keepAlive);
-        this.keepAlive = setInterval(() => {
-          this.socket.keepAlive();
-        }, 10 * 1000);
 
-          // Setup event listeners outside of the Open event to ensure they're registered
+      // Configure Deepgram with proper audio settings
+      // Note: Make sure these settings match your audio format from Janus
+      this.socket = this.deepgram.listen.live({
+        language: "en",
+        punctuate: true,
+        smart_format: false,
+        filler_words: true,
+        unknown_words: true,
+        model: "nova-3",
+        encoding: "linear16", // PCM 16-bit
+        sample_rate: 48000, // Adjust to match your Janus audio configuration
+        channels: 1, // Mono audio
+        interim_results: true,
+        utterance_end_ms: 1000,
+        vad_events: true,
+        endpointing: 300, // Time in milliseconds of silence to wait for before finalizing speech
+      });
+
+      console.log("Deepgram socket created");
+
+      if (this.keepAlive) clearInterval(this.keepAlive);
+      this.keepAlive = setInterval(() => {
+        this.socket.keepAlive();
+      }, 10 * 1000);
+
+      // Setup event listeners outside of the Open event to ensure they're registered
       // before any messages arrive
       this.socket.addListener(LiveTranscriptionEvents.Transcript, (data: TranscriptData) => {
         console.log(`deepgram: transcript received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript}`);
@@ -163,10 +170,18 @@ export class SttTtsPlugin implements Plugin {
       });
 
       this.socket.addListener(LiveTranscriptionEvents.UtteranceEnd, (data: TranscriptData) => {
-        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript}`);
-        // if (data && this.lastSpeaker) {
-        //   this.handleTranscription(data?.channel?.alternatives?.[0]?.transcript, data.is_final, this.lastSpeaker);
-        // }
+        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript} data: ${JSON.stringify(data)}`);
+        if (data && this.lastSpeaker) {
+          // Even if transcript is undefined in the utterance end event,
+          // we still want to process what's in the buffer
+          const hasBuffer = this.transcriptBuffer.has(this.lastSpeaker) && 
+                            isNotEmpty(this.transcriptBuffer.get(this.lastSpeaker)?.trim());
+          
+          if (hasBuffer) {
+            elizaLogger.log(`[SttTtsPlugin] Processing due to utterance end: ${this.transcriptBuffer.get(this.lastSpeaker)}`);
+            this.processBufferedTranscription(this.lastSpeaker);
+          }
+        }
       });
 
       this.socket.addListener(LiveTranscriptionEvents.Close, async (test) => {
@@ -192,22 +207,22 @@ export class SttTtsPlugin implements Plugin {
         console.log("deepgram: metadata received", JSON.stringify(data));
         this.eventEmitter.emit('metadata', data);
       });
-      
+
       // The Open event should be the last listener added
       this.socket.addListener(LiveTranscriptionEvents.Open, async () => {
         console.log("deepgram: connected successfully");
-        
+
         // Send a silent audio buffer to test the connection
         // const silentBuffer = new Int16Array(960).fill(0);
         // this.socket.send(silentBuffer.buffer);
-        
+
         console.log("deepgram: sent initial silent buffer to test connection");
       });
-  } catch(error) {
-    console.error("Error initializing Deepgram:", error);
-    throw error;
+    } catch (error) {
+      console.error("Error initializing Deepgram:", error);
+      throw error;
+    }
   }
-}
 
   /**
    * Called whenever we receive PCM from a speaker
@@ -225,24 +240,24 @@ export class SttTtsPlugin implements Plugin {
         this.interruptionCounter = 0;
       }
     }
-    
+
     // Update the last speaker
     this.lastSpeaker = data.userId;
-    
+
     // Make sure socket is ready before sending data
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
-      
+
       try {
         if (this.botProfile.id !== data.userId) {
-          
+
           // Check if buffer is empty or contains no voice
           const energy = this.calculateEnergy(data.samples);
           const isSilent = energy < 50; // Adjust this threshold based on your audio environment
-          
+
           if (data.samples.length === 0 || isSilent) {
             return;
           }
-          
+
           // Since the audio data is already in Int16Array format, send it directly
           // No need for conversion from Float32Array
           this.socket.send(data.samples.buffer);
@@ -250,7 +265,7 @@ export class SttTtsPlugin implements Plugin {
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
-    } 
+    }
   }
 
   private calculateEnergy(samples: Int16Array): number {
@@ -267,14 +282,94 @@ export class SttTtsPlugin implements Plugin {
   private handleTranscription(transcript: string, isFinal: boolean, userId: string): void {
     elizaLogger.log(`[SttTtsPlugin] Transcription (${isFinal ? 'final' : 'interim'}): ${transcript} for user ${userId}`);
 
+    // Update last transcription time
+    this.lastTranscriptionTime.set(userId, Date.now());
+
     // If the bot is speaking and any transcription is received, stop it
     if (this.isSpeaking && isEmpty(transcript?.trim())) {
       this.stopSpeaking();
     }
 
-    // Process final transcriptions for conversation
-    if (isFinal && !isNotEmpty(transcript?.trim())) {
-      this.processTranscription(userId, transcript).catch((err) =>
+    // Get the current buffer for this user or initialize an empty one
+    const currentBuffer = this.transcriptBuffer.get(userId) || '';
+    
+    // For non-empty transcripts, update the buffer
+    if (isNotEmpty(transcript?.trim())) {
+      // Update the buffer with the new transcript
+      // For interim results, replace the buffer
+      // For final results or significant changes, append to buffer
+      if (!isFinal && (currentBuffer.includes(transcript) || transcript.includes(currentBuffer))) {
+        // This is likely an incremental update, so replace the buffer
+        this.transcriptBuffer.set(userId, transcript);
+      } else if (transcript !== currentBuffer) {
+        // This is new content or a final result, so append with space if needed
+        const separator = currentBuffer && !currentBuffer.endsWith(' ') && !transcript.startsWith(' ') ? ' ' : '';
+        this.transcriptBuffer.set(userId, currentBuffer + separator + transcript);
+      }
+
+      // Clear any existing timeouts for this user
+      this.clearUserTimeouts(userId);
+
+      // If final, process immediately
+      if (isFinal) {
+        this.processBufferedTranscription(userId);
+      } else {
+        // Otherwise set a timeout to process if no utterance end is received
+        const timeout = setTimeout(() => {
+          elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout: ${this.transcriptBuffer.get(userId)}`);
+          this.processBufferedTranscription(userId);
+        }, this.timeoutDuration);
+        
+        this.processingTimeout.set(userId, timeout);
+        
+        // Set inactivity timer to flush buffer after a period of no new transcripts
+        const inactivityTimeout = setTimeout(() => {
+          const lastTime = this.lastTranscriptionTime.get(userId) || 0;
+          const elapsed = Date.now() - lastTime;
+          
+          if (elapsed >= this.inactivityDuration && this.transcriptBuffer.has(userId)) {
+            elizaLogger.log(`[SttTtsPlugin] Processing transcript due to inactivity (${elapsed}ms): ${this.transcriptBuffer.get(userId)}`);
+            this.processBufferedTranscription(userId);
+          }
+        }, this.inactivityDuration);
+        
+        this.inactivityTimer.set(userId, inactivityTimeout);
+      }
+    }
+  }
+
+  /**
+   * Clear all timeouts for a user
+   */
+  private clearUserTimeouts(userId: string): void {
+    // Clear processing timeout
+    if (this.processingTimeout.has(userId)) {
+      clearTimeout(this.processingTimeout.get(userId));
+      this.processingTimeout.delete(userId);
+    }
+    
+    // Clear inactivity timeout
+    if (this.inactivityTimer.has(userId)) {
+      clearTimeout(this.inactivityTimer.get(userId));
+      this.inactivityTimer.delete(userId);
+    }
+  }
+
+  /**
+   * Process the buffered transcription for a user
+   */
+  private processBufferedTranscription(userId: string): void {
+    const bufferedTranscript = this.transcriptBuffer.get(userId);
+    
+    // Clear the buffer and all timeouts for this user
+    this.transcriptBuffer.delete(userId);
+    this.clearUserTimeouts(userId);
+    this.lastTranscriptionTime.delete(userId);
+    
+    // Process if there's content in the buffer
+    if (isNotEmpty(bufferedTranscript?.trim())) {
+      elizaLogger.log(`[SttTtsPlugin] Processing buffered transcription: ${bufferedTranscript}`);
+      this.processTranscription(userId, bufferedTranscript).catch((err) =>
         elizaLogger.error('[SttTtsPlugin] processTranscription error:', err)
       );
     }
