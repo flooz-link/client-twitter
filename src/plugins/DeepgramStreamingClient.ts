@@ -492,7 +492,6 @@ export class SttTtsPlugin implements Plugin {
       
       // Calculate total length
       const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
-      console.log(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
       
       // Create a combined buffer for smoother audio
       const combinedBuffer = new Int16Array(totalLength);
@@ -528,9 +527,7 @@ export class SttTtsPlugin implements Plugin {
             const frame = new Int16Array(frameData); // Copy to new buffer with exact size
             
             try {
-              // Diagnostic logging to verify buffer length
-              console.log(`[SttTtsPlugin] Pushing frame to Janus: ${frame.length} samples, byteLength: ${frame.buffer.byteLength}`);
-              await this.janus.pushLocalAudio(frame, 48000);
+              this.janus.pushLocalAudio(frame, 48000);
             } catch (err) {
               console.error('[SttTtsPlugin] Error pushing audio frame to Janus:', err);
             }
