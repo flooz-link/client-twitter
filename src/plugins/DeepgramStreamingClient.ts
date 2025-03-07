@@ -599,7 +599,10 @@ export class SttTtsPlugin implements Plugin {
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
 
       try {
-        if (this.botProfile.id !== data.userId) {
+        // Skip bot's audio and also skip if this is the local user's audio (to prevent echo)
+        // The userId might be formatted differently for local users based on your implementation
+        const isLocalUser = data.userId.includes('local') || data.userId.startsWith('self-');
+        if (this.botProfile.id !== data.userId && !isLocalUser) {
 
           // Check if buffer is empty or contains no voice
           const energy = this.calculateEnergy(data.samples);
@@ -623,61 +626,56 @@ export class SttTtsPlugin implements Plugin {
    * Handle transcriptions from Deepgram
    */
   private handleTranscription(transcript: string, isFinal: boolean, userId: string): void {
-    elizaLogger.log(`[SttTtsPlugin] Transcription (${isFinal ? 'final' : 'interim'}): ${transcript} for user ${userId}`);
-
-    // Update last transcription time
-    this.lastTranscriptionTime.set(userId, Date.now());
-
-    // If the bot is speaking and any transcription is received, stop it
-    if (this.isSpeaking && isEmpty(transcript?.trim())) {
-      this.stopSpeaking();
+    if (isEmpty(transcript) || isEmpty(userId)) {
+      elizaLogger.warn('[SttTtsPlugin] Empty transcript or userId, skipping');
+      return;
     }
 
-    // Get the current buffer for this user or initialize an empty one
-    const currentBuffer = this.transcriptBuffer.get(userId) || '';
-    
-    // For non-empty transcripts, update the buffer
-    if (isNotEmpty(transcript?.trim())) {
+    // Store the time of this transcription
+    this.lastTranscriptionTime.set(userId, Date.now());
+
+    // Only process final transcriptions or ones that are long enough to be meaningful
+    if (isFinal || transcript.length > 15) {
+      // Check if the transcript changed significantly from what's already in the buffer
+      const currentBuffer = this.transcriptBuffer.get(userId) || '';
+      
       // Update the buffer with the new transcript
-      // For interim results, replace the buffer
-      // For final results or significant changes, append to buffer
-      if (!isFinal && (currentBuffer.includes(transcript) || transcript.includes(currentBuffer))) {
-        // This is likely an incremental update, so replace the buffer
-        this.transcriptBuffer.set(userId, transcript);
-      } else if (transcript !== currentBuffer) {
-        // This is new content or a final result, so append with space if needed
-        const separator = currentBuffer && !currentBuffer.endsWith(' ') && !transcript.startsWith(' ') ? ' ' : '';
-        this.transcriptBuffer.set(userId, currentBuffer + separator + transcript);
+      this.transcriptBuffer.set(userId, transcript);
+
+      // For final transcriptions, process after a short delay to allow for corrections
+      // For non-final but substantial transcriptions, use a longer delay
+      const delayTime = isFinal ? 300 : 1000;
+
+      // Clear any existing timeout for this user
+      if (this.processingTimeout.has(userId)) {
+        clearTimeout(this.processingTimeout.get(userId));
       }
 
-      // Clear any existing timeouts for this user
-      this.clearUserTimeouts(userId);
-
-      // If final, process immediately
-      if (isFinal) {
-        this.processBufferedTranscription(userId);
-      } else {
-        // Otherwise set a timeout to process if no utterance end is received
-        const timeout = setTimeout(() => {
-          elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout: ${this.transcriptBuffer.get(userId)}`);
-          this.processBufferedTranscription(userId);
-        }, this.timeoutDuration);
-        
-        this.processingTimeout.set(userId, timeout);
-        
-        // Set inactivity timer to flush buffer after a period of no new transcripts
-        const inactivityTimeout = setTimeout(() => {
+      // Set a new timeout for processing
+      this.processingTimeout.set(
+        userId,
+        setTimeout(() => {
+          // Only process if there have been no new transcriptions during the timeout
           const lastTime = this.lastTranscriptionTime.get(userId) || 0;
           const elapsed = Date.now() - lastTime;
           
-          if (elapsed >= this.inactivityDuration && this.transcriptBuffer.has(userId)) {
-            elizaLogger.log(`[SttTtsPlugin] Processing transcript due to inactivity (${elapsed}ms): ${this.transcriptBuffer.get(userId)}`);
+          if (elapsed >= delayTime) {
             this.processBufferedTranscription(userId);
           }
-        }, this.inactivityDuration);
-        
-        this.inactivityTimer.set(userId, inactivityTimeout);
+        }, delayTime)
+      );
+
+      // Also set an inactivity timer to process if there's no activity for a while
+      if (this.inactivityTimer.has(userId)) {
+        clearTimeout(this.inactivityTimer.get(userId));
       }
+
+      this.inactivityTimer.set(
+        userId,
+        setTimeout(() => {
+          this.processBufferedTranscription(userId);
+        }, this.inactivityDuration)
+      );
     }
   }
 
@@ -719,26 +717,22 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Stop the bot's speech when interrupted
-   */
-  private stopSpeaking(): void {
-    if (this.ttsAbortController) {
-      this.ttsAbortController.abort();
-      this.ttsAbortController = null;
-    }
-    this.isSpeaking = false;
-    this.ttsQueue = []; // Clear the queue
-    elizaLogger.log('[SttTtsPlugin] Bot speech interrupted by user');
-  }
-
-  /**
    * Process final transcription for response
    */
   private async processTranscription(userId: string, transcript: string): Promise<void> {
     try {
+      // If we're already processing, just queue this request and return
       if (this.isProcessingAudio) {
         console.log('[SttTtsPlugin] Already processing audio, queueing this request');
+        
+        // Replace any existing message from this user with the newer one
         this.pendingMessages.set(userId, transcript);
+        return;
+      }
+      
+      // Check if the transcript is too short to be meaningful
+      if (transcript.trim().length < 5) {
+        console.log('[SttTtsPlugin] Transcript too short, ignoring:', transcript);
         return;
       }
       
@@ -749,62 +743,60 @@ export class SttTtsPlugin implements Plugin {
       this.currentStreamId = streamId;
       this.activeStreams.add(streamId);
       
-      // Set up the abort controller for this stream
-      if (this.ttsAbortController) {
-        this.ttsAbortController.abort();
-      }
-      this.ttsAbortController = new AbortController();
+      elizaLogger.log(`[SttTtsPlugin] Starting stream with ID: ${streamId} for transcript: ${transcript}`);
       
-      // Listen for chunks of the streamed response
-      this.eventEmitter.on('stream-chunk', (chunk: string, chunkStreamId: string) => {
-        // Only process chunks for our current stream
-        if (chunkStreamId !== streamId) {
-          console.log('[SttTtsPlugin] Ignoring chunk from different stream', chunkStreamId);
-          return;
+      // Abort any previous streams
+      this.abortPreviousStreams();
+      
+      // Reset the text buffer
+      this.textBuffer = '';
+      
+      // Attach event listeners for this stream to handle chunks and stream end events
+      this.eventEmitter.on('stream-chunk', (chunkStreamId, text) => {
+        // Only process chunks for the current stream
+        if (chunkStreamId === streamId) {
+          this.bufferTextForTTS(text, streamId);
         }
-        
-        this.bufferTextForTTS(chunk, streamId);
       });
       
       // Clean up when the stream ends
       this.eventEmitter.once('stream-end', (endStreamId?: string) => {
         // Only clean up if this is our stream
-        if (endStreamId !== streamId) {
-          console.log('[SttTtsPlugin] Ignoring stream-end from different stream', endStreamId);
+        if (!endStreamId || !this.activeStreams.has(endStreamId)) {
+          elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
           return;
         }
         
-        console.log('[SttTtsPlugin] Stream ended, flushing any remaining buffered text');
-        
-        // Flush any remaining text in the buffer
-        if (this.textBuffer.length > 0) {
-          console.log(`[SttTtsPlugin] Flushing final text buffer: "${this.textBuffer}"`);
-          this.speakText(this.textBuffer);
-          this.textBuffer = '';
-        }
-        
-        // Clear any pending timeout
-        if (this.textBufferTimeout) {
-          clearTimeout(this.textBufferTimeout);
-          this.textBufferTimeout = null;
-        }
-        
-        console.log('[SttTtsPlugin] Removing event listeners');
-        // Clean up the listeners when we're done
+        console.log('[SttTtsPlugin] Stream ended for user:', userId);
+        elizaLogger.log(
+          `[SttTtsPlugin] user=${userId}, complete reply="${this.textBuffer}"`,
+        );
+
+        // Remove all stream listeners to prevent memory leaks
         this.eventEmitter.removeAllListeners('stream-chunk');
+        this.eventEmitter.removeAllListeners('stream-start');
         this.eventEmitter.removeAllListeners('stream-end');
-        
-        // Check for pending messages
-        setTimeout(() => {
-          this.isProcessingAudio = false;
-          this.processNextPendingMessage();
-        }, 500);
       });
 
-      // Handle the transcription with streaming response
-      this.debouncedHandleUserMessageStreaming(transcript, userId);
+      // Start the streaming response from Grok
+      await this.handleUserMessageStreaming(transcript, userId);
     } catch (error) {
-      elizaLogger.error('[SttTtsPlugin] processTranscription error:', error);
+      // Handle both transcription errors and general errors
+      if (
+        error.name === 'TranscriptionError' ||
+        error.message?.includes('transcription')
+      ) {
+        elizaLogger.error(`[SttTtsPlugin] Transcription error: ${error}`, {
+          userId,
+          audioBufferSize: 0,
+          sampleRate: 0,
+          error,
+        });
+      } else {
+        elizaLogger.error('[SttTtsPlugin] processTranscription error =>', error);
+      }
+    } finally {
+      // Reset the processing flag
       this.isProcessingAudio = false;
     }
   }
@@ -845,6 +837,15 @@ export class SttTtsPlugin implements Plugin {
         return;
       }
       
+      // Check if the message meets minimum length requirements
+      const message = this.pendingMessages.get(userId);
+      if (!message || message.trim().length < 5) {
+        console.log('[SttTtsPlugin] Message too short or empty, skipping:', message);
+        this.pendingMessages.delete(userId);
+        this.isProcessingMessage = false;
+        return;
+      }
+      
       this.isProcessingMessage = true;
       const latestMessage = this.pendingMessages.get(userId);
       
@@ -858,10 +859,14 @@ export class SttTtsPlugin implements Plugin {
           elizaLogger.error('[SttTtsPlugin] Error in debouncedHandleUserMessageStreaming:', error);
         } finally {
           this.isProcessingMessage = false;
-          // Check if we have more messages to process
-          if (this.pendingMessages.size > 0) {
-            this.processNextPendingMessage();
-          }
+          
+          // Add a delay before processing the next message to avoid rapid succession
+          setTimeout(() => {
+            // Check if we have more messages to process
+            if (this.pendingMessages.size > 0) {
+              this.processNextPendingMessage();
+            }
+          }, 1000);
         }
       } else {
         this.isProcessingMessage = false;
@@ -1280,7 +1285,7 @@ export class SttTtsPlugin implements Plugin {
           manageTtsBuffer();
         });
 
-        // Clean up when stream ends
+        // Clean up when the stream ends
         this.eventEmitter.once('stream-end', (endStreamId?: string) => {
           // Ignore end events if this stream is no longer active
           if (!endStreamId || !this.activeStreams.has(endStreamId) || signal.aborted) {
@@ -1639,48 +1644,52 @@ export class SttTtsPlugin implements Plugin {
    * Smart text buffering for TTS
    * This buffers text until we have a natural break point or enough characters
    */
-  private bufferTextForTTS(text: string, streamId: string): void {
-    // Append new text to buffer
+  bufferTextForTTS(text: string, streamId: string): void {
+    // Skip empty content
+    if (!text || text.length === 0) {
+      console.log('[SttTtsPlugin] Empty content, skipping chunk');
+      return;
+    }
+
+    // Add the new text to the buffer
     this.textBuffer += text;
     
-    // Clear any existing timeout
+    // Check if we've hit a natural break point like punctuation
+    const naturalBreakRegex = /[.!?;:,](\s|$)/;
+    
+    // Reset the buffer timeout
     if (this.textBufferTimeout) {
       clearTimeout(this.textBufferTimeout);
-      this.textBufferTimeout = null;
     }
     
-    // Function to flush the buffer to TTS
-    const flushBuffer = () => {
-      if (this.textBuffer.length > 0) {
-        console.log(`[SttTtsPlugin] Flushing text buffer to TTS: "${this.textBuffer.substring(0, 50)}${this.textBuffer.length > 50 ? '...' : ''}"`);
-        this.speakText(this.textBuffer);
-        this.textBuffer = '';
-      }
-    };
+    // Conditions to flush the buffer:
+    // 1. Buffer contains enough characters (MAX_TTS_BUFFER_SIZE)
+    // 2. Buffer contains a natural break point and has enough characters (MIN_TTS_BUFFER_SIZE)
+    const hasNaturalBreak = naturalBreakRegex.test(this.textBuffer);
+    const bufferLengthExceedsMax = this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE;
+    const bufferLengthMeetsMin = this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE;
     
-    // Determine if we have a natural break point
-    const hasStrongPunctuation = /[.!?](\s|$)/.test(this.textBuffer);
-    const hasMediumPunctuation = /[;:](\s|$)/.test(this.textBuffer);
-    const hasWeakPunctuation = /[,](\s|$)/.test(this.textBuffer);
-    
-    // Decision logic for when to flush the buffer
-    if (
-      // Strong punctuation (end of sentence) and enough characters
-      (hasStrongPunctuation && this.textBuffer.length >= 10) ||
-      // Medium punctuation and enough characters
-      (hasMediumPunctuation && this.textBuffer.length >= 15) ||
-      // Weak punctuation and enough characters
-      (hasWeakPunctuation && this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE) ||
-      // Buffer getting too large
-      this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
-    ) {
-      flushBuffer();
+    if (bufferLengthExceedsMax || (hasNaturalBreak && bufferLengthMeetsMin)) {
+      this.flushBuffer();
     } else {
-      // Set a timeout to flush the buffer if no more text arrives
+      // Set a timeout to flush the buffer if no new text arrives
       this.textBufferTimeout = setTimeout(() => {
-        console.log('[SttTtsPlugin] Buffer timeout reached, flushing buffer');
-        flushBuffer();
+        if (this.textBuffer.length > 0) {
+          console.log(`[SttTtsPlugin] Flushing text buffer due to timeout: "${this.textBuffer}"`);
+          this.flushBuffer();
+        }
       }, this.TTS_BUFFER_TIMEOUT);
+    }
+  }
+  
+  /**
+   * Flush the text buffer to TTS
+   */
+  private flushBuffer(): void {
+    if (this.textBuffer.length > 0) {
+      console.log(`[SttTtsPlugin] Flushing text buffer to TTS: "${this.textBuffer.substring(0, 50)}${this.textBuffer.length > 50 ? '...' : ''}"`);
+      this.speakText(this.textBuffer);
+      this.textBuffer = '';
     }
   }
 }
