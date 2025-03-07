@@ -95,10 +95,7 @@ export class SttTtsPlugin implements Plugin {
   private readonly TTS_BUFFER_TIMEOUT = 500; // ms to wait before flushing buffer if no natural breaks
 
   // Debouncing mechanism
-  private isProcessingMessage = false;
-  private processingDebounceTimeout: NodeJS.Timeout | null = null;
   private pendingMessages: Map<string, string> = new Map(); // userId -> latestMessage
-  private readonly MESSAGE_DEBOUNCE_TIME = 1000; // 1 second debounce time
 
   /**
    * Transcription service interface
@@ -253,51 +250,61 @@ export class SttTtsPlugin implements Plugin {
     pcmData: Int16Array,
     sampleRate: number,
   ): Promise<ArrayBuffer> {
-    // number of channels
-    const numChannels = 1;
-    // byte rate = (sampleRate * numChannels * bitsPerSample/8)
-    const byteRate = sampleRate * numChannels * 2;
-    const blockAlign = numChannels * 2;
-    // data chunk size = pcmData.length * (bitsPerSample/8)
-    const dataSize = pcmData.length * 2;
+    try {
+      // number of channels
+      const numChannels = 1;
+      // byte rate = (sampleRate * numChannels * bitsPerSample/8)
+      const byteRate = sampleRate * numChannels * 2;
+      const blockAlign = numChannels * 2;
+      // data chunk size = pcmData.length * (bitsPerSample/8)
+      const dataSize = pcmData.length * 2;
 
-    // WAV header is 44 bytes
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
+      // Validate input data
+      if (!pcmData || pcmData.length === 0) {
+        throw new Error('Empty PCM data provided for WAV conversion');
+      }
 
-    // RIFF chunk descriptor
-    this.writeString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true); // file size - 8
-    this.writeString(view, 8, 'WAVE');
+      // WAV header is 44 bytes
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
 
-    // fmt sub-chunk
-    this.writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
-    view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
-    view.setUint16(22, numChannels, true); // NumChannels
-    view.setUint32(24, sampleRate, true); // SampleRate
-    view.setUint32(28, byteRate, true); // ByteRate
-    view.setUint16(32, blockAlign, true); // BlockAlign
-    view.setUint16(34, 16, true); // BitsPerSample (16)
+      // RIFF chunk descriptor
+      this.writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true); // file size - 8
+      this.writeString(view, 8, 'WAVE');
 
-    // data sub-chunk
-    this.writeString(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
+      // fmt sub-chunk
+      this.writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+      view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
+      view.setUint16(22, numChannels, true); // NumChannels
+      view.setUint32(24, sampleRate, true); // SampleRate
+      view.setUint32(28, byteRate, true); // ByteRate
+      view.setUint16(32, blockAlign, true); // BlockAlign
+      view.setUint16(34, 16, true); // BitsPerSample (16)
 
-    // Write PCM samples
-    let offset = 44;
-    for (let i = 0; i < pcmData.length; i++, offset += 2) {
-      view.setInt16(offset, pcmData[i], true);
+      // data sub-chunk
+      this.writeString(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      // Write PCM samples
+      let offset = 44;
+      for (let i = 0; i < pcmData.length; i++, offset += 2) {
+        view.setInt16(offset, pcmData[i], true);
+      }
+
+      // Log WAV buffer details for debugging
+      elizaLogger.debug(
+        `[SttTtsPlugin] Created WAV buffer: size=${buffer.byteLength} bytes, ` +
+          `sample rate=${sampleRate}Hz, channels=${numChannels}, ` +
+          `samples=${pcmData.length}, duration=${(pcmData.length / sampleRate).toFixed(2)}s`,
+      );
+
+      return buffer;
+    } catch (error) {
+      elizaLogger.error(`[SttTtsPlugin] Error converting PCM to WAV: ${error.message}`);
+      throw new Error(`Failed to convert PCM to WAV: ${error.message}`);
     }
-
-    // Log WAV buffer details for debugging
-    elizaLogger.debug(
-      `[SttTtsPlugin] Created WAV buffer: size=${buffer.byteLength} bytes, ` +
-        `sample rate=${sampleRate}Hz, channels=${numChannels}, ` +
-        `samples=${pcmData.length}, duration=${(pcmData.length / sampleRate).toFixed(2)}s`,
-    );
-
-    return buffer;
   }
 
   /**
@@ -378,7 +385,9 @@ export class SttTtsPlugin implements Plugin {
 
       if (this.keepAlive) clearInterval(this.keepAlive);
       this.keepAlive = setInterval(() => {
-        this.socket.keepAlive();
+        if (this.socket && this.socket.getReadyState() === 1) { // Only send keepalive if socket is open
+          this.socket.keepAlive();
+        }
       }, 10 * 1000);
 
       // Setup event listeners outside of the Open event to ensure they're registered
@@ -412,6 +421,12 @@ export class SttTtsPlugin implements Plugin {
           this.keepAlive = null;
         }
         this.socket.finish();
+        
+        // Attempt to reconnect after a delay
+        setTimeout(() => {
+          console.log("deepgram: attempting to reconnect");
+          this.initializeDeepgram();
+        }, 5000);
       });
 
       this.socket.addListener(LiveTranscriptionEvents.Error, async (error: any) => {
@@ -434,8 +449,8 @@ export class SttTtsPlugin implements Plugin {
         console.log("deepgram: connected successfully");
 
         // Send a silent audio buffer to test the connection
-        // const silentBuffer = new Int16Array(960).fill(0);
-        // this.socket.send(silentBuffer.buffer);
+        const silentBuffer = new Int16Array(960).fill(0);
+        this.socket.send(silentBuffer.buffer);
 
         console.log("deepgram: sent initial silent buffer to test connection");
       });
@@ -492,9 +507,18 @@ export class SttTtsPlugin implements Plugin {
           return;
         }
 
-        // Stream audio data directly to Deepgram instead of buffering
-        elizaLogger.debug('[SttTtsPlugin] Streaming audio data directly to Deepgram');
-        this.socket.send(data.samples.buffer);
+        // Create a copy of the audio samples to avoid modifying the original data
+        const audioSamples = new Int16Array(data.samples);
+        
+        // Normalize audio levels for better recognition
+        const normalizedSamples = this.normalizeAudioLevels(audioSamples);
+        
+        // Ensure we're sending the buffer correctly
+        const audioBuffer = normalizedSamples.buffer;
+        
+        // Stream audio data directly to Deepgram
+        elizaLogger.debug(`[SttTtsPlugin] Streaming audio data to Deepgram: ${normalizedSamples.length} samples, energy: ${energy}`);
+        this.socket.send(audioBuffer);
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
