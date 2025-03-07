@@ -83,9 +83,8 @@ export class SttTtsPlugin implements Plugin {
   // Added for transcript buffering
   private transcriptBuffer: Map<string, string> = new Map();
   private processingTimeout: Map<string, NodeJS.Timeout> = new Map();
-  private timeoutDuration = 2000; // ms to wait before processing if no utterance end
+  private timeoutDuration = 200; // ms to wait before processing if no utterance end
   private inactivityTimer: Map<string, NodeJS.Timeout> = new Map();
-  private inactivityDuration = 500; // ms of inactivity before flushing buffer
   private lastTranscriptionTime: Map<string, number> = new Map();
 
   // Smart text buffering for TTS
@@ -94,15 +93,6 @@ export class SttTtsPlugin implements Plugin {
   private readonly MIN_TTS_BUFFER_SIZE = 20; // Minimum characters before sending to TTS
   private readonly MAX_TTS_BUFFER_SIZE = 150; // Maximum buffer size to prevent too long chunks
   private readonly TTS_BUFFER_TIMEOUT = 500; // ms to wait before flushing buffer if no natural breaks
-
-  // Audio processing system
-  private audioDataBuffer: Int16Array[] = [];
-  private isProcessingAudioData = false;
-  private readonly AUDIO_PROCESSING_INTERVAL = 100; // ms between audio processing checks
-  private audioProcessingTimer: NodeJS.Timeout | null = null;
-
-  // Audio buffer for processing speech
-  private audioBuffer: Int16Array[] = [];
 
   // Debouncing mechanism
   private isProcessingMessage = false;
@@ -526,7 +516,7 @@ export class SttTtsPlugin implements Plugin {
     // Update the transcript buffer - buffer the transcribed text instead of calling the LLM
     this.transcriptBuffer.set(userId, transcript);
     
-    elizaLogger.debug(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
+    elizaLogger.log(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
     
     // Clear any existing timeout for this user
     if (this.processingTimeout.has(userId)) {
@@ -539,19 +529,19 @@ export class SttTtsPlugin implements Plugin {
       this.processBufferedTranscription(userId);
     } else {
       // Set a timeout to process if we don't receive any more transcripts soon
-      // If more than 500 ms pass without events, flush the buffer
+      // Use a more aggressive 200ms timeout instead of 500ms
       this.processingTimeout.set(
         userId,
         setTimeout(() => {
           const lastTime = this.lastTranscriptionTime.get(userId) || 0;
           const elapsed = Date.now() - lastTime;
           
-          // If no new transcripts in the last 500ms, process what we have
-          if (elapsed >= 500) {
+          // If no new transcripts in the last 200ms, process what we have
+          if (elapsed >= this.timeoutDuration) {
             elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout (${elapsed}ms) for user: ${userId}`);
             this.processBufferedTranscription(userId);
           }
-        }, 500) // 500ms timeout
+        }, this.timeoutDuration) // 200ms timeout (more aggressive)
       );
     }
   }
@@ -691,79 +681,6 @@ export class SttTtsPlugin implements Plugin {
     }
   }
   
-  /**
-   * Process the next pending message if any
-   */
-  private processNextPendingMessage(): void {
-    if (this.pendingMessages.size > 0) {
-      const entries = Array.from(this.pendingMessages.entries());
-      const [userId, transcript] = entries[entries.length - 1]; // Take the most recent message
-      this.pendingMessages.clear(); // Clear all pending messages
-      
-      console.log(`[SttTtsPlugin] Processing pending message for user ${userId}: "${transcript.substring(0, 50)}${transcript.length > 50 ? '...' : ''}"`);
-      
-      // Process the most recent pending message
-      this.processTranscription(userId, transcript).catch(error => {
-        elizaLogger.error('[SttTtsPlugin] Error processing pending message:', error);
-      });
-    }
-  }
-  
-  /**
-   * Debounced version of handleUserMessageStreaming to prevent multiple calls
-   */
-  private debouncedHandleUserMessageStreaming(userText: string, userId: string): void {
-    if (this.processingDebounceTimeout) {
-      clearTimeout(this.processingDebounceTimeout);
-    }
-    
-    // Store the latest message from this user
-    this.pendingMessages.set(userId, userText);
-    
-    // Set a timeout to handle the message
-    this.processingDebounceTimeout = setTimeout(async () => {
-      if (this.isProcessingMessage) {
-        // Already processing, will be picked up by processNextPendingMessage later
-        return;
-      }
-      
-      // Check if the message meets minimum length requirements
-      const message = this.pendingMessages.get(userId);
-      if (!message || message.trim().length < 5) {
-        console.log('[SttTtsPlugin] Message too short or empty, skipping:', message);
-        this.pendingMessages.delete(userId);
-        this.isProcessingMessage = false;
-        return;
-      }
-      
-      this.isProcessingMessage = true;
-      const latestMessage = this.pendingMessages.get(userId);
-      
-      if (latestMessage) {
-        // Remove this message from pending
-        this.pendingMessages.delete(userId);
-        
-        try {
-          await this.handleUserMessageStreaming(latestMessage, userId);
-        } catch (error) {
-          elizaLogger.error('[SttTtsPlugin] Error in debouncedHandleUserMessageStreaming:', error);
-        } finally {
-          this.isProcessingMessage = false;
-          
-          // Add a delay before processing the next message to avoid rapid succession
-          setTimeout(() => {
-            // Check if we have more messages to process
-            if (this.pendingMessages.size > 0) {
-              this.processNextPendingMessage();
-            }
-          }, 1000);
-        }
-      } else {
-        this.isProcessingMessage = false;
-      }
-    }, this.MESSAGE_DEBOUNCE_TIME);
-  }
-
   /**
    * Handle User Message with streaming support
    */
@@ -978,254 +895,83 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Should Ignore
+   * Smart text buffering for TTS
+   * This buffers text until we have a natural break point or enough characters
    */
-  private async _shouldIgnore(message: Memory): Promise<boolean> {
-    const messageStr = message?.content?.text;
-    const messageLen = messageStr?.length ?? 0;
-    if (messageLen < 3) {
-      return true;
-    }
-
-    const loseInterestWords = [
-      'shut up', 'stop', 'dont talk', 'silence', 'stop talking', 'be quiet', 'hush', 'stfu',
-      'stupid bot', 'dumb bot', 'fuck', 'shit', 'damn', 'suck', 'dick', 'cock', 'sex', 'sexy',
-    ];
-    if (messageLen < 50 && loseInterestWords.some((word) => messageStr?.toLowerCase()?.includes(word))) {
-      return true;
-    }
-
-    const ignoreWords = ['k', 'ok', 'bye', 'lol', 'nm', 'uh'];
-    if (messageStr?.length < 8 && ignoreWords.some((word) => messageStr?.toLowerCase()?.includes(word))) {
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Add a message to the chat context
-   */
-  public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
-    this.chatContext.push({ role, content });
-    elizaLogger.log(`[SttTtsPlugin] addMessage => role=${role}, content=${content}`);
-  }
-
-  /**
-   * Clear the chat context
-   */
-  public clearChatContext() {
-    this.chatContext = [];
-    elizaLogger.log('[SttTtsPlugin] clearChatContext => done');
-  }
-
-  /**
-   * Cleanup resources
-   */
-  cleanup(): void {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.close();
-      elizaLogger.log('[SttTtsPlugin] Deepgram WebSocket closed');
-    }
-    if (this.ttsAbortController) {
-      this.ttsAbortController.abort();
-      this.ttsAbortController = null;
-    }
-    this.activeStreams.clear();
-    this.currentStreamId = null;
-    this.eventEmitter.removeAllListeners();
-    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
-  }
-
-  /**
-   * Process audio from a user
-   */
-  public async processAudio(userId: string, audioData: Int16Array): Promise<void> {
-    try {
-      // Don't process audio if already processing
-      if (this.isProcessingAudio) {
-        elizaLogger.debug('[SttTtsPlugin] Already processing audio, skipping');
-        return;
-      }
-
-      try {
-        this.isProcessingAudio = true;
-
-        // Abort any previous streams before starting a new one
-        this.abortPreviousStreams();
-
-        // Create a new stream ID and add it to active streams
-        const streamId = uuidv4();
-        this.currentStreamId = streamId;
+  private bufferTextForTTS(text: string, streamId: string): void {
+    // Check if stream ID is valid and still active
+    if (!this.currentStreamId || !this.activeStreams.has(streamId)) {
+      // Try to recover by creating a new stream ID if needed
+      if (!this.currentStreamId) {
+        elizaLogger.warn('[SttTtsPlugin] No current stream ID found, creating a new one');
+        const newStreamId = uuidv4();
+        this.currentStreamId = newStreamId;
+        this.activeStreams.add(newStreamId);
+        // Continue with the new stream ID
+        streamId = newStreamId;
+      } else if (!this.activeStreams.has(streamId)) {
+        elizaLogger.warn(`[SttTtsPlugin] Stream ID ${streamId} is no longer active, using current stream ID`);
+        // Use the current stream ID instead
+        streamId = this.currentStreamId;
         this.activeStreams.add(streamId);
-
-        // Create an abort controller for this stream
-        const signal = this.ttsAbortController?.signal;
-        if (!signal || signal.aborted) {
-          elizaLogger.log('[SttTtsPlugin] Abort signal already aborted, skipping processing');
-          return;
-        }
-
-        // Initialize variables for TTS and streaming
-        let wavBuffer: ArrayBuffer | null = null;
-        let sttText = '';
-        let merged: Int16Array | null = null;
-        let optimizedPcm: Int16Array | null = null;
-
-        // Store the audio buffer for processing
-        this.audioBuffer = [...(this.audioBuffer || []), audioData];
-
-        // Create a promise to merge the audio buffers
-        const mergeBufferPromise = new Promise<Int16Array>((resolve, reject) => {
-          try {
-            // Combine all audio chunks into a single buffer for better processing
-            let totalLength = 0;
-            for (const buffer of this.audioBuffer) {
-              totalLength += buffer.length;
-            }
-
-            const mergedBuffer = new Int16Array(totalLength);
-            let offset = 0;
-
-            for (const buffer of this.audioBuffer) {
-              mergedBuffer.set(buffer, offset);
-              offset += buffer.length;
-            }
-
-            // Clear the buffer after merging
-            this.audioBuffer = [];
-
-            resolve(mergedBuffer);
-          } catch (error) {
-            reject(error);
-          }
-        });
-
-        // Process the merged audio buffer
-        merged = await mergeBufferPromise;
-
-        // Optimize audio for transcription by downsampling if needed
-        optimizedPcm = this.maybeDownsampleAudio(merged, 48000, 16000);
-
-        // Convert to WAV format for the transcription service
-        wavBuffer = await this.convertPcmToWavInMemory(optimizedPcm, optimizedPcm === merged ? 48000 : 16000);
-        sttText = await this.transcriptionService.transcribe(wavBuffer);
-
-        // Setup variables for text handling
-        let ttsBuffer = '';
-        let accumulatedText = '';
-
-        // Enable smart text buffering for TTS to avoid choppy speech
-        const manageTtsBuffer = () => {
-          if (ttsBuffer.length < this.MIN_TTS_BUFFER_SIZE) {
-            return; // Not enough text yet
-          }
-
-          // Check for natural break points
-          const hasStrongPunctuation = /[.!?](\s|$)/.test(ttsBuffer);
-          const hasMediumPunctuation = /[;:](\s|$)/.test(ttsBuffer);
-          const hasWeakPunctuation = /[,](\s|$)/.test(ttsBuffer);
-
-          if (
-            // Strong punctuation (end of sentence) and enough characters
-            (hasStrongPunctuation && ttsBuffer.length >= 10) ||
-            // Medium punctuation and enough characters
-            (hasMediumPunctuation && ttsBuffer.length >= 15) ||
-            // Weak punctuation and enough characters
-            (hasWeakPunctuation && ttsBuffer.length >= this.MIN_TTS_BUFFER_SIZE) ||
-            // Buffer getting too large
-            ttsBuffer.length >= this.MAX_TTS_BUFFER_SIZE
-          ) {
-            processTtsChunk();
-          }
-        };
-
-        // Process a chunk of text for TTS
-        const processTtsChunk = () => {
-          if (ttsBuffer.length === 0) return;
-          
-          const textToProcess = ttsBuffer;
-          ttsBuffer = '';
-          
-          // Send to TTS and ignore if aborted
-          if (!signal.aborted) {
-            this.speakText(textToProcess);
-          }
-        };
-
-        // Set up stream event listeners
-        this.eventEmitter.on('stream-chunk', (chunk: string, chunkStreamId?: string) => {
-          // Ignore chunks from other streams
-          if (chunkStreamId !== streamId || signal.aborted) {
-            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-chunk from outdated stream`);
-            return;
-          }
-          
-          if (typeof chunk !== 'string' || isEmpty(chunk)) {
-            return;
-          }
-
-          // Add to accumulated text for logging
-          accumulatedText += chunk;
-
-          // Add to TTS buffer
-          ttsBuffer += chunk;
-
-          // Manage the buffer - this will decide when to process
-          manageTtsBuffer();
-        });
-
-        // Clean up when the stream ends
-        this.eventEmitter.once('stream-end', (endStreamId?: string) => {
-          // Ignore end events if this stream is no longer active
-          if (!endStreamId || !this.activeStreams.has(endStreamId) || signal.aborted) {
-            elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
-            return;
-          }
-          
-          // Remove this stream from active streams
-          this.activeStreams.delete(endStreamId);
-          
-          // Process any remaining text in the buffer
-          if (ttsBuffer.length > 0 && !signal.aborted) {
-            processTtsChunk();
-          }
-
-          elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
-          elizaLogger.log(
-            `[SttTtsPlugin] user=${userId}, complete reply="${this.textBuffer}"`,
-          );
-
-          // Remove all stream listeners to prevent memory leaks
-          this.eventEmitter.removeAllListeners('stream-chunk');
-          this.eventEmitter.removeAllListeners('stream-start');
-          this.eventEmitter.removeAllListeners('stream-end');
-        });
-
-        // Start the streaming response from Grok
-        await this.handleUserMessageStreaming(sttText, userId);
-      } catch (error) {
-        // Handle both transcription errors and general errors
-        if (
-          error.name === 'TranscriptionError' ||
-          error.message?.includes('transcription')
-        ) {
-          elizaLogger.error(`[SttTtsPlugin] Transcription error: ${error}`, {
-            userId,
-            audioBufferSize: wavBuffer?.byteLength || 0,
-            sampleRate: optimizedPcm === merged ? 48000 : 16000,
-            error,
-          });
-        } else {
-          elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
-        }
-      } finally {
-        // Reset the processing flag
-        this.isProcessingAudio = false;
       }
-    } catch (error) {
-      elizaLogger.error('[SttTtsPlugin] processAudio error =>', error);
     }
+
+    if (!text) {
+      return;
+    }
+    
+    // Append the new text to our buffer
+    this.textBuffer += text;
+    
+    // Clear any existing timeout
+    if (this.textBufferTimeout) {
+      clearTimeout(this.textBufferTimeout);
+    }
+    
+    // Check if there's a natural break or if we've reached the max buffer size
+    const hasNaturalBreak = /[.!?]\s*$/.test(this.textBuffer) || // Ends with punctuation
+                           /\n\s*$/.test(this.textBuffer);       // Ends with newline
+    
+    if (
+      hasNaturalBreak ||
+      this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
+    ) {
+      // Flush immediately if we have a natural break or reached max size
+      this.flushBuffer();
+    } else if (this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE) {
+      // If we have enough characters but no natural break,
+      // set a timeout to flush soon if no more text arrives
+      this.textBufferTimeout = setTimeout(() => {
+        this.flushBuffer();
+      }, this.TTS_BUFFER_TIMEOUT);
+    }
+  }
+
+  /**
+   * Flush the text buffer to TTS
+   */
+  private flushBuffer(): void {
+    if (!this.textBuffer) {
+      return;
+    }
+    
+    // Check if we have a valid current stream ID
+    if (!this.currentStreamId) {
+      elizaLogger.warn('[SttTtsPlugin] No current stream ID for TTS, creating a new one');
+      this.currentStreamId = uuidv4();
+      this.activeStreams.add(this.currentStreamId);
+    }
+    
+    // Send the buffered text to TTS queue
+    const textToSpeak = this.textBuffer;
+    this.textBuffer = ''; // Clear the buffer
+    
+    elizaLogger.log(`[SttTtsPlugin] Flushing buffer to TTS: "${textToSpeak}"`);
+    
+    this.speakText(textToSpeak).catch((err) => {
+      elizaLogger.error('[SttTtsPlugin] Error speaking text:', err);
+    });
   }
 
   /**
@@ -1530,56 +1276,64 @@ export class SttTtsPlugin implements Plugin {
     }
   }
 
+
   /**
-   * Smart text buffering for TTS
-   * This buffers text until we have a natural break point or enough characters
+   * Should Ignore
    */
-  bufferTextForTTS(text: string, streamId: string): void {
-    // Skip empty content
-    if (!text || text.length === 0) {
-      console.log('[SttTtsPlugin] Empty content, skipping chunk');
-      return;
+  private async _shouldIgnore(message: Memory): Promise<boolean> {
+    const messageStr = message?.content?.text;
+    const messageLen = messageStr?.length ?? 0;
+    if (messageLen < 3) {
+      return true;
     }
 
-    // Add the new text to the buffer
-    this.textBuffer += text;
-    
-    // Check if we've hit a natural break point like punctuation
-    const naturalBreakRegex = /[.!?;:,](\s|$)/;
-    
-    // Reset the buffer timeout
-    if (this.textBufferTimeout) {
-      clearTimeout(this.textBufferTimeout);
+    const loseInterestWords = [
+      'shut up', 'stop', 'dont talk', 'silence', 'stop talking', 'be quiet', 'hush', 'stfu',
+      'stupid bot', 'dumb bot', 'fuck', 'shit', 'damn', 'suck', 'dick', 'cock', 'sex', 'sexy',
+    ];
+    if (messageLen < 50 && loseInterestWords.some((word) => messageStr?.toLowerCase()?.includes(word))) {
+      return true;
     }
-    
-    // Conditions to flush the buffer:
-    // 1. Buffer contains enough characters (MAX_TTS_BUFFER_SIZE)
-    // 2. Buffer contains a natural break point and has enough characters (MIN_TTS_BUFFER_SIZE)
-    const hasNaturalBreak = naturalBreakRegex.test(this.textBuffer);
-    const bufferLengthExceedsMax = this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE;
-    const bufferLengthMeetsMin = this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE;
-    
-    if (bufferLengthExceedsMax || (hasNaturalBreak && bufferLengthMeetsMin)) {
-      this.flushBuffer();
-    } else {
-      // Set a timeout to flush the buffer if no new text arrives
-      this.textBufferTimeout = setTimeout(() => {
-        if (this.textBuffer.length > 0) {
-          console.log(`[SttTtsPlugin] Flushing text buffer due to timeout: "${this.textBuffer}"`);
-          this.flushBuffer();
-        }
-      }, this.TTS_BUFFER_TIMEOUT);
+
+    const ignoreWords = ['k', 'ok', 'bye', 'lol', 'nm', 'uh'];
+    if (messageStr?.length < 8 && ignoreWords.some((word) => messageStr?.toLowerCase()?.includes(word))) {
+      return true;
     }
+
+    return false;
   }
-  
+
   /**
-   * Flush the text buffer to TTS
+   * Add a message to the chat context
    */
-  private flushBuffer(): void {
-    if (this.textBuffer.length > 0) {
-      console.log(`[SttTtsPlugin] Flushing text buffer to TTS: "${this.textBuffer.substring(0, 50)}${this.textBuffer.length > 50 ? '...' : ''}"`);
-      this.speakText(this.textBuffer);
-      this.textBuffer = '';
+  public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
+    this.chatContext.push({ role, content });
+    elizaLogger.log(`[SttTtsPlugin] addMessage => role=${role}, content=${content}`);
+  }
+
+  /**
+   * Clear the chat context
+   */
+  public clearChatContext() {
+    this.chatContext = [];
+    elizaLogger.log('[SttTtsPlugin] clearChatContext => done');
+  }
+
+  /**
+   * Cleanup resources
+   */
+  cleanup(): void {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.close();
+      elizaLogger.log('[SttTtsPlugin] Deepgram WebSocket closed');
     }
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
+    }
+    this.activeStreams.clear();
+    this.currentStreamId = null;
+    this.eventEmitter.removeAllListeners();
+    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 }
