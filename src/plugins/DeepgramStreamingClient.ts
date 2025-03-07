@@ -160,46 +160,6 @@ export class SttTtsPlugin implements Plugin {
     }
   };
 
-  /**
-   * Downsample audio if needed for better transcription
-   * Most transcription services work best with 16kHz audio
-   */
-  private maybeDownsampleAudio(
-    audio: Int16Array,
-    originalSampleRate: number,
-    targetSampleRate: number,
-  ): Int16Array {
-    // If already at target rate or downsampling not needed, return original
-    if (originalSampleRate <= targetSampleRate) {
-      return audio;
-    }
-
-    // Calculate the ratio for downsampling
-    const ratio = originalSampleRate / targetSampleRate;
-    const newLength = Math.floor(audio.length / ratio);
-    const result = new Int16Array(newLength);
-
-    // Enhanced downsampling with linear interpolation for better quality
-    // This preserves more of the audio information compared to simple picking
-    for (let i = 0; i < newLength; i++) {
-      const exactPos = i * ratio;
-      const lowIndex = Math.floor(exactPos);
-      const highIndex = Math.min(lowIndex + 1, audio.length - 1);
-      const fraction = exactPos - lowIndex;
-
-      // Linear interpolation between adjacent samples
-      result[i] = Math.round(
-        (1 - fraction) * audio[lowIndex] + fraction * audio[highIndex],
-      );
-    }
-
-    elizaLogger.debug(
-      `[SttTtsPlugin] Downsampled audio from ${originalSampleRate}Hz to ${targetSampleRate}Hz, ` +
-        `original length: ${audio.length}, new length: ${newLength}`,
-    );
-
-    return this.normalizeAudioLevels(result);
-  }
 
   /**
    * Normalize audio levels to improve speech recognition
@@ -595,6 +555,7 @@ export class SttTtsPlugin implements Plugin {
    */
   private clearUserTimeouts(userId: string): void {
     // Clear processing timeout
+    // Clear processing timeout
     if (this.processingTimeout.has(userId)) {
       clearTimeout(this.processingTimeout.get(userId));
       this.processingTimeout.delete(userId);
@@ -796,99 +757,129 @@ export class SttTtsPlugin implements Plugin {
       return;
     }
 
-    const stream = await this.openai.chat.completions.create({
-      model: 'grok-2-latest',
-      messages,
-      stream: true,
-    });
+    try {
+      const stream = await this.openai.chat.completions.create({
+        model: 'grok-2-latest',
+        messages,
+        stream: true,
+      });
 
-    let fullResponse = '';
-    let bufferedText = '';
-    let potentialActionMarker = false;
-    let detectedAction = '';
+      let fullResponse = '';
+      let bufferedText = '';
+      let potentialActionMarker = false;
+      let detectedAction = '';
 
-    console.log('[SttTtsPlugin] Starting to process OpenAI stream chunks');
+      console.log('[SttTtsPlugin] Starting to process OpenAI stream chunks');
 
-    for await (const chunk of stream) {
-      console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
-      
-      const content = chunk.choices[0]?.delta?.content || '';
-      console.log('[SttTtsPlugin] Extracted content:', content);
-      
-      if (!content) {
-        console.log('[SttTtsPlugin] Empty content, skipping chunk');
-        continue;
-      }
+      // Set up a timer to ensure we emit text at regular intervals for a more natural speech pattern
+      let lastEmitTime = Date.now();
+      const minTimeBetweenEmits = 150; // ms - adjust for desired natural pacing
+      const maxBufferTime = 500; // ms - maximum time to hold text before emitting
 
-      fullResponse += content;
+      for await (const chunk of stream) {
+        if (!this.activeStreams.has(streamId)) {
+          console.log('[SttTtsPlugin] Stream was aborted during processing, cancelling');
+          break;
+        }
 
-      // Check if this chunk contains or starts an action marker
-      if (content.includes('actionIs:') || content.includes('```actionIs:')) {
-        // If we find the action marker, extract only the text before it
-        const parts = content.split(/(\`\`\`actionIs:|actionIs:)/);
-        if (parts.length > 1) {
-          // Send only the text before the marker to TTS
-          const textBeforeAction = parts[0].trim();
-          if (textBeforeAction) {
-            console.log('[SttTtsPlugin] Emitting chunk with text before action:', textBeforeAction);
-            this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
-          }
-          
-          // Extract the action name
-          const actionMatch = /actionIs:([A-Z_]+)/.exec(content);
-          if (actionMatch) {
-            detectedAction = actionMatch[1];
-            elizaLogger.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
-          }
-          
-          potentialActionMarker = true;
+        console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
+        
+        const content = chunk.choices[0]?.delta?.content || '';
+        console.log('[SttTtsPlugin] Extracted content:', content);
+        
+        if (!content) {
+          console.log('[SttTtsPlugin] Empty content, skipping chunk');
           continue;
         }
-      }
-      
-      // Handle potential action continuation
-      if (potentialActionMarker) {
-        // Check if we're still in an action block
-        if (content.includes('```')) {
-          potentialActionMarker = false;
-          
-          // Extract any text after the action block
-          const parts = content.split(/\`\`\`/);
-          if (parts.length > 1 && parts[1].trim()) {
-            console.log('[SttTtsPlugin] Emitting chunk with text after action:', parts[1].trim());
-            this.eventEmitter.emit('stream-chunk', parts[1].trim(), streamId);
+
+        fullResponse += content;
+
+        // Check if this chunk contains or starts an action marker
+        if (content.includes('actionIs:') || content.includes('```actionIs:')) {
+          // If we find the action marker, extract only the text before it
+          const parts = content.split(/(\`\`\`actionIs:|actionIs:)/);
+          if (parts.length > 1) {
+            // Send only the text before the marker to TTS
+            const textBeforeAction = parts[0].trim();
+            if (textBeforeAction) {
+              console.log('[SttTtsPlugin] Emitting chunk with text before action:', textBeforeAction);
+              this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
+            }
+            
+            // Extract the action name
+            const actionMatch = /actionIs:([A-Z_]+)/.exec(content);
+            if (actionMatch) {
+              detectedAction = actionMatch[1];
+              elizaLogger.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
+            }
+            
+            potentialActionMarker = true;
+            continue;
           }
         }
-        // Skip content that's part of an action block
-        continue;
+        
+        // Handle potential action continuation
+        if (potentialActionMarker) {
+          // Check if we're still in an action block
+          if (content.includes('```')) {
+            potentialActionMarker = false;
+            
+            // Extract any text after the action block
+            const parts = content.split(/\`\`\`/);
+            if (parts.length > 1 && parts[1].trim()) {
+              console.log('[SttTtsPlugin] Emitting chunk with text after action:', parts[1].trim());
+              this.eventEmitter.emit('stream-chunk', parts[1].trim(), streamId);
+              lastEmitTime = Date.now();
+            }
+          }
+          // Skip content that's part of an action block
+          continue;
+        }
+        
+        // Normal text content - buffer it and emit when appropriate
+        bufferedText += content;
+        
+        // Determine if we should emit based on natural breaks or timing
+        const hasNaturalBreak = /[.!?]\s*$/.test(bufferedText) || // Ends with punctuation
+                             /\n\s*$/.test(bufferedText) ||      // Ends with newline
+                             /[:;]\s*$/.test(bufferedText);      // Ends with colon or semicolon
+        
+        const currentTime = Date.now();
+        const timeSinceLastEmit = currentTime - lastEmitTime;
+        const shouldEmitBasedOnTime = timeSinceLastEmit >= maxBufferTime;
+        const hasEnoughText = bufferedText.length >= 15; // Minimum characters to emit
+        
+        // Emit text if we have a natural break point or if enough time has passed
+        if ((hasNaturalBreak && hasEnoughText) || shouldEmitBasedOnTime) {
+          // If we're emitting too quickly, add a small delay for more natural pacing
+          if (timeSinceLastEmit < minTimeBetweenEmits) {
+            await new Promise(resolve => setTimeout(resolve, minTimeBetweenEmits - timeSinceLastEmit));
+          }
+          
+          console.log('[SttTtsPlugin] Emitting chunk with buffered text:', bufferedText);
+          this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
+          bufferedText = '';
+          lastEmitTime = Date.now();
+        }
       }
       
-      // Normal text content - buffer it and emit when appropriate
-      bufferedText += content;
-      
-      // If we have accumulated enough text or hit natural break points, emit it
-      const hasNaturalBreak = /[.!?]\s*$/.test(bufferedText) || // Ends with punctuation
-                           /\n\s*$/.test(bufferedText);       // Ends with newline
-      
-      if (hasNaturalBreak || bufferedText.length > 20) {
-        console.log('[SttTtsPlugin] Emitting chunk with buffered text:', bufferedText);
+      // Emit any remaining buffered text
+      if (bufferedText.trim()) {
+        console.log('[SttTtsPlugin] Emitting final buffered text:', bufferedText);
         this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
-        bufferedText = '';
       }
+      
+      // Add the complete message to our conversation history
+      this.addMessage('user', userText);
+      this.addMessage('assistant', fullResponse);
+      
+      // Signal that the stream has ended
+      this.eventEmitter.emit('stream-end', streamId);
+    } catch (error) {
+      elizaLogger.error(`[SttTtsPlugin] Error processing stream: ${error.message}`, error);
+      // Ensure we clean up even if there's an error
+      this.eventEmitter.emit('stream-end', streamId);
     }
-    
-    // Emit any remaining buffered text
-    if (bufferedText.trim()) {
-      console.log('[SttTtsPlugin] Emitting final buffered text:', bufferedText);
-      this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
-    }
-    
-    // Add the complete message to our conversation history
-    this.addMessage('user', userText);
-    this.addMessage('assistant', fullResponse);
-    
-    // Signal that the stream has ended
-    this.eventEmitter.emit('stream-end', streamId);
   }
 
   /**
@@ -900,9 +891,13 @@ export class SttTtsPlugin implements Plugin {
       this.ttsAbortController.abort();
     }
     this.ttsAbortController = new AbortController();
+    
+    // Clear active streams but preserve event listeners
     this.activeStreams.clear();
     this.currentStreamId = null;
-    this.eventEmitter.removeAllListeners();
+    
+    // Don't remove all listeners as it could affect other parts of the system
+    // Instead, we'll manage listeners for specific streams in their respective handlers
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
@@ -951,7 +946,8 @@ export class SttTtsPlugin implements Plugin {
     
     // Check if there's a natural break or if we've reached the max buffer size
     const hasNaturalBreak = /[.!?]\s*$/.test(this.textBuffer) || // Ends with punctuation
-                           /\n\s*$/.test(this.textBuffer);       // Ends with newline
+                           /\n\s*$/.test(this.textBuffer) ||     // Ends with newline
+                           /[:;]\s*$/.test(this.textBuffer);     // Ends with colon or semicolon
     
     if (
       hasNaturalBreak ||
