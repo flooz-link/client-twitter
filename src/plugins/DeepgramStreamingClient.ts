@@ -507,6 +507,12 @@ export class SttTtsPlugin implements Plugin {
         offset += frame.length;
       }
       
+      // Send to Deepgram for transcription
+      // The socket expects a full buffer not frames
+      if (this.socket && this.socket.getReadyState() === 1) {
+        this.socket.send(combinedBuffer.buffer);
+      }
+      
       // Now send to Janus directly, ensuring we split into 480-sample frames
       if (this.janus) {
         const JANUS_FRAME_SIZE = 480; // Janus requires exactly 480 samples per frame
@@ -515,9 +521,15 @@ export class SttTtsPlugin implements Plugin {
         for (let i = 0; i < combinedBuffer.length; i += JANUS_FRAME_SIZE) {
           // Check if we have enough samples for a full frame
           if (i + JANUS_FRAME_SIZE <= combinedBuffer.length) {
-            // Extract exact frame of 480 samples
-            const frame = combinedBuffer.subarray(i, i + JANUS_FRAME_SIZE);
+            // Important: Create a NEW Int16Array with exactly 480 samples
+            // This ensures the underlying buffer is exactly the right size
+            // Using subarray() would maintain a reference to the full buffer
+            const frameData = combinedBuffer.subarray(i, i + JANUS_FRAME_SIZE);
+            const frame = new Int16Array(frameData); // Copy to new buffer with exact size
+            
             try {
+              // Diagnostic logging to verify buffer length
+              console.log(`[SttTtsPlugin] Pushing frame to Janus: ${frame.length} samples, byteLength: ${frame.buffer.byteLength}`);
               await this.janus.pushLocalAudio(frame, 48000);
             } catch (err) {
               console.error('[SttTtsPlugin] Error pushing audio frame to Janus:', err);
@@ -533,6 +545,7 @@ export class SttTtsPlugin implements Plugin {
               // Rest is already zeros (silence)
               
               try {
+                console.log(`[SttTtsPlugin] Pushing final padded frame to Janus: ${paddedFrame.length} samples, byteLength: ${paddedFrame.buffer.byteLength}`);
                 await this.janus.pushLocalAudio(paddedFrame, 48000);
               } catch (err) {
                 console.error('[SttTtsPlugin] Error pushing final padded frame to Janus:', err);
