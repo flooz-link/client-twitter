@@ -359,7 +359,7 @@ export class SttTtsPlugin implements Plugin {
     this.initializeDeepgram();
 
     // Initialize audio processing system
-    this.initAudioProcessing();
+    // this.initAudioProcessing();
   }
 
   private initializeDeepgram(): void {
@@ -512,51 +512,16 @@ export class SttTtsPlugin implements Plugin {
         offset += frame.length;
       }
       
-      // Send to Deepgram for transcription
-      // The socket expects a full buffer not frames
+      // ONLY send to Deepgram for transcription - NOT to Janus
+      // This prevents the user from hearing their own voice
       if (this.socket && this.socket.getReadyState() === 1) {
+        elizaLogger.debug('[SttTtsPlugin] Sending combined audio buffer to Deepgram');
         this.socket.send(combinedBuffer.buffer);
       }
       
-      // Now send to Janus directly, ensuring we split into 480-sample frames
-      if (this.janus) {
-        const JANUS_FRAME_SIZE = 480; // Janus requires exactly 480 samples per frame
-        
-        // Process buffer in chunks of exactly 480 samples
-        for (let i = 0; i < combinedBuffer.length; i += JANUS_FRAME_SIZE) {
-          // Check if we have enough samples for a full frame
-          if (i + JANUS_FRAME_SIZE <= combinedBuffer.length) {
-            // Important: Create a NEW Int16Array with exactly 480 samples
-            // This ensures the underlying buffer is exactly the right size
-            // Using subarray() would maintain a reference to the full buffer
-            const frameData = combinedBuffer.subarray(i, i + JANUS_FRAME_SIZE);
-            const frame = new Int16Array(frameData); // Copy to new buffer with exact size
-            
-            try {
-              this.janus.pushLocalAudio(frame, 48000);
-            } catch (err) {
-              console.error('[SttTtsPlugin] Error pushing audio frame to Janus:', err);
-            }
-          } else {
-            // Handle the remainder (partial frame) by padding with silence
-            const remainingSamples = combinedBuffer.length - i;
-            if (remainingSamples > 0) {
-              // Create a frame with exactly 480 samples, filled with silence (zeros)
-              const paddedFrame = new Int16Array(JANUS_FRAME_SIZE);
-              // Copy the remaining samples
-              paddedFrame.set(combinedBuffer.subarray(i));
-              // Rest is already zeros (silence)
-              
-              try {
-                console.log(`[SttTtsPlugin] Pushing final padded frame to Janus: ${paddedFrame.length} samples, byteLength: ${paddedFrame.buffer.byteLength}`);
-                await this.janus.pushLocalAudio(paddedFrame, 48000);
-              } catch (err) {
-                console.error('[SttTtsPlugin] Error pushing final padded frame to Janus:', err);
-              }
-            }
-          }
-        }
-      }
+      // REMOVED: Do not send to Janus anymore - this was causing echo
+      // The audio should only go to Deepgram for transcription
+      
     } catch (err) {
       console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
     } finally {
@@ -597,25 +562,22 @@ export class SttTtsPlugin implements Plugin {
 
     // Make sure socket is ready before sending data
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
-
       try {
-        // Skip bot's audio and also skip if this is the local user's audio (to prevent echo)
-        // The userId might be formatted differently for local users based on your implementation
-        const isLocalUser = data.userId.includes('local') || data.userId.startsWith('self-');
-        if (this.botProfile.id !== data.userId && !isLocalUser) {
-
-          // Check if buffer is empty or contains no voice
-          const energy = this.calculateEnergy(data.samples);
-          const isSilent = energy < 50; // Adjust this threshold based on your audio environment
-
-          if (data.samples.length === 0 || isSilent) {
-            return;
-          }
-
-          // Since the audio data is already in Int16Array format, send it directly
-          // No need for conversion from Float32Array
-          this.audioDataBuffer.push(data.samples);
+        // Skip bot's audio to prevent feedback loops
+        if (this.botProfile.id === data.userId) {
+          return;
         }
+
+        // Check if buffer is empty or contains no voice
+        const energy = this.calculateEnergy(data.samples);
+        const isSilent = energy < 50; // Adjust this threshold based on your audio environment
+
+        if (data.samples.length === 0 || isSilent) {
+          return;
+        }
+
+        // Add audio data to buffer for processing
+        this.audioDataBuffer.push(data.samples);
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
@@ -633,48 +595,55 @@ export class SttTtsPlugin implements Plugin {
 
     // Store the time of this transcription
     this.lastTranscriptionTime.set(userId, Date.now());
-
-    // Only process final transcriptions or ones that are long enough to be meaningful
-    if (isFinal || transcript.length > 15) {
-      // Check if the transcript changed significantly from what's already in the buffer
-      const currentBuffer = this.transcriptBuffer.get(userId) || '';
-      
-      // Update the buffer with the new transcript
-      this.transcriptBuffer.set(userId, transcript);
-
-      // For final transcriptions, process after a short delay to allow for corrections
-      // For non-final but substantial transcriptions, use a longer delay
-      const delayTime = isFinal ? 300 : 1000;
-
-      // Clear any existing timeout for this user
-      if (this.processingTimeout.has(userId)) {
-        clearTimeout(this.processingTimeout.get(userId));
-      }
-
-      // Set a new timeout for processing
+    
+    // Update the transcript buffer
+    this.transcriptBuffer.set(userId, transcript);
+    
+    elizaLogger.debug(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
+    
+    // Clear any existing timeout for this user
+    if (this.processingTimeout.has(userId)) {
+      clearTimeout(this.processingTimeout.get(userId));
+    }
+    
+    // If this is a final transcript, process it immediately
+    if (isFinal) {
+      elizaLogger.log(`[SttTtsPlugin] Processing final transcript for user: ${userId}`);
+      this.processBufferedTranscription(userId);
+    } else {
+      // Set a timeout to process if we don't receive any more transcripts soon
       this.processingTimeout.set(
         userId,
         setTimeout(() => {
-          // Only process if there have been no new transcriptions during the timeout
           const lastTime = this.lastTranscriptionTime.get(userId) || 0;
           const elapsed = Date.now() - lastTime;
           
-          if (elapsed >= delayTime) {
+          // If no new transcripts in the last 500ms, process what we have
+          if (elapsed >= 500) {
+            elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout (${elapsed}ms) for user: ${userId}`);
             this.processBufferedTranscription(userId);
           }
-        }, delayTime)
+        }, 500) // 500ms timeout
       );
+    }
+  }
 
-      // Also set an inactivity timer to process if there's no activity for a while
-      if (this.inactivityTimer.has(userId)) {
-        clearTimeout(this.inactivityTimer.get(userId));
-      }
-
-      this.inactivityTimer.set(
-        userId,
-        setTimeout(() => {
-          this.processBufferedTranscription(userId);
-        }, this.inactivityDuration)
+  /**
+   * Process the buffered transcription for a user
+   */
+  private processBufferedTranscription(userId: string): void {
+    const bufferedTranscript = this.transcriptBuffer.get(userId);
+    
+    // Clear the buffer and all timeouts for this user
+    this.transcriptBuffer.delete(userId);
+    this.clearUserTimeouts(userId);
+    this.lastTranscriptionTime.delete(userId);
+    
+    // Process if there's content in the buffer
+    if (isNotEmpty(bufferedTranscript?.trim())) {
+      elizaLogger.log(`[SttTtsPlugin] Processing buffered transcription: "${bufferedTranscript}"`);
+      this.processTranscription(userId, bufferedTranscript).catch((err) =>
+        elizaLogger.error('[SttTtsPlugin] processTranscription error:', err)
       );
     }
   }
@@ -697,23 +666,16 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Process the buffered transcription for a user
+   * Stop the bot's speech when interrupted
    */
-  private processBufferedTranscription(userId: string): void {
-    const bufferedTranscript = this.transcriptBuffer.get(userId);
-    
-    // Clear the buffer and all timeouts for this user
-    this.transcriptBuffer.delete(userId);
-    this.clearUserTimeouts(userId);
-    this.lastTranscriptionTime.delete(userId);
-    
-    // Process if there's content in the buffer
-    if (isNotEmpty(bufferedTranscript?.trim())) {
-      elizaLogger.log(`[SttTtsPlugin] Processing buffered transcription: ${bufferedTranscript}`);
-      this.processTranscription(userId, bufferedTranscript).catch((err) =>
-        elizaLogger.error('[SttTtsPlugin] processTranscription error:', err)
-      );
+  private stopSpeaking(): void {
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
     }
+    this.isSpeaking = false;
+    this.ttsQueue = []; // Clear the queue
+    elizaLogger.log('[SttTtsPlugin] Bot speech interrupted by user');
   }
 
   /**
@@ -1303,7 +1265,7 @@ export class SttTtsPlugin implements Plugin {
 
           elizaLogger.log('[SttTtsPlugin] Stream ended for user:', userId);
           elizaLogger.log(
-            `[SttTtsPlugin] user=${userId}, complete reply="${accumulatedText}"`,
+            `[SttTtsPlugin] user=${userId}, complete reply="${this.textBuffer}"`,
           );
 
           // Remove all stream listeners to prevent memory leaks
