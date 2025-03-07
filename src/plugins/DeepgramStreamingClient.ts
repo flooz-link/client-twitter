@@ -16,7 +16,7 @@ import type {
 } from '@flooz-link/agent-twitter-client';
 import type { ClientBase, TwitterProfile } from '../base';
 import { twitterSpaceTemplate } from './templates';
-import { isEmpty } from '../utils';
+import { isEmpty, isNotEmpty } from '../utils';
 import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
@@ -167,8 +167,10 @@ export class SttTtsPlugin implements Plugin {
         this.socket = this.deepgram.listen.live({
           language: "en",
           punctuate: true,
-          smart_format: true,
-          model: "nova",
+          smart_format: false,
+          filler_words: true,
+          unknown_words: true,
+          model: "nova-3",
           encoding: "linear16",  // PCM 16-bit
           sample_rate: 48000,    // Adjust to match your Janus audio configuration
           channels: 1,           // Mono audio
@@ -179,7 +181,6 @@ export class SttTtsPlugin implements Plugin {
         
         if (this.keepAlive) clearInterval(this.keepAlive);
         this.keepAlive = setInterval(() => {
-          console.log("deepgram: keepalive");
           this.socket.keepAlive();
         }, 10 * 1000);
 
@@ -221,8 +222,8 @@ export class SttTtsPlugin implements Plugin {
         console.log("deepgram: connected successfully");
         
         // Send a silent audio buffer to test the connection
-        const silentBuffer = new Int16Array(960).fill(0);
-        this.socket.send(silentBuffer.buffer);
+        // const silentBuffer = new Int16Array(960).fill(0);
+        // this.socket.send(silentBuffer.buffer);
         
         console.log("deepgram: sent initial silent buffer to test connection");
       });
@@ -291,12 +292,12 @@ export class SttTtsPlugin implements Plugin {
     elizaLogger.log(`[SttTtsPlugin] Transcription (${isFinal ? 'final' : 'interim'}): ${transcript} for user ${userId}`);
 
     // If the bot is speaking and any transcription is received, stop it
-    if (this.isSpeaking && transcript.trim()) {
+    if (this.isSpeaking && isEmpty(transcript?.trim())) {
       this.stopSpeaking();
     }
 
     // Process final transcriptions for conversation
-    if (isFinal && transcript.trim()) {
+    if (isFinal && !isNotEmpty(transcript?.trim())) {
       this.processTranscription(userId, transcript).catch((err) =>
         elizaLogger.error('[SttTtsPlugin] processTranscription error:', err)
       );
