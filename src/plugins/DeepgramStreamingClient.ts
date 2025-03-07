@@ -407,6 +407,37 @@ export class SttTtsPlugin implements Plugin {
       this.currentStreamId = streamId;
       this.activeStreams.add(streamId);
 
+      // Set up event listeners for handling the streaming response
+      // These need to be set up BEFORE we start the streaming process
+      console.log('[SttTtsPlugin] Setting up event listeners for stream ID:', streamId);
+      
+      // Handle each text chunk as it comes in
+      this.eventEmitter.on('stream-chunk', (chunk: string, chunkStreamId?: string) => {
+        // Ignore chunks from other streams
+        if (chunkStreamId !== streamId) {
+          console.log('[SttTtsPlugin] Ignoring chunk from different stream', chunkStreamId);
+          return;
+        }
+        
+        console.log(`[SttTtsPlugin] Processing stream chunk: "${chunk}"`);
+        // Add the text to the TTS queue for processing
+        this.speakText(chunk);
+      });
+      
+      // Clean up when the stream ends
+      this.eventEmitter.once('stream-end', (endStreamId?: string) => {
+        // Only clean up if this is our stream
+        if (endStreamId !== streamId) {
+          console.log('[SttTtsPlugin] Ignoring stream-end from different stream', endStreamId);
+          return;
+        }
+        
+        console.log('[SttTtsPlugin] Stream ended, removing listeners');
+        // Clean up the listeners when we're done
+        this.eventEmitter.removeAllListeners('stream-chunk');
+        this.eventEmitter.removeAllListeners('stream-end');
+      });
+
       // Handle the transcription with streaming response
       await this.handleUserMessageStreaming(transcript, userId);
     } catch (error) {
@@ -420,12 +451,18 @@ export class SttTtsPlugin implements Plugin {
    * Public method to queue a TTS request
    */
   public async speakText(text: string): Promise<void> {
+    console.log(`[SttTtsPlugin] Adding text to TTS queue: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
-      this.processTtsQueue().catch((err) => {
+      try {
+        await this.processTtsQueue();
+      } catch (err) {
+        console.error('[SttTtsPlugin] processTtsQueue error =>', err);
         elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
-      });
+        // Reset the speaking state to allow future processing attempts
+        this.isSpeaking = false;
+      }
     }
   }
 
@@ -480,6 +517,8 @@ export class SttTtsPlugin implements Plugin {
       mp3Stream.end();
     });
 
+    console.log('[SttTtsPlugin] Starting FFmpeg process for audio conversion');
+    
     const ffmpeg = spawn('ffmpeg', [
       '-i', 'pipe:0',
       '-f', 's16le',
@@ -490,6 +529,7 @@ export class SttTtsPlugin implements Plugin {
     ]);
 
     ffmpeg.on('error', (err) => {
+      console.error('[SttTtsPlugin] FFMPEG process error:', err);
       elizaLogger.error('[SttTtsPlugin] FFMPEG process error:', err);
       isInterrupted = true;
     });
@@ -497,30 +537,75 @@ export class SttTtsPlugin implements Plugin {
     const audioBuffer: Int16Array[] = [];
     const processingPromise = new Promise<void>((resolve, reject) => {
       let pcmBuffer = Buffer.alloc(0);
+      let bufferStats = {
+        totalChunks: 0,
+        totalBytes: 0,
+        emptyChunks: 0
+      };
 
       ffmpeg.stdout.on('data', (chunk: Buffer) => {
         if (isInterrupted || signal.aborted) return;
+
+        bufferStats.totalChunks++;
+        bufferStats.totalBytes += chunk.length;
+        
+        if (chunk.length === 0) {
+          bufferStats.emptyChunks++;
+          console.warn('[SttTtsPlugin] Received empty chunk from FFmpeg');
+          return;
+        }
 
         pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
         const FRAME_SIZE = 480;
         const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2));
 
         if (frameCount > 0) {
-          for (let i = 0; i < frameCount; i++) {
-            const frame = new Int16Array(
-              pcmBuffer.buffer.slice(
-                i * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
-                (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset,
-              ),
-            );
-            const frameCopy = new Int16Array(FRAME_SIZE);
-            frameCopy.set(frame);
-            audioBuffer.push(frameCopy);
+          console.log(`[SttTtsPlugin] Processing ${frameCount} audio frames (${pcmBuffer.length} bytes)`);
+          
+          try {
+            for (let i = 0; i < frameCount; i++) {
+              // Check for valid slice parameters
+              const startOffset = i * FRAME_SIZE * 2 + pcmBuffer.byteOffset;
+              const endOffset = (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset;
+              
+              if (startOffset >= pcmBuffer.buffer.byteLength || endOffset > pcmBuffer.buffer.byteLength) {
+                console.error(`[SttTtsPlugin] Invalid buffer slice: start=${startOffset}, end=${endOffset}, bufferLength=${pcmBuffer.buffer.byteLength}`);
+                continue;
+              }
+              
+              const frame = new Int16Array(
+                pcmBuffer.buffer.slice(
+                  startOffset,
+                  endOffset,
+                ),
+              );
+              
+              // Check for invalid audio data
+              let invalidData = false;
+              for (let j = 0; j < 5 && j < frame.length; j++) {
+                if (isNaN(frame[j]) || !isFinite(frame[j])) {
+                  invalidData = true;
+                  break;
+                }
+              }
+              
+              if (invalidData) {
+                console.error('[SttTtsPlugin] Invalid audio data detected in frame');
+                continue;
+              }
+              
+              const frameCopy = new Int16Array(FRAME_SIZE);
+              frameCopy.set(frame);
+              audioBuffer.push(frameCopy);
+            }
+            
+            pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
+          } catch (err) {
+            console.error('[SttTtsPlugin] Error processing audio frames:', err);
           }
-          pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
         }
       });
-
+      
       ffmpeg.stdout.on('end', () => {
         processingComplete = true;
         if (pcmBuffer.length > 0) {
@@ -747,9 +832,18 @@ export class SttTtsPlugin implements Plugin {
     let potentialActionMarker = false;
     let detectedAction = '';
 
+    console.log('[SttTtsPlugin] Starting to process OpenAI stream chunks');
+
     for await (const chunk of stream) {
+      console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
+      
       const content = chunk.choices[0]?.delta?.content || '';
-      if (!content) continue;
+      console.log('[SttTtsPlugin] Extracted content:', content);
+      
+      if (!content) {
+        console.log('[SttTtsPlugin] Empty content, skipping chunk');
+        continue;
+      }
 
       fullResponse += content;
 
@@ -767,12 +861,14 @@ export class SttTtsPlugin implements Plugin {
             detectedAction = actionMatch[1];
             const textBeforeAction = bufferedText.split('actionIs:')[0].trim();
             if (textBeforeAction) {
+              console.log('[SttTtsPlugin] Emitting stream-chunk with action text:', textBeforeAction);
               this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
             }
             bufferedText = '';
             potentialActionMarker = false;
           }
         } else if (bufferedText.length > 100) {
+          console.log('[SttTtsPlugin] Emitting stream-chunk with buffered text:', bufferedText);
           this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
           bufferedText = '';
           potentialActionMarker = false;
@@ -780,6 +876,7 @@ export class SttTtsPlugin implements Plugin {
         continue;
       }
 
+      console.log('[SttTtsPlugin] Emitting stream-chunk with regular content:', content);
       this.eventEmitter.emit('stream-chunk', content, streamId);
     }
 
@@ -787,6 +884,7 @@ export class SttTtsPlugin implements Plugin {
       if (bufferedText.includes('actionIs:')) {
         const textBeforeAction = bufferedText.split('actionIs:')[0].trim();
         if (textBeforeAction) {
+          console.log('[SttTtsPlugin] Emitting final stream-chunk with action text:', textBeforeAction);
           this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
         }
         const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
@@ -795,6 +893,7 @@ export class SttTtsPlugin implements Plugin {
           elizaLogger.log(`[SttTtsPlugin] Final detected action: ${detectedAction}`);
         }
       } else {
+        console.log('[SttTtsPlugin] Emitting final stream-chunk with remaining buffered text:', bufferedText);
         this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
       }
     }
