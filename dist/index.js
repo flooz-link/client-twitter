@@ -3032,11 +3032,13 @@ var SttTtsPlugin = class {
   // Counter for consecutive high-energy frames
   keepAlive = null;
   deepgramApiKey;
+  botProfile;
   init(params) {
-    var _a;
+    var _a, _b;
     elizaLogger6.log("[SttTtsPlugin] init => Space fully ready. Subscribing to events.");
     this.space = params.space;
-    this.janus = (_a = this.space) == null ? void 0 : _a.janusClient;
+    this.botProfile = (_a = params.pluginConfig) == null ? void 0 : _a.user;
+    this.janus = (_b = this.space) == null ? void 0 : _b.janusClient;
     const config = params.pluginConfig;
     this.runtime = config == null ? void 0 : config.runtime;
     this.client = config == null ? void 0 : config.client;
@@ -3073,33 +3075,40 @@ var SttTtsPlugin = class {
       this.socket = this.deepgram.listen.live({
         language: "en",
         punctuate: true,
-        smart_format: true,
-        model: "nova",
+        smart_format: false,
+        filler_words: true,
+        unknown_words: true,
+        model: "nova-3",
         encoding: "linear16",
         // PCM 16-bit
         sample_rate: 48e3,
         // Adjust to match your Janus audio configuration
         channels: 1,
         // Mono audio
-        interim_results: true
+        interim_results: true,
+        utterance_end_ms: 1e3,
+        vad_events: true,
+        endpointing: 300
+        //Time in milliseconds of silence to wait for before finalizing speech
       });
       console.log("Deepgram socket created");
       if (this.keepAlive) clearInterval(this.keepAlive);
       this.keepAlive = setInterval(() => {
-        console.log("deepgram: keepalive");
-        if (this.socket && this.socket.getReadyState() === 1) {
-          this.socket.keepAlive();
-        }
+        this.socket.keepAlive();
       }, 10 * 1e3);
       this.socket.addListener(LiveTranscriptionEvents.Transcript, (data) => {
-        var _a, _b, _c;
-        console.log("deepgram: transcript received", JSON.stringify(data));
+        var _a, _b, _c, _d, _e, _f;
+        console.log(`deepgram: transcript received isFinal: ${data.is_final} transcript: ${(_c = (_b = (_a = data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript}`);
         if (data && this.lastSpeaker) {
-          this.handleTranscription((_c = (_b = (_a = data == null ? void 0 : data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript, data.is_final, this.lastSpeaker);
+          this.handleTranscription((_f = (_e = (_d = data == null ? void 0 : data.channel) == null ? void 0 : _d.alternatives) == null ? void 0 : _e[0]) == null ? void 0 : _f.transcript, data.is_final, this.lastSpeaker);
         }
       });
-      this.socket.addListener(LiveTranscriptionEvents.Close, async () => {
-        console.log("deepgram: disconnected");
+      this.socket.addListener(LiveTranscriptionEvents.UtteranceEnd, (data) => {
+        var _a, _b, _c;
+        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${(_c = (_b = (_a = data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript}`);
+      });
+      this.socket.addListener(LiveTranscriptionEvents.Close, async (test) => {
+        console.log("deepgram: disconnected", test);
         if (this.keepAlive) {
           clearInterval(this.keepAlive);
           this.keepAlive = null;
@@ -3120,8 +3129,6 @@ var SttTtsPlugin = class {
       });
       this.socket.addListener(LiveTranscriptionEvents.Open, async () => {
         console.log("deepgram: connected successfully");
-        const silentBuffer = new Int16Array(960).fill(0);
-        this.socket.send(silentBuffer.buffer);
         console.log("deepgram: sent initial silent buffer to test connection");
       });
     } catch (error) {
@@ -3147,14 +3154,18 @@ var SttTtsPlugin = class {
     }
     this.lastSpeaker = data.userId;
     if (this.socket && this.socket.getReadyState() === 1) {
-      console.log("Sending audio data to Deepgram", data.samples.length);
       try {
-        this.socket.send(data.samples.buffer);
+        if (this.botProfile.id !== data.userId) {
+          const energy = this.calculateEnergy(data.samples);
+          const isSilent = energy < 50;
+          if (data.samples.length === 0 || isSilent) {
+            return;
+          }
+          this.socket.send(data.samples.buffer);
+        }
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
-    } else {
-      console.warn("Deepgram socket not ready, state:", this.socket ? this.socket.getReadyState() : "no socket");
     }
   }
   calculateEnergy(samples) {
@@ -3169,10 +3180,10 @@ var SttTtsPlugin = class {
    */
   handleTranscription(transcript, isFinal, userId) {
     elizaLogger6.log(`[SttTtsPlugin] Transcription (${isFinal ? "final" : "interim"}): ${transcript} for user ${userId}`);
-    if (this.isSpeaking && transcript.trim()) {
+    if (this.isSpeaking && isEmpty(transcript == null ? void 0 : transcript.trim())) {
       this.stopSpeaking();
     }
-    if (isFinal && transcript.trim()) {
+    if (isFinal && !isNotEmpty(transcript == null ? void 0 : transcript.trim())) {
       this.processTranscription(userId, transcript).catch(
         (err) => elizaLogger6.error("[SttTtsPlugin] processTranscription error:", err)
       );
@@ -3777,6 +3788,7 @@ var TwitterSpaceClient = class {
           sttTts.init({
             space: participant,
             pluginConfig: {
+              user: this.client.profile,
               runtime: this.runtime,
               client: this.client,
               spaceId: this.spaceId,
