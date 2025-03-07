@@ -507,15 +507,56 @@ export class SttTtsPlugin implements Plugin {
         offset += frame.length;
       }
       
-      // Now send to Janus directly, bypassing the per-chunk processing
+      // Now send to Janus directly, ensuring we split into 480-sample frames
       if (this.janus) {
-        await this.janus.pushLocalAudio(combinedBuffer, 48000);
+        const JANUS_FRAME_SIZE = 480; // Janus requires exactly 480 samples per frame
+        
+        // Process buffer in chunks of exactly 480 samples
+        for (let i = 0; i < combinedBuffer.length; i += JANUS_FRAME_SIZE) {
+          // Check if we have enough samples for a full frame
+          if (i + JANUS_FRAME_SIZE <= combinedBuffer.length) {
+            // Extract exact frame of 480 samples
+            const frame = combinedBuffer.subarray(i, i + JANUS_FRAME_SIZE);
+            try {
+              await this.janus.pushLocalAudio(frame, 48000);
+            } catch (err) {
+              console.error('[SttTtsPlugin] Error pushing audio frame to Janus:', err);
+            }
+          } else {
+            // Handle the remainder (partial frame) by padding with silence
+            const remainingSamples = combinedBuffer.length - i;
+            if (remainingSamples > 0) {
+              // Create a frame with exactly 480 samples, filled with silence (zeros)
+              const paddedFrame = new Int16Array(JANUS_FRAME_SIZE);
+              // Copy the remaining samples
+              paddedFrame.set(combinedBuffer.subarray(i));
+              // Rest is already zeros (silence)
+              
+              try {
+                await this.janus.pushLocalAudio(paddedFrame, 48000);
+              } catch (err) {
+                console.error('[SttTtsPlugin] Error pushing final padded frame to Janus:', err);
+              }
+            }
+          }
+        }
       }
     } catch (err) {
       console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
     } finally {
       this.isProcessingAudioData = false;
     }
+  }
+
+  /**
+   * Calculate the energy of an audio frame
+   */
+  private calculateEnergy(samples: Int16Array): number {
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sum += Math.abs(samples[i]);
+    }
+    return sum / samples.length;
   }
 
   /**
@@ -560,14 +601,6 @@ export class SttTtsPlugin implements Plugin {
         console.error("Error sending audio to Deepgram:", error);
       }
     }
-  }
-
-  private calculateEnergy(samples: Int16Array): number {
-    let sum = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sum += Math.abs(samples[i]);
-    }
-    return sum / samples.length;
   }
 
   /**
