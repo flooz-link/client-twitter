@@ -66,7 +66,7 @@ export class SttTtsPlugin implements Plugin {
   private isSpeaking = false;
   private isProcessingAudio = false;
   private ttsAbortController: AbortController | null = null;
-  private currentStreamId: string | null = null;
+  private latestActiveStreamId: string | null = null;
   private activeStreams = new Set<string>();
   private eventEmitter = new EventEmitter();
   private openai: OpenAI;
@@ -343,12 +343,14 @@ export class SttTtsPlugin implements Plugin {
 
       console.log("Deepgram socket created");
 
-      if (this.keepAlive) clearInterval(this.keepAlive);
+      if (this.keepAlive) {
+        clearInterval(this.keepAlive);
+      }
       this.keepAlive = setInterval(() => {
-        if (this.socket && this.socket.getReadyState() === 1) { // Only send keepalive if socket is open
-          this.socket.keepAlive();
+        if (this.socket) { // Only send keepalive if socket is open
+          this.socket?.keepAlive();
         }
-      }, 10 * 1000);
+      }, 10 * 5000);
 
       // Setup event listeners outside of the Open event to ensure they're registered
       // before any messages arrive
@@ -555,7 +557,6 @@ export class SttTtsPlugin implements Plugin {
    */
   private clearUserTimeouts(userId: string): void {
     // Clear processing timeout
-    // Clear processing timeout
     if (this.processingTimeout.has(userId)) {
       clearTimeout(this.processingTimeout.get(userId));
       this.processingTimeout.delete(userId);
@@ -606,7 +607,7 @@ export class SttTtsPlugin implements Plugin {
       
       // Generate a unique stream ID for this response
       const streamId = uuidv4();
-      this.currentStreamId = streamId;
+      this.latestActiveStreamId = streamId;
       this.activeStreams.add(streamId);
       
       elizaLogger.log(`[SttTtsPlugin] Starting stream with ID: ${streamId} for transcript: ${transcript}`);
@@ -623,14 +624,14 @@ export class SttTtsPlugin implements Plugin {
         if (chunkStreamId === streamId) {
           this.bufferTextForTTS(text, streamId);
         } else {
-          elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from different stream. Expected: ${streamId}, Got: ${chunkStreamId}`);
+          console.log(`[SttTtsPlugin] Ignoring chunk from different stream. Expected: ${streamId}, Got: ${chunkStreamId}`);
         }
       };
       
       const handleStreamEnd = (endStreamId?: string) => {
         // Only clean up if this is our stream
         if (!endStreamId || !this.activeStreams.has(endStreamId)) {
-          elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
+          console.log(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
           return;
         }
         
@@ -649,7 +650,7 @@ export class SttTtsPlugin implements Plugin {
       this.eventEmitter.once('stream-end', handleStreamEnd);
 
       // Start the streaming response from Grok
-      await this.handleUserMessageStreaming(transcript, userId);
+      await this.handleUserMessageStreaming(transcript, userId, streamId);
     } catch (error) {
       // Handle both transcription errors and general errors
       if (
@@ -674,16 +675,14 @@ export class SttTtsPlugin implements Plugin {
   /**
    * Handle User Message with streaming support
    */
-  private async handleUserMessageStreaming(userText: string, userId: string): Promise<void> {
+  private async handleUserMessageStreaming(userText: string, userId: string, streamId: string): Promise<void> {
     // Create a new stream ID if one doesn't exist
-    if (!this.currentStreamId) {
-      const newStreamId = uuidv4();
-      elizaLogger.log(`[SttTtsPlugin] Creating new stream ID: ${newStreamId} as none exists`);
-      this.currentStreamId = newStreamId;
-      this.activeStreams.add(newStreamId);
+    if (!this.latestActiveStreamId) {
+      elizaLogger.log(`[SttTtsPlugin] Creating new stream ID: ${streamId} as none exists`);
+      this.latestActiveStreamId = streamId;
+      this.activeStreams.add(streamId);
     }
     
-    const streamId = this.currentStreamId;
     
     // Double-check the stream is active
     if (!this.activeStreams.has(streamId)) {
@@ -894,7 +893,7 @@ export class SttTtsPlugin implements Plugin {
     
     // Clear active streams but preserve event listeners
     this.activeStreams.clear();
-    this.currentStreamId = null;
+    this.latestActiveStreamId = null;
     
     // Don't remove all listeners as it could affect other parts of the system
     // Instead, we'll manage listeners for specific streams in their respective handlers
@@ -907,25 +906,25 @@ export class SttTtsPlugin implements Plugin {
    */
   private bufferTextForTTS(text: string, streamId: string): void {
     // Enhanced stream ID handling
-    if (!this.currentStreamId || !this.activeStreams.has(streamId)) {
+    if (!this.latestActiveStreamId || !this.activeStreams.has(streamId)) {
       // Try to recover by creating a new stream ID if needed
-      if (!this.currentStreamId) {
+      if (!this.latestActiveStreamId) {
         elizaLogger.warn('[SttTtsPlugin] No current stream ID found, creating a new one');
         const newStreamId = uuidv4();
-        this.currentStreamId = newStreamId;
+        this.latestActiveStreamId = newStreamId;
         this.activeStreams.add(newStreamId);
         // Continue with the new stream ID
         streamId = newStreamId;
       } else if (!this.activeStreams.has(streamId)) {
         elizaLogger.warn(`[SttTtsPlugin] Stream ID ${streamId} is no longer active, attempting to re-use current stream ID`);
         // Use the current stream ID instead if it exists
-        if (this.activeStreams.has(this.currentStreamId)) {
-          streamId = this.currentStreamId;
+        if (this.activeStreams.has(this.latestActiveStreamId)) {
+          streamId = this.latestActiveStreamId;
         } else {
           // If current stream ID is also inactive, create a new one
-          elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.currentStreamId} is also inactive, creating a new one`);
+          elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.latestActiveStreamId} is also inactive, creating a new one`);
           const newStreamId = uuidv4();
-          this.currentStreamId = newStreamId;
+          this.latestActiveStreamId = newStreamId;
           this.activeStreams.add(newStreamId);
           streamId = newStreamId;
         }
@@ -973,16 +972,16 @@ export class SttTtsPlugin implements Plugin {
     }
     
     // Check if we have a valid current stream ID
-    if (!this.currentStreamId) {
+    if (!this.latestActiveStreamId) {
       elizaLogger.warn('[SttTtsPlugin] No current stream ID for TTS, creating a new one');
-      this.currentStreamId = uuidv4();
-      this.activeStreams.add(this.currentStreamId);
+      this.latestActiveStreamId = uuidv4();
+      this.activeStreams.add(this.latestActiveStreamId);
     }
     
     // Ensure the current stream ID is in active streams
-    if (!this.activeStreams.has(this.currentStreamId)) {
-      elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.currentStreamId} is not active, adding it`);
-      this.activeStreams.add(this.currentStreamId);
+    if (!this.activeStreams.has(this.latestActiveStreamId)) {
+      elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.latestActiveStreamId} is not active, adding it`);
+      this.activeStreams.add(this.latestActiveStreamId);
     }
     
     // Send the buffered text to TTS queue
@@ -1354,7 +1353,7 @@ export class SttTtsPlugin implements Plugin {
       this.ttsAbortController = null;
     }
     this.activeStreams.clear();
-    this.currentStreamId = null;
+    this.latestActiveStreamId = null;
     this.eventEmitter.removeAllListeners();
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
