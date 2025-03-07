@@ -118,40 +118,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Initialize Deepgram
     this.initializeDeepgram();
-  
-    //   this.socket.addListener(LiveTranscriptionEvents.Transcript, (data) => {
-    //     console.log("deepgram: packet received");
-    //     console.log("deepgram: transcript received");
-    //     console.log("socket: transcript sent to client");
-    //     if (data && this.lastSpeaker) {
-    //       this.handleTranscription(data, data.is_final, this.lastSpeaker);
-    //     }
-    //   });
-  
-    //   this.socket.addListener(LiveTranscriptionEvents.Close, async () => {
-    //     console.log("deepgram: disconnected");
-    //     clearInterval(this.keepAlive);
-    //     this.socket.finish();
-    //   });
-  
-    //   this.socket.addListener(LiveTranscriptionEvents.Error, async (error) => {
-    //     console.log("deepgram: error received");
-    //     console.error(error);
-    //   });
-  
-    //   this.socket.addListener(LiveTranscriptionEvents.Warning, async (warning) => {
-    //     console.log("deepgram: warning received");
-    //     console.warn(warning);
-    //   });
-  
-    //   this.socket.addListener(LiveTranscriptionEvents.Metadata, (data) => {
-    //     console.log("deepgram: packet received");
-    //     console.log("deepgram: metadata received");
-    //     console.log("ws: metadata sent to client");
-    //     this.eventEmitter.emit('metadata', data);
-    //   });
-    // });
-
   }
 
 
@@ -187,7 +153,7 @@ export class SttTtsPlugin implements Plugin {
           // Setup event listeners outside of the Open event to ensure they're registered
       // before any messages arrive
       this.socket.addListener(LiveTranscriptionEvents.Transcript, (data: TranscriptData) => {
-        console.log("deepgram: transcript received", JSON.stringify(data));
+        console.log(`deepgram: transcript received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript}`);
         if (data && this.lastSpeaker) {
           this.handleTranscription(data?.channel?.alternatives?.[0]?.transcript, data.is_final, this.lastSpeaker);
         }
