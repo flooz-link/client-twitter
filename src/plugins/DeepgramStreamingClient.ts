@@ -357,9 +357,6 @@ export class SttTtsPlugin implements Plugin {
 
     // Initialize Deepgram
     this.initializeDeepgram();
-
-    // Initialize audio processing system
-    // this.initAudioProcessing();
   }
 
   private initializeDeepgram(): void {
@@ -459,77 +456,6 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Initialize the audio processing system
-   */
-  private initAudioProcessing(): void {
-    // Clear any existing timer
-    if (this.audioProcessingTimer) {
-      clearInterval(this.audioProcessingTimer);
-    }
-    
-    // Start a periodic timer to process buffered audio data
-    this.audioProcessingTimer = setInterval(() => {
-      this.processAudioDataBuffer();
-    }, this.AUDIO_PROCESSING_INTERVAL);
-    
-    console.log('[SttTtsPlugin] Audio processing system initialized');
-  }
-
-  /**
-   * Process the audio data buffer
-   */
-  private async processAudioDataBuffer(): Promise<void> {
-    // Don't process if already processing or no data
-    if (this.isProcessingAudioData || this.audioDataBuffer.length === 0) {
-      return;
-    }
-    
-    try {
-      this.isProcessingAudioData = true;
-      
-      // Get all frames from the buffer
-      const frames = [...this.audioDataBuffer];
-      this.audioDataBuffer = [];
-      
-      // Skip if no frames
-      if (frames.length === 0) {
-        return;
-      }
-      
-      // Calculate total length
-      const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
-      
-      // Create a combined buffer for smoother audio
-      const combinedBuffer = new Int16Array(totalLength);
-      let offset = 0;
-      
-      // Copy frames with crossfade between adjacent frames to reduce clicks/pops
-      for (let i = 0; i < frames.length; i++) {
-        const frame = frames[i];
-        
-        // Simple copy for now, could implement crossfade for smoother transitions
-        combinedBuffer.set(frame, offset);
-        offset += frame.length;
-      }
-      
-      // ONLY send to Deepgram for transcription - NOT to Janus
-      // This prevents the user from hearing their own voice
-      if (this.socket && this.socket.getReadyState() === 1) {
-        elizaLogger.debug('[SttTtsPlugin] Sending combined audio buffer to Deepgram');
-        this.socket.send(combinedBuffer.buffer);
-      }
-      
-      // REMOVED: Do not send to Janus anymore - this was causing echo
-      // The audio should only go to Deepgram for transcription
-      
-    } catch (err) {
-      console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
-    } finally {
-      this.isProcessingAudioData = false;
-    }
-  }
-
-  /**
    * Calculate the energy of an audio frame
    */
   private calculateEnergy(samples: Int16Array): number {
@@ -576,8 +502,9 @@ export class SttTtsPlugin implements Plugin {
           return;
         }
 
-        // Add audio data to buffer for processing
-        this.audioDataBuffer.push(data.samples);
+        // Stream audio data directly to Deepgram instead of buffering
+        elizaLogger.debug('[SttTtsPlugin] Streaming audio data directly to Deepgram');
+        this.socket.send(data.samples.buffer);
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
@@ -596,7 +523,7 @@ export class SttTtsPlugin implements Plugin {
     // Store the time of this transcription
     this.lastTranscriptionTime.set(userId, Date.now());
     
-    // Update the transcript buffer
+    // Update the transcript buffer - buffer the transcribed text instead of calling the LLM
     this.transcriptBuffer.set(userId, transcript);
     
     elizaLogger.debug(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
@@ -612,6 +539,7 @@ export class SttTtsPlugin implements Plugin {
       this.processBufferedTranscription(userId);
     } else {
       // Set a timeout to process if we don't receive any more transcripts soon
+      // If more than 500 ms pass without events, flush the buffer
       this.processingTimeout.set(
         userId,
         setTimeout(() => {
