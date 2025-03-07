@@ -492,7 +492,7 @@ export class SttTtsPlugin implements Plugin {
       
       // Calculate total length
       const totalLength = frames.reduce((acc, frame) => acc + frame.length, 0);
-      console.log(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
+      elizaLogger.debug(`[SttTtsPlugin] Processing ${frames.length} buffered audio frames (${totalLength} samples)`);
       
       // Create a combined buffer for smoother audio
       const combinedBuffer = new Int16Array(totalLength);
@@ -507,15 +507,59 @@ export class SttTtsPlugin implements Plugin {
         offset += frame.length;
       }
       
-      // Now send to Janus directly, bypassing the per-chunk processing
+      // Now send to Janus - ensuring we send the correct frame size (480 samples)
       if (this.janus) {
-        await this.janus.pushLocalAudio(combinedBuffer, 48000);
+        const JANUS_FRAME_SIZE = 480; // Janus expects frames of 480 samples
+        
+        // Process the combined buffer in chunks of the correct frame size
+        for (let i = 0; i < combinedBuffer.length; i += JANUS_FRAME_SIZE) {
+          // Create a slice of the appropriate size
+          const frameSize = Math.min(JANUS_FRAME_SIZE, combinedBuffer.length - i);
+          const frame = combinedBuffer.subarray(i, i + frameSize);
+          
+          // Only send complete frames of the expected size
+          if (frame.length === JANUS_FRAME_SIZE) {
+            try {
+              await this.janus.pushLocalAudio(frame, 48000);
+            } catch (err) {
+              elizaLogger.error(`[SttTtsPlugin] Error pushing audio frame to Janus:`, err);
+              // Continue processing other frames even if one fails
+            }
+          } else if (frame.length > 0) {
+            // Handle partial frame at the end by padding to expected size
+            const paddedFrame = new Int16Array(JANUS_FRAME_SIZE);
+            paddedFrame.set(frame);
+            // Fill the rest with silence (zeros)
+            for (let j = frame.length; j < JANUS_FRAME_SIZE; j++) {
+              paddedFrame[j] = 0;
+            }
+            
+            try {
+              await this.janus.pushLocalAudio(paddedFrame, 48000);
+            } catch (err) {
+              elizaLogger.error(`[SttTtsPlugin] Error pushing padded audio frame to Janus:`, err);
+            }
+          }
+        }
+        
+        elizaLogger.debug(`[SttTtsPlugin] Sent ${Math.ceil(combinedBuffer.length / JANUS_FRAME_SIZE)} frames to Janus`);
       }
     } catch (err) {
-      console.error('[SttTtsPlugin] Error processing audio data buffer:', err);
+      elizaLogger.error('[SttTtsPlugin] Error processing audio data buffer:', err);
     } finally {
       this.isProcessingAudioData = false;
     }
+  }
+
+  /**
+   * Calculate the energy of an audio frame
+   */
+  private calculateEnergy(samples: Int16Array): number {
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sum += Math.abs(samples[i]);
+    }
+    return sum / samples.length;
   }
 
   /**
@@ -540,10 +584,8 @@ export class SttTtsPlugin implements Plugin {
 
     // Make sure socket is ready before sending data
     if (this.socket && this.socket.getReadyState() === 1) { // WebSocket.OPEN
-
       try {
         if (this.botProfile.id !== data.userId) {
-
           // Check if buffer is empty or contains no voice
           const energy = this.calculateEnergy(data.samples);
           const isSilent = energy < 50; // Adjust this threshold based on your audio environment
@@ -557,17 +599,9 @@ export class SttTtsPlugin implements Plugin {
           this.audioDataBuffer.push(data.samples);
         }
       } catch (error) {
-        console.error("Error sending audio to Deepgram:", error);
+        elizaLogger.error("Error sending audio to Deepgram:", error);
       }
     }
-  }
-
-  private calculateEnergy(samples: Int16Array): number {
-    let sum = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sum += Math.abs(samples[i]);
-    }
-    return sum / samples.length;
   }
 
   /**
