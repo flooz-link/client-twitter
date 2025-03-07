@@ -610,8 +610,9 @@ export class SttTtsPlugin implements Plugin {
         return;
       }
       
+      const transcriptLen = transcript?.trim()?.length ?? 0
       // Check if the transcript is too short to be meaningful
-      if (transcript.trim().length < 5) {
+      if (transcriptLen< 5) {
         console.log('[SttTtsPlugin] Transcript too short, ignoring:', transcript);
         return;
       }
@@ -631,16 +632,17 @@ export class SttTtsPlugin implements Plugin {
       // Reset the text buffer
       this.textBuffer = '';
       
-      // Attach event listeners for this stream to handle chunks and stream end events
-      this.eventEmitter.on('stream-chunk', (chunkStreamId, text) => {
+      // Create named handler functions for this specific stream
+      const handleChunkForStream = (text: string, chunkStreamId: string) => {
         // Only process chunks for the current stream
         if (chunkStreamId === streamId) {
           this.bufferTextForTTS(text, streamId);
+        } else {
+          elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from different stream. Expected: ${streamId}, Got: ${chunkStreamId}`);
         }
-      });
+      };
       
-      // Clean up when the stream ends
-      this.eventEmitter.once('stream-end', (endStreamId?: string) => {
+      const handleStreamEnd = (endStreamId?: string) => {
         // Only clean up if this is our stream
         if (!endStreamId || !this.activeStreams.has(endStreamId)) {
           elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
@@ -652,11 +654,14 @@ export class SttTtsPlugin implements Plugin {
           `[SttTtsPlugin] user=${userId}, complete reply="${this.textBuffer}"`,
         );
 
-        // Remove all stream listeners to prevent memory leaks
-        this.eventEmitter.removeAllListeners('stream-chunk');
-        this.eventEmitter.removeAllListeners('stream-start');
-        this.eventEmitter.removeAllListeners('stream-end');
-      });
+        // Only remove listeners specific to this stream
+        this.eventEmitter.removeListener('stream-chunk', handleChunkForStream);
+        this.eventEmitter.removeListener('stream-end', handleStreamEnd);
+      };
+      
+      // Attach event listeners for this stream
+      this.eventEmitter.on('stream-chunk', handleChunkForStream);
+      this.eventEmitter.once('stream-end', handleStreamEnd);
 
       // Start the streaming response from Grok
       await this.handleUserMessageStreaming(transcript, userId);
@@ -685,10 +690,20 @@ export class SttTtsPlugin implements Plugin {
    * Handle User Message with streaming support
    */
   private async handleUserMessageStreaming(userText: string, userId: string): Promise<void> {
+    // Create a new stream ID if one doesn't exist
+    if (!this.currentStreamId) {
+      const newStreamId = uuidv4();
+      elizaLogger.log(`[SttTtsPlugin] Creating new stream ID: ${newStreamId} as none exists`);
+      this.currentStreamId = newStreamId;
+      this.activeStreams.add(newStreamId);
+    }
+    
     const streamId = this.currentStreamId;
-    if (!streamId || !this.activeStreams.has(streamId)) {
-      elizaLogger.error('[SttTtsPlugin] No current stream ID found or stream is no longer active');
-      return;
+    
+    // Double-check the stream is active
+    if (!this.activeStreams.has(streamId)) {
+      elizaLogger.warn(`[SttTtsPlugin] Stream ${streamId} not found in active streams, adding it`);
+      this.activeStreams.add(streamId);
     }
 
     elizaLogger.log(`[SttTtsPlugin] Handling user message with stream ID: ${streamId}`);
@@ -799,85 +814,56 @@ export class SttTtsPlugin implements Plugin {
           const actionMatch = /actionIs:([A-Z_]+)/.exec(content);
           if (actionMatch) {
             detectedAction = actionMatch[1];
-            elizaLogger.log(`[SttTtsPlugin] Detected action in chunk: ${detectedAction}`);
+            elizaLogger.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
           }
           
-          // Skip the rest of this chunk processing
+          potentialActionMarker = true;
           continue;
         }
       }
       
-      // Check if we're in the process of identifying an action marker
-      if (!potentialActionMarker && (content.includes('action') || content.includes('```'))) {
-        potentialActionMarker = true;
-        bufferedText += content;
-        continue;
-      }
-
+      // Handle potential action continuation
       if (potentialActionMarker) {
-        bufferedText += content;
-        if (bufferedText.includes('actionIs:') || bufferedText.includes('```actionIs:')) {
-          // Extract the parts before and after the action marker
-          const parts = bufferedText.split(/(\`\`\`actionIs:|actionIs:)/);
-          if (parts.length > 1) {
-            const textBeforeAction = parts[0].trim();
-            if (textBeforeAction) {
-              console.log('[SttTtsPlugin] Emitting buffered text before action:', textBeforeAction);
-              this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
-            }
-            
-            // Extract the action name
-            const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
-            if (actionMatch) {
-              detectedAction = actionMatch[1];
-              elizaLogger.log(`[SttTtsPlugin] Detected action in buffer: ${detectedAction}`);
-            }
+        // Check if we're still in an action block
+        if (content.includes('```')) {
+          potentialActionMarker = false;
+          
+          // Extract any text after the action block
+          const parts = content.split(/\`\`\`/);
+          if (parts.length > 1 && parts[1].trim()) {
+            console.log('[SttTtsPlugin] Emitting chunk with text after action:', parts[1].trim());
+            this.eventEmitter.emit('stream-chunk', parts[1].trim(), streamId);
           }
-          bufferedText = '';
-          potentialActionMarker = false;
-        } else if (bufferedText.length > 100) {
-          // If buffer gets too big without finding an action, just emit it
-          console.log('[SttTtsPlugin] Emitting large buffered text (no action found):', bufferedText);
-          this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
-          bufferedText = '';
-          potentialActionMarker = false;
         }
+        // Skip content that's part of an action block
         continue;
       }
-
-      // Regular content, just emit it
-      console.log('[SttTtsPlugin] Emitting regular chunk content:', content);
-      this.eventEmitter.emit('stream-chunk', content, streamId);
-    }
-
-    // Process any remaining buffered text, being careful with action markers
-    if (bufferedText) {
-      if (bufferedText.includes('actionIs:') || bufferedText.includes('```actionIs:')) {
-        // Extract only the text before the marker
-        const parts = bufferedText.split(/(\`\`\`actionIs:|actionIs:)/);
-        const textBeforeAction = parts[0].trim();
-        if (textBeforeAction) {
-          console.log('[SttTtsPlugin] Emitting final text before action:', textBeforeAction);
-          this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
-        }
-        
-        // Extract the action
-        const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
-        if (actionMatch) {
-          detectedAction = actionMatch[1];
-          elizaLogger.log(`[SttTtsPlugin] Final detected action: ${detectedAction}`);
-        }
-      } else {
-        // No action marker, emit the whole buffer
-        console.log('[SttTtsPlugin] Emitting final buffered text:', bufferedText);
+      
+      // Normal text content - buffer it and emit when appropriate
+      bufferedText += content;
+      
+      // If we have accumulated enough text or hit natural break points, emit it
+      const hasNaturalBreak = /[.!?]\s*$/.test(bufferedText) || // Ends with punctuation
+                           /\n\s*$/.test(bufferedText);       // Ends with newline
+      
+      if (hasNaturalBreak || bufferedText.length > 20) {
+        console.log('[SttTtsPlugin] Emitting chunk with buffered text:', bufferedText);
         this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
+        bufferedText = '';
       }
     }
-
-    if (detectedAction) {
-      elizaLogger.log(`[SttTtsPlugin] Response contained action: ${detectedAction}`);
+    
+    // Emit any remaining buffered text
+    if (bufferedText.trim()) {
+      console.log('[SttTtsPlugin] Emitting final buffered text:', bufferedText);
+      this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
     }
-
+    
+    // Add the complete message to our conversation history
+    this.addMessage('user', userText);
+    this.addMessage('assistant', fullResponse);
+    
+    // Signal that the stream has ended
     this.eventEmitter.emit('stream-end', streamId);
   }
 
@@ -892,6 +878,8 @@ export class SttTtsPlugin implements Plugin {
     this.ttsAbortController = new AbortController();
     this.activeStreams.clear();
     this.currentStreamId = null;
+    this.eventEmitter.removeAllListeners();
+    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
   /**
@@ -899,7 +887,7 @@ export class SttTtsPlugin implements Plugin {
    * This buffers text until we have a natural break point or enough characters
    */
   private bufferTextForTTS(text: string, streamId: string): void {
-    // Check if stream ID is valid and still active
+    // Enhanced stream ID handling
     if (!this.currentStreamId || !this.activeStreams.has(streamId)) {
       // Try to recover by creating a new stream ID if needed
       if (!this.currentStreamId) {
@@ -910,10 +898,18 @@ export class SttTtsPlugin implements Plugin {
         // Continue with the new stream ID
         streamId = newStreamId;
       } else if (!this.activeStreams.has(streamId)) {
-        elizaLogger.warn(`[SttTtsPlugin] Stream ID ${streamId} is no longer active, using current stream ID`);
-        // Use the current stream ID instead
-        streamId = this.currentStreamId;
-        this.activeStreams.add(streamId);
+        elizaLogger.warn(`[SttTtsPlugin] Stream ID ${streamId} is no longer active, attempting to re-use current stream ID`);
+        // Use the current stream ID instead if it exists
+        if (this.activeStreams.has(this.currentStreamId)) {
+          streamId = this.currentStreamId;
+        } else {
+          // If current stream ID is also inactive, create a new one
+          elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.currentStreamId} is also inactive, creating a new one`);
+          const newStreamId = uuidv4();
+          this.currentStreamId = newStreamId;
+          this.activeStreams.add(newStreamId);
+          streamId = newStreamId;
+        }
       }
     }
 
@@ -960,6 +956,12 @@ export class SttTtsPlugin implements Plugin {
     if (!this.currentStreamId) {
       elizaLogger.warn('[SttTtsPlugin] No current stream ID for TTS, creating a new one');
       this.currentStreamId = uuidv4();
+      this.activeStreams.add(this.currentStreamId);
+    }
+    
+    // Ensure the current stream ID is in active streams
+    if (!this.activeStreams.has(this.currentStreamId)) {
+      elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.currentStreamId} is not active, adding it`);
       this.activeStreams.add(this.currentStreamId);
     }
     
