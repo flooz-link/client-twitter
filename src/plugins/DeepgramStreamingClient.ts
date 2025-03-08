@@ -100,68 +100,6 @@ export class SttTtsPlugin implements Plugin {
   // Debouncing mechanism
   private pendingMessages: Map<string, string> = new Map(); // userId -> latestMessage
 
-  /**
-   * Transcription service interface
-   */
-  private transcriptionService = {
-    transcribe: async (audioBuffer: ArrayBuffer): Promise<string> => {
-      try {
-        // Convert the audio to a Uint8Array for sending to Deepgram
-        const audioData = new Uint8Array(audioBuffer);
-        
-        if (!audioData || audioData.length === 0) {
-          throw new Error('Empty audio data provided for transcription');
-        }
-        
-        console.log(`[SttTtsPlugin] Transcribing audio: ${audioData.length} bytes`);
-        
-        // Return empty string if socket is not ready
-        if (!this.socket || this.socket.getReadyState() !== 1) {
-          console.error('[SttTtsPlugin] Deepgram socket not ready for transcription');
-          return '';
-        }
-        
-        // Send the audio data to Deepgram for transcription
-        this.socket.send(audioData);
-        
-        // Wait for transcription result - we'll use a promise that resolves when utterance is complete
-        return new Promise<string>((resolve) => {
-          let transcriptionResult = '';
-          
-          // Setup timeout to handle case where no transcription comes back
-          const timeout = setTimeout(() => {
-            console.warn('[SttTtsPlugin] Transcription timed out, returning empty result');
-            cleanup();
-            resolve('');
-          }, 10000); // 10 second timeout
-          
-          // Function to clean up event listeners
-          const cleanup = () => {
-            this.eventEmitter.removeListener('transcription-complete', handleTranscriptionComplete);
-            clearTimeout(timeout);
-          };
-          
-          // Handler for transcription completion
-          const handleTranscriptionComplete = (userId: string, transcript: string) => {
-            if (transcript && transcript.length > 0) {
-              transcriptionResult = transcript;
-              cleanup();
-              resolve(transcriptionResult);
-            }
-          };
-          
-          // Listen for transcription completion event
-          this.eventEmitter.once('transcription-complete', handleTranscriptionComplete);
-        });
-      } catch (error) {
-        console.error('[SttTtsPlugin] Transcription error:', error);
-        // Create a custom error that can be detected in the calling code
-        const transcriptionError = new Error(`Failed to transcribe audio: ${error.message}`);
-        transcriptionError.name = 'TranscriptionError';
-        throw transcriptionError;
-      }
-    }
-  };
 
 
   /**

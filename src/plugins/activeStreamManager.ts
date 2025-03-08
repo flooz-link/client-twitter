@@ -25,31 +25,31 @@ export class ActiveStreamManager {
     }
 
     abort(streamId: string): void {
-        const stream = this.activeStreams.get(streamId)
+        const stream = this.activeStreams?.get(streamId)
         if (stream) {
             stream.active = false
         }
     }
 
     abortOthers(streamId: string): void {
-        this.activeStreams.forEach(stream => {
-            if (stream.id !== streamId) {
+        this.activeStreams?.forEach(stream => {
+            if (stream?.id !== streamId) {
                 stream.active = false
             }
         })
     }
 
     isActive(streamId: string): boolean {
-        const stream = this.activeStreams.get(streamId)
+        const stream = this.activeStreams?.get(streamId)
         return stream?.active ?? false
     }
 
 
     cleanup() {
         const now = Date.now()
-        this.activeStreams.forEach(stream => {
-            if (!stream.active && now - stream.startedAt > 30 * 1000) {
-                this.activeStreams.delete(stream.id)
+        this.activeStreams?.forEach(stream => {
+            if (!stream?.active && now - stream?.startedAt > 30 * 1000) {
+                this.activeStreams?.delete(stream.id)
             }
         })
         setTimeout(this.cleanup, 10 * 1000)
