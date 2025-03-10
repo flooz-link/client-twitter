@@ -94,7 +94,7 @@ export const twitterVoiceHandlerTemplate =
     export const twitterSpaceTemplate = (state: State, spaceMessages: ResponseStream[]) =>
     `# Task: Generate conversational voice dialog for {{agentName}}.
 
-You are in a twitter space, so keeps short and concise.
+You are in a twitter space, so keeps short and concise, try to add filler words to sound more human and natural, add exclamation marks and things that make the voice sound human.
 Do not create lenghty and repeatitive answers.
 **Important!**
 As you are in a twitter space, your answers will be streamed, hence try to avoid really long answers or really long pauses in your responses.

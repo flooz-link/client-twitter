@@ -21,7 +21,7 @@ import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
-import { createClient, DeepgramClient, ListenLiveClient, LiveTranscriptionEvents } from '@deepgram/sdk';
+import { createClient, DeepgramClient, ListenLiveClient, LiveTranscriptionEvents, SOCKET_STATES } from '@deepgram/sdk';
 import {ActiveStreamManager} from './activeStreamManager';
 
 interface PluginConfig {
@@ -240,21 +240,6 @@ export class SttTtsPlugin implements Plugin {
         }
       });
 
-      this.deepgramSocket.addListener(LiveTranscriptionEvents.UtteranceEnd, (data: TranscriptData) => {
-        console.log(`deepgram: utterance end received isFinal: ${data.is_final} transcript: ${data.channel?.alternatives?.[0]?.transcript} data: ${JSON.stringify(data)}`);
-        if (data && this.lastSpeaker) {
-          // Even if transcript is undefined in the utterance end event,
-          // we still want to process what's in the buffer
-          const hasBuffer = this.transcriptBuffer.has(this.lastSpeaker) && 
-                            isNotEmpty(this.transcriptBuffer.get(this.lastSpeaker)?.trim());
-          
-          if (hasBuffer) {
-            console.log(`[SttTtsPlugin] Processing due to utterance end: ${this.transcriptBuffer.get(this.lastSpeaker)}`);
-            // this.processBufferedTranscription(this.lastSpeaker);
-          }
-        }
-      });
-
       this.deepgramSocket.addListener(LiveTranscriptionEvents.Close, async (test) => {
         console.log("deepgram: disconnected", test);
         if (this.keepAlive) {
@@ -394,7 +379,7 @@ export class SttTtsPlugin implements Plugin {
     
     // If this is a final transcript, process it immediately
     if (isFinal) {
-      console.log(`[SttTtsPlugin] Processing final transcript for user: ${userId}`);
+      console.log(`[SttTtsPlugin] Processing final transcript for user: ${userId} with text: ${transcript}`);
       this.processBufferedTranscription(userId);
     } else {
       // Set a timeout to process if we don't receive any more transcripts soon
@@ -1137,7 +1122,7 @@ export class SttTtsPlugin implements Plugin {
 
     await Promise.race([
       processingPromise.catch((err) => {
-        elizaLogger.error('[SttTtsPlugin] Processing error:', err);
+        console.error('[SttTtsPlugin] Processing error:', err);
       }),
       new Promise<void>((resolve) => {
         const checkBuffer = () => {
@@ -1245,7 +1230,7 @@ export class SttTtsPlugin implements Plugin {
    */
   public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
     this.chatContext.push({ role, content });
-    elizaLogger.log(`[SttTtsPlugin] addMessage => role=${role}, content=${content}`);
+    console.log(`[SttTtsPlugin] addMessage => role=${role}, content=${content}`);
   }
 
   /**
@@ -1253,24 +1238,25 @@ export class SttTtsPlugin implements Plugin {
    */
   public clearChatContext() {
     this.chatContext = [];
-    elizaLogger.log('[SttTtsPlugin] clearChatContext => done');
+    console.log('[SttTtsPlugin] clearChatContext => done');
   }
 
   /**
    * Cleanup resources
    */
   cleanup(): void {
-    if (this.deepgramSocket && this.deepgramSocket.readyState === WebSocket.OPEN) {
-      this.deepgramSocket.close();
-      elizaLogger.log('[SttTtsPlugin] Deepgram WebSocket closed');
-    }
-    if (this.ttsAbortController) {
-      this.ttsAbortController.abort();
-      this.ttsAbortController = null;
-    }
-    this.activeStreamManager.cleanup();
-    this.latestActiveStreamId = null;
-    this.eventEmitter.removeAllListeners();
-    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
+    console.warn(`Close was called`)
+    // if (this.deepgramSocket && this.deepgramSocket.getReadyState() === SOCKET_STATES.OPEN) {
+    //   this.deepgramSocket.disconnect();
+    //   console.log('[SttTtsPlugin] Deepgram WebSocket closed');
+    // }
+    // if (this.ttsAbortController) {
+    //   this.ttsAbortController.abort();
+    //   this.ttsAbortController = null;
+    // }
+    // this.activeStreamManager.cleanup();
+    // this.latestActiveStreamId = null;
+    // this.eventEmitter.removeAllListeners();
+    // elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 }
