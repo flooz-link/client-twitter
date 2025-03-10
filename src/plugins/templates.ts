@@ -1,4 +1,5 @@
-import { messageCompletionFooter, shouldRespondFooter } from '@elizaos/core';
+import { messageCompletionFooter, shouldRespondFooter, State } from '@elizaos/core';
+import {ResponseStream} from './activeStreamManager';
 
 export const twitterShouldRespondTemplate =
   `# Task: Decide if {{agentName}} should respond.
@@ -90,7 +91,7 @@ export const twitterVoiceHandlerTemplate =
     ` + messageCompletionFooter;
 
 
-    export const twitterSpaceTemplate =
+    export const twitterSpaceTemplate = (state: State, spaceMessages: ResponseStream[]) =>
     `# Task: Generate conversational voice dialog for {{agentName}}.
 
 You are in a twitter space, so keeps short and concise.
@@ -112,6 +113,11 @@ Note that {{agentName}} is capable of multiple tasks but in the context of space
 {{messageDirections}}
 
 {{recentMessages}}
+
+**Important**
+You are in a streaming environment where the user is talking, hence we have partial requests from their end try to understand from the sequence of messages what the user wants.
+The partial events are:
+${spaceMessages.map((message, index) => `${index + 1}. ${message.message}`).join('\n')}
 
 # Instructions: Write the next message for {{agentName}}.
     

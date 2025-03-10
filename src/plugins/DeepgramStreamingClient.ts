@@ -8,6 +8,7 @@ import {
   type IAgentRuntime,
   type Memory,
   type Plugin,
+  State,
 } from '@elizaos/core';
 import type {
   Space,
@@ -96,9 +97,6 @@ export class SttTtsPlugin implements Plugin {
   private readonly MIN_TTS_BUFFER_SIZE = 20; // Minimum characters before sending to TTS
   private readonly MAX_TTS_BUFFER_SIZE = 150; // Maximum buffer size to prevent too long chunks
   private readonly TTS_BUFFER_TIMEOUT = 500; // ms to wait before flushing buffer if no natural breaks
-
-  // Debouncing mechanism
-  private pendingMessages: Map<string, string> = new Map(); // userId -> latestMessage
 
 
 
@@ -340,11 +338,11 @@ export class SttTtsPlugin implements Plugin {
 
         // Check if buffer is empty or contains no voice
         const energy = this.calculateEnergy(data.samples);
-        const isSilent = energy < 50; // Adjust this threshold based on your audio environment
+        // const isSilent = energy < 50; // Adjust this threshold based on your audio environment
 
-        if (data.samples.length === 0 || isSilent) {
-          return;
-        }
+        // if (data.samples.length === 0 || isSilent) {
+        //   return;
+        // }
 
         // Create a copy of the audio samples to avoid modifying the original data
         const audioSamples = new Int16Array(data.samples);
@@ -468,8 +466,6 @@ export class SttTtsPlugin implements Plugin {
       if (this.isProcessingAudio) {
         console.log('[SttTtsPlugin] Already processing audio, queueing this request');
         
-        // Replace any existing message from this user with the newer one
-        this.pendingMessages.set(userId, transcript);
         return;
       }
       
@@ -485,7 +481,7 @@ export class SttTtsPlugin implements Plugin {
       // Generate a unique stream ID for this response
       const streamId = uuidv4();
       this.latestActiveStreamId = streamId;
-      this.activeStreamManager.register({ id: streamId, active: true, startedAt: Date.now() });
+      this.activeStreamManager.register({ id: streamId, active: true, startedAt: Date.now(), userId: userId, message: transcript });
       
       elizaLogger.log(`[SttTtsPlugin] Starting stream with ID: ${streamId} for transcript: ${transcript}`);
       
@@ -499,7 +495,7 @@ export class SttTtsPlugin implements Plugin {
       const handleChunkForStream = (text: string, chunkStreamId: string) => {
         // Only process chunks for the current stream
         if (this.activeStreamManager.isActive(streamId)) {
-          this.bufferTextForTTS(text, streamId);
+          this.bufferTextForTTS(text, streamId, userId);
         } else {
           console.log(`[SttTtsPlugin] Ignoring chunk from different stream. Expected: ${streamId}, Got: ${chunkStreamId}`);
         }
@@ -561,7 +557,7 @@ export class SttTtsPlugin implements Plugin {
       const foundStream = this.activeStreamManager.get(streamId)
 
       if (!foundStream) {
-        this.activeStreamManager.register({ id: streamId, active: true, startedAt: Date.now() });
+        this.activeStreamManager.register({ id: streamId, active: true, startedAt: Date.now(), userId: userId, message: userText });
       }
     }
 
@@ -620,10 +616,13 @@ export class SttTtsPlugin implements Plugin {
     if (shouldIgnore) {
       return;
     }
+    const previousMessages = this.activeStreamManager.findAllByUserId(userId)
 
     const context = composeContext({
       state,
-      template: twitterSpaceTemplate,
+      template: (options: { state: State }): string => {
+        return twitterSpaceTemplate(options.state, previousMessages);
+      },
     });
 
     const systemMessage = { role: 'system' as const, content: context };
@@ -785,7 +784,7 @@ export class SttTtsPlugin implements Plugin {
    * Smart text buffering for TTS
    * This buffers text until we have a natural break point or enough characters
    */
-  private bufferTextForTTS(text: string, streamId: string): void {
+  private bufferTextForTTS(text: string, streamId: string, userId: string): void {
     if (isEmpty(text)) {
       return;
     }
@@ -817,7 +816,9 @@ export class SttTtsPlugin implements Plugin {
           this.activeStreamManager.register({
             id: newStreamId,
             active: true,
-            startedAt: Date.now()
+            startedAt: Date.now(),
+            userId: userId,
+            message: text
           });
           streamId = newStreamId;
         }
@@ -841,12 +842,12 @@ export class SttTtsPlugin implements Plugin {
       this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
     ) {
       // Flush immediately if we have a natural break or reached max size
-      this.flushBuffer();
+      this.flushBuffer(userId);
     } else if (this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE) {
       // If we have enough characters but no natural break,
       // set a timeout to flush soon if no more text arrives
       this.textBufferTimeout = setTimeout(() => {
-        this.flushBuffer();
+        this.flushBuffer(userId);
       }, this.TTS_BUFFER_TIMEOUT);
     }
   }
@@ -854,7 +855,7 @@ export class SttTtsPlugin implements Plugin {
   /**
    * Flush the text buffer to TTS
    */
-  private flushBuffer(): void {
+  private flushBuffer(userId: string): void {
     if (!this.textBuffer) {
       return;
     }
@@ -866,7 +867,9 @@ export class SttTtsPlugin implements Plugin {
       this.activeStreamManager.register({
         id: this.latestActiveStreamId,
         active: true,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        userId: userId,
+        message: this.textBuffer
       });
     }
     
@@ -876,7 +879,9 @@ export class SttTtsPlugin implements Plugin {
       this.activeStreamManager.register({
         id: this.latestActiveStreamId,
         active: true,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        userId: userId,
+        message: this.textBuffer
       });    }
     
     // Send the buffered text to TTS queue

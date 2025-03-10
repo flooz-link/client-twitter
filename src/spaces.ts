@@ -277,7 +277,7 @@ export class TwitterSpaceClient {
         // elizaLogger.log(`[Space] Space started => ${spaceUrl}`);
 
         // Greet
-        await speakFiller(this.client.runtime, this.sttTtsPlugin, 'WELCOME');
+        // await speakFiller(this.client.runtime, this.sttTtsPlugin, 'WELCOME');
 
         // Events
 

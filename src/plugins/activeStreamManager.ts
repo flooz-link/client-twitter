@@ -1,6 +1,8 @@
 export interface ResponseStream {
     id: string;
     active: boolean;
+    userId: string;
+    message: string;
     startedAt: number;
   }
 
@@ -29,6 +31,10 @@ export class ActiveStreamManager {
         if (stream) {
             stream.active = false
         }
+    }
+
+    findAllByUserId(userId: string): ResponseStream[] {
+        return Array.from(this.activeStreams.values()).filter(stream => stream.userId === userId)
     }
 
     abortOthers(streamId: string): void {
