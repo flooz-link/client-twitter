@@ -384,7 +384,7 @@
 
 //     // Start streaming request to ElevenLabs
 //     elizaLogger.log('[SttTtsPlugin] Starting ElevenLabs streaming request');
-    
+
 //     // Create a buffer to hold audio frames for playback
 //     const audioBuffer: Int16Array[] = [];
 
@@ -416,14 +416,14 @@
 //       ffmpeg.stdout.on('data', (chunk: Buffer) => {
 //         try {
 //           if (isInterrupted || signal.aborted) return;
-          
+
 //           // Append new chunk to our buffer
 //           pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
 
 //           // Process complete frames (480 samples = 10ms at 48kHz)
 //           const FRAME_SIZE = 480;
 //           const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2)); // 2 bytes per sample
-          
+
 //           // Optimize for low latency by processing frames as soon as we have a small batch
 //           if (frameCount > 0) {
 //             for (let i = 0; i < frameCount; i++) {
@@ -440,7 +440,7 @@
 //               frameCopy.set(frame);
 //               audioBuffer.push(frameCopy);
 //             }
-            
+
 //             // Remove processed frames from buffer
 //             pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
 //           }
@@ -451,7 +451,7 @@
 
 //       ffmpeg.stdout.on('end', () => {
 //         processingComplete = true;
-        
+
 //         // Process any remaining data
 //         if (pcmBuffer.length > 0) {
 //           const remainingFrames = Math.floor(pcmBuffer.length / 2); // 2 bytes per sample
@@ -463,7 +463,7 @@
 //             audioBuffer.push(frame);
 //           }
 //         }
-        
+
 //         resolve();
 //       });
 
@@ -497,16 +497,16 @@
 
 //       // Stream the response to the ffmpeg process
 //       const reader = response.body.getReader();
-      
+
 //       // Speed up the initial buffer filling by reading faster
 //       const readStream = async () => {
 //         try {
 //           while (true) {
 //             if (isInterrupted || signal.aborted) break;
-            
+
 //             const { done, value } = await reader.read();
 //             if (done) break;
-            
+
 //             if (value) {
 //               ffmpeg.stdin.write(value);
 //             }
@@ -517,7 +517,7 @@
 //           ffmpeg.stdin.end();
 //         }
 //       };
-      
+
 //       readStream();
 
 //       // Wait for initial processing or interruption - reduced wait time for faster start
@@ -597,7 +597,7 @@
 //         if (frameIndex < audioBuffer.length) {
 //           try {
 //             const frame = audioBuffer[frameIndex];
-            
+
 //             if (!isInterrupted && !signal.aborted) {
 //               // Use the enhanced interrupt detection
 //               if (this.enhancedAnalyzeForInterruption(frame)) {
@@ -605,19 +605,19 @@
 //                 isInterrupted = true;
 //                 break;
 //               }
-              
+
 //               // Send the frame to Janus - ensure proper frame size (480 samples)
 //               const EXPECTED_SAMPLES = 480;
-              
+
 //               // Check if we need to resize the frame
 //               if (frame.length !== EXPECTED_SAMPLES) {
 //                 // Create properly sized frame
 //                 const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
-                
+
 //                 // Copy data from original samples, being careful not to overflow
 //                 const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
 //                 properSizedFrame.set(frame.subarray(0, copyLength));
-                
+
 //                 // Send properly sized frame
 //                 this.janus.pushLocalAudio(properSizedFrame, 48000);
 //               } else {
@@ -745,7 +745,7 @@
 //         const now = Date.now();
 //         const prevBuffer = this.transcriptionBuffers.get(userId);
 //         let contextualText = sttText;
-        
+
 //         // If we have a previous buffer that's still within our time window, append to it
 //         if (prevBuffer && (now - prevBuffer.timestamp) < this.transcriptionBufferTimeout) {
 //           // Append the new transcription to the existing buffer
@@ -755,7 +755,7 @@
 //             `combined text="${contextualText.substring(0, 100)}${contextualText.length > 100 ? '...' : ''}"`,
 //           );
 //         }
-        
+
 //         // Update the transcription buffer with the current (possibly combined) text
 //         this.transcriptionBuffers.set(userId, {
 //           text: contextualText,
@@ -869,7 +869,7 @@
 //             elizaLogger.debug(`[SttTtsPlugin] Ignoring chunk from outdated stream`);
 //             return;
 //           }
-          
+
 //           if (typeof chunk !== 'string' || isEmpty(chunk)) {
 //             return;
 //           }
@@ -891,10 +891,10 @@
 //             elizaLogger.debug(`[SttTtsPlugin] Ignoring stream-end from outdated stream`);
 //             return;
 //           }
-          
+
 //           // Remove this stream from active streams
 //           this.activeStreams.delete(endStreamId);
-          
+
 //           // Process any remaining text in the buffer
 //           if (ttsBuffer.length > 0 && !signal.aborted) {
 //             processTtsChunk();
@@ -948,18 +948,18 @@
 //       elizaLogger.log('[SttTtsPlugin] Aborting previous TTS stream');
 //       this.ttsAbortController.abort();
 //     }
-    
+
 //     // Create a new abort controller for the next stream
 //     this.ttsAbortController = new AbortController();
-    
+
 //     // Clear audio buffer to stop any ongoing audio processing
 //     this.audioBuffer = [];
-    
+
 //     // Mark all active streams as inactive
 //     this.activeStreams.clear();
 //     this.currentStreamId = null;
-    
-//     // NOTE: We're not clearing transcriptionBuffers here 
+
+//     // NOTE: We're not clearing transcriptionBuffers here
 //     // as we want to preserve context between interactions
 //   }
 
@@ -1323,12 +1323,12 @@
 //   ): Promise<void> {
 //     // Use the current stream ID
 //     const streamId = this.currentStreamId;
-    
+
 //     if (!streamId || !this.activeStreams.has(streamId)) {
 //       elizaLogger.error('[SttTtsPlugin] No current stream ID found or stream is no longer active');
 //       return;
 //     }
-    
+
 //     elizaLogger.log(`[SttTtsPlugin] Handling user message with stream ID: ${streamId}`);
 
 //     // Extract the numeric ID part
@@ -1430,14 +1430,14 @@
 //     const progressiveDelay = 400; // ms
 
 //     const start = Date.now();
-    
+
 //     // Check if the stream is still active before making the API call
 //     if (!this.activeStreams.has(streamId) || this.ttsAbortController?.signal.aborted) {
 //       elizaLogger.log('[SttTtsPlugin] Stream was aborted before API call, cancelling');
 //       this.eventEmitter.emit('stream-end', streamId);
 //       return;
 //     }
-    
+
 //     // Make streaming request to Grok
 //     const stream = await this.openai.chat.completions.create({
 //       model: 'grok-2-latest',
@@ -1449,7 +1449,7 @@
 //     let bufferedText = '';
 //     let potentialActionMarker = false;
 //     let detectedAction = '';
-    
+
 //     elizaLogger.log('[SttTtsPlugin] Starting Grok streaming response processing');
 
 //     // Process each chunk as it arrives
@@ -1469,26 +1469,26 @@
 //       // If we're buffering, check for actionIs: pattern
 //       if (potentialActionMarker) {
 //         bufferedText += content;
-        
+
 //         // If we find the complete actionIs: pattern
 //         if (bufferedText.includes('actionIs:')) {
 //           const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
 //           if (actionMatch) {
 //             detectedAction = actionMatch[1];
 //             elizaLogger.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
-            
+
 //             // Emit only the text part before actionIs:
 //             const textBeforeAction = bufferedText.split('actionIs:')[0].trim();
 //             if (textBeforeAction) {
 //               this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
 //             }
-            
+
 //             // Clear buffer since we've handled it
 //             bufferedText = '';
 //             potentialActionMarker = false;
 //           }
 //         } else if (bufferedText.length > 100) {
-//           // If buffer gets too large without finding actionIs:, 
+//           // If buffer gets too large without finding actionIs:,
 //           // it's probably not an action marker - emit it
 //           this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
 //           bufferedText = '';
@@ -1509,7 +1509,7 @@
 //         if (textBeforeAction) {
 //           this.eventEmitter.emit('stream-chunk', textBeforeAction, streamId);
 //         }
-        
+
 //         // Extract action if any
 //         const actionMatch = /actionIs:([A-Z_]+)/.exec(bufferedText);
 //         if (actionMatch) {
@@ -1523,14 +1523,14 @@
 //     }
 
 //     console.log(`Time took for completing LLM ${Date.now() - start}`);
-    
+
 //     // Log the detected action if any
 //     if (detectedAction) {
 //       elizaLogger.log(`[SttTtsPlugin] Response contained action: ${detectedAction}`);
 //       // Here you could trigger the appropriate action based on detectedAction
 //       // For example: if (detectedAction === 'SEARCH_WEB') { /* trigger web search */ }
 //     }
-    
+
 //     // Signal stream end
 //     this.eventEmitter.emit('stream-end', streamId);
 //   }
@@ -1702,30 +1702,30 @@
 //       this.ttsAbortController.abort();
 //       this.ttsAbortController = null;
 //     }
-    
+
 //     // Clear all active streams
 //     this.activeStreams.clear();
 //     this.currentStreamId = null;
-    
+
 //     // Clear all event listeners
 //     this.eventEmitter.removeAllListeners();
-    
+
 //     // Clear any timers
 //     if (this.userSpeakingTimer) {
 //       clearTimeout(this.userSpeakingTimer);
 //       this.userSpeakingTimer = null;
 //     }
-    
+
 //     if (this.streamingInterval) {
 //       clearInterval(this.streamingInterval);
 //       this.streamingInterval = null;
 //     }
-    
+
 //     // Clear buffers
 //     this.pcmBuffers.clear();
 //     this.volumeBuffers.clear();
 //     this.audioBuffer = [];
-    
+
 //     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
 //   }
 

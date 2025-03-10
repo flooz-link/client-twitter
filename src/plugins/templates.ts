@@ -1,5 +1,9 @@
-import { messageCompletionFooter, shouldRespondFooter, State } from '@elizaos/core';
-import {ResponseStream} from './activeStreamManager';
+import {
+  messageCompletionFooter,
+  shouldRespondFooter,
+  State,
+} from '@elizaos/core';
+import { ResponseStream } from './activeStreamManager';
 
 export const twitterShouldRespondTemplate =
   `# Task: Decide if {{agentName}} should respond.
@@ -90,9 +94,11 @@ export const twitterVoiceHandlerTemplate =
     # Instructions: Write the next message for {{agentName}}. Include an optional action if appropriate. {{actionNames}}
     ` + messageCompletionFooter;
 
-
-    export const twitterSpaceTemplate = (state: State, spaceMessages: ResponseStream[]) =>
-    `# Task: Generate conversational voice dialog for {{agentName}}.
+export const twitterSpaceTemplate = (
+  state: State,
+  spaceMessages: ResponseStream[],
+) =>
+  `# Task: Generate conversational voice dialog for {{agentName}}.
 
 You are in a twitter space, so keeps short and concise, try to add filler words to sound more human and natural, add exclamation marks and things that make the voice sound human.
 Ahere to this guide to add emotion.
@@ -129,11 +135,9 @@ ${spaceMessages.map((message, index) => `${index + 1}. ${message.message}`).join
 If you decide that {{agentName}} should take an action other than "NONE", the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you have to sound like you are naturally buying time.
 You should always respond with a short and concise message.
 **Important** 
-If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`.`
+If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`.`;
 
-
-export const twitterSpaceTemplate_v2 =
-`# Task: Generate conversational voice dialog for {{agentName}}.
+export const twitterSpaceTemplate_v2 = `# Task: Generate conversational voice dialog for {{agentName}}.
 
 You are in a twitter space, so keeps short and concise.
 Do not create lenghty and repeatitive answers.
@@ -164,4 +168,4 @@ Response format should be formatted in a valid JSON block like this:
 
 The “action” field should be one of the options in [Available Actions] and the "text" field should be the response you want to send.
 When you decide the action is something different than NONE, the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you
-need to sound like you are naturally buying time.`
+need to sound like you are naturally buying time.`;
