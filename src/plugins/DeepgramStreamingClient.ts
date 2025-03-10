@@ -88,7 +88,7 @@ export class SttTtsPlugin implements Plugin {
   // Added for transcript buffering
   private transcriptBuffer: Map<string, string> = new Map();
   private processingTimeout: Map<string, NodeJS.Timeout> = new Map();
-  private timeoutDuration = 300; // ms to wait before processing if no utterance end
+  private transcriptionaBufferDuration = 600; // ms to buffer transcribed text before processing
   private inactivityTimer: Map<string, NodeJS.Timeout> = new Map();
   private lastTranscriptionTime: Map<string, number> = new Map();
 
@@ -390,9 +390,9 @@ export class SttTtsPlugin implements Plugin {
     console.log(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
     
     // Clear any existing timeout for this user
-    if (this.processingTimeout.has(userId)) {
+    // if (this.processingTimeout.has(userId)) {
       clearTimeout(this.processingTimeout.get(userId));
-    }
+    // }
     
     // If this is a final transcript, process it immediately
     if (isFinal) {
@@ -408,11 +408,11 @@ export class SttTtsPlugin implements Plugin {
           const elapsed = Date.now() - lastTime;
           
           // If no new transcripts in the last 200ms, process what we have
-          if (elapsed >= this.timeoutDuration) {
+          if (elapsed >= this.transcriptionaBufferDuration) {
             console.log(`[SttTtsPlugin] Processing transcript due to timeout (${elapsed}ms) for user: ${userId}`);
             this.processBufferedTranscription(userId);
           }
-        }, this.timeoutDuration) // 200ms timeout (more aggressive)
+        }, this.transcriptionaBufferDuration) 
       );
     }
   }
