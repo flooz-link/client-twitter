@@ -232,7 +232,6 @@ export class SttTtsPlugin implements Plugin {
       // before any messages arrive
       this.deepgramSocket.addListener(LiveTranscriptionEvents.Transcript, (data: TranscriptData) => {
         const transcript = data.channel?.alternatives?.[0]?.transcript;
-        console.log(`deepgram: transcript received isFinal: ${data.is_final} transcript: ${transcript}`);
         if (isEmpty(transcript)) {
           return;
         }
@@ -252,8 +251,8 @@ export class SttTtsPlugin implements Plugin {
                             isNotEmpty(this.transcriptBuffer.get(this.lastSpeaker)?.trim());
           
           if (hasBuffer) {
-            elizaLogger.log(`[SttTtsPlugin] Processing due to utterance end: ${this.transcriptBuffer.get(this.lastSpeaker)}`);
-            this.processBufferedTranscription(this.lastSpeaker);
+            console.log(`[SttTtsPlugin] Processing due to utterance end: ${this.transcriptBuffer.get(this.lastSpeaker)}`);
+            // this.processBufferedTranscription(this.lastSpeaker);
           }
         }
       });
@@ -388,7 +387,7 @@ export class SttTtsPlugin implements Plugin {
     // Update the transcript buffer - buffer the transcribed text instead of calling the LLM
     this.transcriptBuffer.set(userId, transcript);
     
-    elizaLogger.log(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
+    console.log(`[SttTtsPlugin] Received transcript (${isFinal ? 'final' : 'interim'}): "${transcript}" for user: ${userId}`);
     
     // Clear any existing timeout for this user
     if (this.processingTimeout.has(userId)) {
@@ -397,7 +396,7 @@ export class SttTtsPlugin implements Plugin {
     
     // If this is a final transcript, process it immediately
     if (isFinal) {
-      elizaLogger.log(`[SttTtsPlugin] Processing final transcript for user: ${userId}`);
+      console.log(`[SttTtsPlugin] Processing final transcript for user: ${userId}`);
       this.processBufferedTranscription(userId);
     } else {
       // Set a timeout to process if we don't receive any more transcripts soon
@@ -410,7 +409,7 @@ export class SttTtsPlugin implements Plugin {
           
           // If no new transcripts in the last 200ms, process what we have
           if (elapsed >= this.timeoutDuration) {
-            elizaLogger.log(`[SttTtsPlugin] Processing transcript due to timeout (${elapsed}ms) for user: ${userId}`);
+            console.log(`[SttTtsPlugin] Processing transcript due to timeout (${elapsed}ms) for user: ${userId}`);
             this.processBufferedTranscription(userId);
           }
         }, this.timeoutDuration) // 200ms timeout (more aggressive)
@@ -986,7 +985,6 @@ export class SttTtsPlugin implements Plugin {
    * Public method to queue a TTS request
    */
   public async speakText(text: string): Promise<void> {
-    console.log(`[SttTtsPlugin] Adding text to TTS queue: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
     this.ttsQueue.push(text);
     if (!this.isSpeaking) {
       this.isSpeaking = true;
