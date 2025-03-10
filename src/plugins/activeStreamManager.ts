@@ -34,6 +34,9 @@ export class ActiveStreamManager {
     }
 
     findAllByUserId(userId: string): ResponseStream[] {
+        if (this.activeStreams.size === 0) {
+            return []
+        }
         return Array.from(this.activeStreams.values()).filter(stream => stream.userId === userId)
     }
 
