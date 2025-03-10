@@ -367,7 +367,6 @@ export class SttTtsPlugin implements Plugin {
    */
   private handleTranscription(transcript: string, isFinal: boolean, userId: string): void {
     if (isEmpty(transcript) || isEmpty(userId)) {
-      elizaLogger.warn('[SttTtsPlugin] Empty transcript or userId, skipping');
       return;
     }
 
@@ -508,10 +507,7 @@ export class SttTtsPlugin implements Plugin {
           return;
         }
         
-        console.log('[SttTtsPlugin] Stream ended for user:', userId);
-        elizaLogger.log(
-          `[SttTtsPlugin] user=${userId}, complete reply="${this.textBuffer}"`,
-        );
+        console.log(`[SttTtsPlugin] Stream ended for user: ${userId} with text: ${this.textBuffer}`);
 
         // Only remove listeners specific to this stream
         this.eventEmitter.removeListener('stream-chunk', handleChunkForStream);
@@ -662,7 +658,7 @@ export class SttTtsPlugin implements Plugin {
           break;
         }
 
-        console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
+        // console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
         
         const content = chunk.choices[0]?.delta?.content || '';
         console.log('[SttTtsPlugin] Extracted content:', content);
