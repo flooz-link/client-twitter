@@ -562,19 +562,6 @@ export class SttTtsPlugin implements Plugin {
     const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
     const userUuid = stringToUuid(`twitter-user-${numericId}`);
 
-    await Promise.all([
-      this.runtime.ensureUserExists(
-        userUuid,
-        userId,
-        `Twitter User ${numericId}`,
-        'twitter',
-      ),
-      this.runtime.ensureRoomExists(roomId),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId),
-    ]).catch((error) => {
-      elizaLogger.warn(`Error when handling streaming for spaces error ${error} ignoring`);
-      return;
-    });
 
     const memory = {
       id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
@@ -585,8 +572,9 @@ export class SttTtsPlugin implements Plugin {
       embedding: getEmbeddingZeroVector(),
       createdAt: Date.now(),
     };
-
-    const [state] = await Promise.all([
+    
+    let state: State;
+    const [tmpState] = await Promise.all([
       this.runtime.composeState(
         {
           agentId: this.runtime.agentId,
@@ -599,8 +587,27 @@ export class SttTtsPlugin implements Plugin {
           agentName: this.runtime.character.name,
         },
       ),
-      Promise.resolve(),
+      this.runtime.ensureUserExists(
+        userUuid,
+        userId,
+        `Twitter User ${numericId}`,
+        'twitter',
+      ).catch((error) => {
+        console.warn(`Error when ensureUserExists, error: ${error} ignoring`);
+        return;
+      }),
+      this.runtime.ensureRoomExists(roomId).catch((error) => {
+        console.warn(`Error when ensureRoomExists, error: ${error} ignoring`);
+        return;
+      }),
+      this.runtime.ensureParticipantInRoom(userUuid, roomId).catch((error) => {
+        console.warn(`Error when ensureParticipantInRoom, error: ${error} ignoring`);
+        return;
+      }),
     ]);
+
+    state = tmpState;
+
 
     const shouldIgnore = await this._shouldIgnore(memory);
     if (shouldIgnore) {
@@ -1104,9 +1111,13 @@ export class SttTtsPlugin implements Plugin {
     const readStream = async () => {
       try {
         while (true) {
-          if (isInterrupted || signal.aborted) break;
+          if (isInterrupted || signal.aborted) {
+            break;
+          }
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            break;
+          }
           if (value) {
             ffmpeg.stdin.write(value);
           }

@@ -95,6 +95,11 @@ export const twitterVoiceHandlerTemplate =
     `# Task: Generate conversational voice dialog for {{agentName}}.
 
 You are in a twitter space, so keeps short and concise, try to add filler words to sound more human and natural, add exclamation marks and things that make the voice sound human.
+Ahere to this guide to add emotion.
+
+Emotion
+Convey emotions through narrative context or explicit dialogue tags. This approach helps the AI understand the tone and emotion to emulate.
+
 Do not create lenghty and repeatitive answers.
 **Important!**
 As you are in a twitter space, your answers will be streamed, hence try to avoid really long answers or really long pauses in your responses.
