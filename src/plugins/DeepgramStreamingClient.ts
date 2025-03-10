@@ -4,7 +4,6 @@ import {
   stringToUuid,
   composeContext,
   getEmbeddingZeroVector,
-  ModelClass,
   type IAgentRuntime,
   type Memory,
   type Plugin,
@@ -24,7 +23,6 @@ import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import { createClient, DeepgramClient, ListenLiveClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import {ActiveStreamManager} from './activeStreamManager';
-import {TranscriptionManager} from './transcriptionManager';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -88,7 +86,7 @@ export class SttTtsPlugin implements Plugin {
   // Added for transcript buffering
   private transcriptBuffer: Map<string, string> = new Map();
   private processingTimeout: Map<string, NodeJS.Timeout> = new Map();
-  private transcriptionaBufferDuration = 600; // ms to buffer transcribed text before processing
+  private transcriptionaBufferDuration = 1000; // ms to buffer transcribed text before processing
   private inactivityTimer: Map<string, NodeJS.Timeout> = new Map();
   private lastTranscriptionTime: Map<string, number> = new Map();
 
@@ -214,7 +212,7 @@ export class SttTtsPlugin implements Plugin {
         interim_results: true,
         utterance_end_ms: 1000,
         vad_events: true,
-        endpointing: this.TTS_BUFFER_TIMEOUT, // Time in milliseconds of silence to wait for before finalizing speech
+        endpointing: this.transcriptionaBufferDuration, // Time in milliseconds of silence to wait for before finalizing speech
       });
 
       console.log("Deepgram socket created");
@@ -493,7 +491,7 @@ export class SttTtsPlugin implements Plugin {
       this.latestActiveStreamId = streamId;
       this.activeStreamManager.register({ id: streamId, active: true, startedAt: Date.now(), userId: userId, message: transcript });
       // Release the transcription as we are answering it
-      elizaLogger.log(`[SttTtsPlugin] Starting stream with ID: ${streamId} for transcript: ${transcript}`);
+      console.log(`[SttTtsPlugin] Starting stream with ID: ${streamId} for transcript: ${transcript}`);
       
       // Abort any previous streams
       this.abortPreviousStreams(streamId);
@@ -798,73 +796,6 @@ export class SttTtsPlugin implements Plugin {
   }  
 
 
-  // private bufferTextForTranscript(text: string, isFinal: boolean, userId: string): void {
-  //   if (isEmpty(text)) {
-  //     return;
-  //   }
-    
-  //   const foundStream = this.activeStreamManager.get(streamId)
-  //   // Enhanced stream ID handling
-  //   if (foundStream?.active === false) {
-  //     return;
-  //   }
-    
-  //   // // Try to recover by creating a new stream ID if needed
-  //   if (!this.latestActiveStreamId) {
-  //     elizaLogger.warn('[SttTtsPlugin] No current stream ID found, creating a new one');
-  //     const newStreamId = uuidv4();
-  //     this.latestActiveStreamId = newStreamId;
-  //       this.activeStreamManager.has(newStreamId);
-  //       // Continue with the new stream ID
-  //       streamId = newStreamId;
-  //     } else if (!this.activeStreamManager.has(streamId)) {
-  //       elizaLogger.warn(`[SttTtsPlugin] Stream ID ${streamId} is no longer active, attempting to re-use current stream ID`);
-  //       // Use the current stream ID instead if it exists
-  //       if (this.activeStreamManager.has(this.latestActiveStreamId)) {
-  //         streamId = this.latestActiveStreamId;
-  //       } else {
-  //         // If current stream ID is also inactive, create a new one
-  //         elizaLogger.warn(`[SttTtsPlugin] Current stream ID ${this.latestActiveStreamId} is also inactive, creating a new one`);
-  //         const newStreamId = uuidv4();
-  //         this.latestActiveStreamId = newStreamId;
-  //         this.activeStreamManager.register({
-  //           id: newStreamId,
-  //           active: true,
-  //           startedAt: Date.now(),
-  //           userId: userId,
-  //           message: text
-  //         });
-  //         streamId = newStreamId;
-  //       }
-  //     }
-
-  //   // Append the new text to our buffer
-  //   this.textBuffer += text;
-    
-  //   // Clear any existing timeout
-  //   if (this.textBufferTimeout) {
-  //     clearTimeout(this.textBufferTimeout);
-  //   }
-    
-  //   // Check if there's a natural break or if we've reached the max buffer size
-  //   const hasNaturalBreak = /[.!?]\s*$/.test(this.textBuffer) || // Ends with punctuation
-  //                          /\n\s*$/.test(this.textBuffer) ||     // Ends with newline
-  //                          /[:;]\s*$/.test(this.textBuffer);     // Ends with colon or semicolon
-    
-  //   if (
-  //     hasNaturalBreak ||
-  //     this.textBuffer.length >= this.MAX_TTS_BUFFER_SIZE
-  //   ) {
-  //     // Flush immediately if we have a natural break or reached max size
-  //     this.flushBuffer(userId);
-  //   } else if (this.textBuffer.length >= this.MIN_TTS_BUFFER_SIZE) {
-  //     // If we have enough characters but no natural break,
-  //     // set a timeout to flush soon if no more text arrives
-  //     this.textBufferTimeout = setTimeout(() => {
-  //       this.flushBuffer(userId);
-  //     }, this.TTS_BUFFER_TIMEOUT);
-  //   }
-  // }
 
   /**
    * Smart text buffering for TTS
@@ -1031,11 +962,11 @@ export class SttTtsPlugin implements Plugin {
   private async streamTtsToJanus(text: string, signal: AbortSignal): Promise<void> {
     // Add natural pauses at punctuation to make speech sound more natural
     const textWithPauses = text
-      .replace(/\.\s+/g, '. <break time="10ms"/> ')
-      .replace(/,\s+/g, ', <break time="5ms"/> ')
-      .replace(/\?\s+/g, '? <break time="10ms"/> ')
-      .replace(/!\s+/g, '! <break time="10ms"/> ')
-      .replace(/;\s+/g, '; <break time="10ms"/> ')
+      .replace(/\.\s+/g, '. <break time="5ms"/> ')
+      .replace(/,\s+/g, ', <break time="2ms"/> ')
+      .replace(/\?\s+/g, '? <break time="5ms"/> ')
+      .replace(/!\s+/g, '! <break time="5ms"/> ')
+      .replace(/;\s+/g, '; <break time="5ms"/> ')
       .replace(/:\s+/g, ': <break time="5ms"/> ');
     
 
