@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug Deepgram Server",
+      "skipFiles": ["<node_internals>/**"],
+      "program": "${workspaceFolder}/examples/debug-deepgram-server.ts",
+      "cwd": "${workspaceFolder}",
+      "runtimeArgs": [
+        "--require", "ts-node/register"
+      ],
+      "outFiles": ["${workspaceFolder}/dist-debug/**/*.js"],
+      "env": {
+        "TS_NODE_PROJECT": "${workspaceFolder}/examples/tsconfig.debug.json"
+      },
+      "sourceMaps": true,
+      "resolveSourceMapLocations": [
+        "${workspaceFolder}/**",
+        "!**/node_modules/**"
+      ],
+      "internalConsoleOptions": "openOnSessionStart",
+      "console": "integratedTerminal",
+      "args": []
+    }
+  ]
+}
