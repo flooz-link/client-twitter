@@ -7,17 +7,24 @@
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
+    "sourceMap": true,
+    "inlineSources": true,
     "noEmit": true,
-    "baseUrl": "..",
+    "baseUrl": ".",
     "paths": {
-      "*": ["./node_modules/*", "./src/*", "./examples/*"]
+      "*": ["*", "../src/*", "./*"]
     },
     "allowImportingTsExtensions": true
   },
   "ts-node": {
     "transpileOnly": true,
     "esm": true,
-    "experimentalSpecifierResolution": "node"
+    "experimentalSpecifierResolution": "node",
+    "require": ["tsconfig-paths/register"],
+    "emit": true,
+    "compilerOptions": {
+      "sourceMap": true
+    }
   },
   "include": [
     "./**/*.ts",

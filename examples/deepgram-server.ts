@@ -9,208 +9,350 @@
 import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import {
-  createClient,
-  LiveTranscriptionEvents,
-  LiveClient,
-} from '@deepgram/sdk';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { AddressInfo } from 'net';
+import {
+  createClient,
+  LiveTranscriptionEvents,
+  SOCKET_STATES,
+} from '@deepgram/sdk';
 import { SttTtsPlugin } from '../src/plugins/DeepgramStreamingClient.js';
+import { MockSpace } from './mock-space.js';
+import { MockJanusClient } from './mock-janus-client.js';
+import { DeepgramStreamingTranscriptionService } from '../src/transcription/deepgramDefaultTranscription.js';
 
 // Get the directory name of the current module (ES modules don't have __dirname)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Load environment variables from .env file in the examples directory
-dotenv.config({ path: join(__dirname, '.env') });
+// Load environment variables from .env file
+dotenv.config();
 
-// Check for required API key
-if (!process.env.DEEPGRAM_API_KEY) {
-  console.error('Error: DEEPGRAM_API_KEY environment variable is required');
-  console.error(`Looked for .env file at: ${join(__dirname, '.env')}`);
-  process.exit(1);
-}
-
-// Initialize Express app and HTTP server
+// Create Express app
 const app = express();
+
+// Serve static files from the public directory
+app.use(express.static(join(__dirname, 'public')));
+
+// Create HTTP server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Create Deepgram client
-const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
-let keepAlive: NodeJS.Timeout | undefined;
+const SHOULD_DEBUG_TRANSCRIPTION = false;
 
-// Create mocks for SttTtsPlugin dependencies
-// Mock IAgentRuntime
-const mockRuntime = {
+// Initialize Deepgram
+const deepgramApiKey = process.env.DEEPGRAM_API_KEY || '';
+console.log(
+  'Initializing Deepgram with API key:',
+  deepgramApiKey ? 'API key found' : 'No API key found',
+);
+
+const mockedRuntime = {
+  agentId: 'mock-agent',
+  character: {
+    name: 'test',
+  },
   getSetting: (key: string) => {
-    if (key === 'DEEPGRAM_API_KEY') return process.env.DEEPGRAM_API_KEY;
-    if (key === 'GROK_API_KEY') return 'mock-grok-api-key';
-    if (key === 'GROK_BASE_URL') return 'https://api.x.ai/v1';
-    return null;
+    if (key === 'DEEPGRAM_API_KEY') return deepgramApiKey;
+    if (key === 'GROK_API_KEY') return process.env.GROK_API_KEY || '';
+    if (key === 'GROK_BASE_URL')
+      return process.env.GROK_BASE_URL || 'https://api.x.ai/v1';
+    return '';
   },
-  // Add other required methods as needed
-  log: console.log,
-  error: console.error,
+  composeState: async () => ({
+    /* mock state */
+  }),
+  ensureUserExists: async () => ({}),
+  ensureRoomExists: async () => ({}),
+  ensureParticipantInRoom: async () => ({}),
+  processActions: async () => ({}),
 };
 
-// Mock ClientBase
-const mockClient = {
-  // Add required methods and properties
-};
+// Create our mock Janus client set to true if you have issues with audio
+// in those cases you will hear a beeping noise
+const mockJanusClient = new MockJanusClient(false);
 
-// Mock Space
-const mockSpace = {
-  // Add required methods and properties
-  janusClient: {
-    // Mock Janus client methods
-    sendAudio: (_audioData: any) => {
-      console.log('Mock Janus: Sending audio data');
-    },
-  },
-};
+// Then create our mock Space with this Janus client
+const mockSpace = new MockSpace(mockJanusClient);
 
-// Generate a random spaceId
-const mockSpaceId = 'space-' + Math.random().toString(36).substring(2, 15);
-
-// Initialize SttTtsPlugin with mocks
+// Create and initialize the SttTtsPlugin
 const sttTtsPlugin = new SttTtsPlugin();
+
+const transcriptionService = new DeepgramStreamingTranscriptionService({
+  apiKey: deepgramApiKey,
+  model: 'nova-3',
+  sample_rate: 48000,
+  language: 'en',
+  channels: 1,
+  encoding: 'linear16',
+});
+await transcriptionService.initialize();
+
+// Register the plugin with the mock Space
+mockSpace.use(sttTtsPlugin as any);
+
+// Initialize the plugin properly
 sttTtsPlugin.init({
-  space: mockSpace as any,
+  space: mockSpace as any, // Type assertion might be needed if there are incompatibilities
   pluginConfig: {
-    runtime: mockRuntime,
-    client: mockClient,
-    spaceId: mockSpaceId,
-    deepgramApiKey: process.env.DEEPGRAM_API_KEY,
-    grokApiKey: process.env.GROK_API_KEY,
-    grokBaseUrl: 'https://api.x.ai/v1',
+    runtime: mockedRuntime,
+    transcriptionService: transcriptionService,
+    client: { profile: { username: 'user', id: 'mock-user-id' } },
+    spaceId: 'mock-space-id',
+    elevenLabsApiKey: process.env.ELEVEN_LABS_API_KEY || '',
+    deepgramApiKey,
+    user: { id: 'bot-id', username: 'bot' },
   },
 });
 
 /**
- * Sets up a Deepgram live transcription connection
- * @param ws WebSocket connection to the client
- * @returns Configured Deepgram live transcription client
+ * Process audio data to make it suitable
+ * for Deepgram's encoding requirement
  */
-const setupDeepgram = (ws: WebSocket): LiveClient => {
-  // Initialize Deepgram with desired options
-  const deepgram = deepgramClient.listen.live({
+async function processAudioData(
+  data: Buffer | ArrayBuffer,
+): Promise<Uint8Array> {
+  try {
+    // Convert Buffer to Uint8Array if needed
+    const audioData = Buffer.isBuffer(data)
+      ? new Uint8Array(data)
+      : new Uint8Array(data);
+
+    // Check for WebM header (starts with 0x1A 0x45 0xDF 0xA3)
+    const isWebM =
+      audioData.length > 4 &&
+      audioData[0] === 0x1a &&
+      audioData[1] === 0x45 &&
+      audioData[2] === 0xdf &&
+      audioData[3] === 0xa3;
+
+    if (isWebM) {
+      console.log('WebM format detected - skipping unsupported format');
+      return new Uint8Array(0); // Return empty array to skip
+    }
+
+    // For content-type with audio/l16, treat as raw int16 PCM data
+    if (audioData.length > 0) {
+      return audioData;
+    }
+
+    return audioData;
+  } catch (error) {
+    console.error('Error processing audio data:', error);
+    return new Uint8Array(data);
+  }
+}
+
+// This is super useful if you have to debug issues related to audio input and transcription
+const setupDeepgramForEncoding = () => {
+  if (SHOULD_DEBUG_TRANSCRIPTION === false) {
+    return;
+  }
+  // Create a new Deepgram client
+  const dgClient = createClient(deepgramApiKey);
+
+  // Create a live transcription connection with more sensitive settings
+  // Use only officially supported parameters
+  const deepgramLive = dgClient.listen.live({
     language: 'en',
     punctuate: true,
     smart_format: true,
-    model: 'nova',
+    model: 'nova-3',
+    encoding: 'linear16', // Always use linear16
+    sample_rate: 48000,
+    channels: 1,
+    interim_results: true,
+    utterance_end_ms: 2000,
+    endpointing: 400,
   });
 
-  // Setup keepalive to maintain the connection
-  if (keepAlive) clearInterval(keepAlive);
-  keepAlive = setInterval(() => {
-    console.log('deepgram: keepalive');
-    deepgram.keepAlive();
-  }, 10 * 1000);
+  setInterval(() => {
+    if (deepgramLive?.getReadyState() === SOCKET_STATES.open) {
+      deepgramLive.send(new Uint8Array(0));
+    }
+  }, 5000);
 
-  // Set up event listeners for Deepgram connection
-  deepgram.addListener(LiveTranscriptionEvents.Open, async () => {
-    console.log('deepgram: connected');
+  // Set up keepalive interval to prevent connection timeouts
+  setInterval(() => {
+    if (deepgramLive?.getReadyState() === SOCKET_STATES.open) {
+      console.log('deepgram: keepalive');
+    }
+  }, 5000);
 
-    // Handle transcription events
-    deepgram.addListener(LiveTranscriptionEvents.Transcript, (data) => {
-      console.log('deepgram: packet received');
+  // Track utterance boundaries for state reset
 
-      // Check if there's a transcript with speech
-      if (data.channel?.alternatives?.[0]?.transcript) {
-        const transcript = data.channel.alternatives[0].transcript;
-        console.log(`deepgram: transcript="${transcript}"`);
-
-        // Send the transcript back to the client
-        ws.send(JSON.stringify({ transcript }));
+  // Add event listeners to the Deepgram client
+  deepgramLive.addListener(LiveTranscriptionEvents.Open, () => {
+    console.log('deepgram: connected successfully');
+    // Send connection status to client
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({ status: 'connected', ready: true }, null, 2),
+        );
       }
     });
-
-    // Handle connection close
-    deepgram.addListener(LiveTranscriptionEvents.Close, () => {
-      console.log('deepgram: disconnected');
-      if (keepAlive) clearInterval(keepAlive);
-    });
-
-    // Handle errors
-    deepgram.addListener('warning', (warning) => {
-      console.log(`deepgram: warning - ${warning}`);
-    });
-
-    deepgram.addListener(LiveTranscriptionEvents.Error, (error) => {
-      console.error(`deepgram: error - ${error}`);
-    });
-
-    // Notify the client that we're ready to receive audio
-    ws.send(JSON.stringify({ status: 'ready' }));
   });
 
-  return deepgram;
+  deepgramLive.addListener(LiveTranscriptionEvents.Error, (error) => {
+    console.error(`deepgram: error: ${error.reason()}`);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify(
+            {
+              type: 'error',
+              message: error instanceof Error ? error.message : String(error),
+            },
+            null,
+            2,
+          ),
+        );
+      }
+    });
+  });
+
+  deepgramLive.addListener(LiveTranscriptionEvents.Close, (event) => {
+    console.log(`deepgram: disconnected ${event}`);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ status: 'disconnected' }, null, 2));
+      }
+    });
+  });
+
+  deepgramLive.addListener(LiveTranscriptionEvents.Transcript, (data) => {
+    const transcript = data.channel?.alternatives?.[0]?.transcript || '';
+    const is_final = data.is_final === true;
+
+    // Log detailed information about the transcript for debugging
+    console.log(
+      '[DEBUG] Deepgram transcript event received:',
+      JSON.stringify(
+        {
+          transcript,
+          is_final,
+          channel_alternatives: data.channel?.alternatives?.map((alt) => ({
+            transcript_length: alt.transcript?.length || 0,
+            transcript: alt.transcript,
+          })),
+        },
+        null,
+        2,
+      ),
+    );
+
+    if (transcript && transcript.length > 0) {
+      // Send all alternatives to client to improve accuracy
+      const alternatives =
+        data.channel?.alternatives
+          ?.map((alt) => alt.transcript)
+          .filter(Boolean) || [];
+
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(
+            JSON.stringify(
+              {
+                type: 'transcript',
+                transcript,
+                alternatives,
+                is_final,
+              },
+              null,
+              2,
+            ),
+          );
+        }
+      });
+    } else {
+      console.log(
+        '[WARNING] Empty transcript received from Deepgram',
+        JSON.stringify(data, null, 2),
+      );
+    }
+  });
+
+  return deepgramLive;
 };
 
 // Handle WebSocket connections
 wss.on('connection', (ws: WebSocket) => {
   console.log('socket: client connected');
-  let deepgram = setupDeepgram(ws);
 
-  // Handle messages from client (audio data)
-  ws.on('message', (message) => {
-    console.log('socket: client data received');
+  // Register this client to receive TTS audio from the plugin
+  mockJanusClient.addClient(ws); // This line is essential!
 
-    if (deepgram.getReadyState() === 1 /* OPEN */) {
-      console.log('socket: data sent to deepgram');
-      // Convert the message to a format Deepgram can accept
-      let socketData: any;
+  // Initial setup with linear16 encoding
+  let deepgramLive = setupDeepgramForEncoding();
 
-      if (Buffer.isBuffer(message)) {
-        socketData = message;
-      } else if (message instanceof ArrayBuffer) {
-        socketData = Buffer.from(new Uint8Array(message));
-      } else if (ArrayBuffer.isView(message)) {
-        socketData = Buffer.from(message.buffer);
-      } else if (Array.isArray(message)) {
-        // Handle array of buffers case
-        const totalLength = message.reduce((acc, buf) => acc + buf.length, 0);
-        socketData = Buffer.concat(message, totalLength);
+  // Handle messages from the client
+  ws.on('message', async (message: WebSocket.Data) => {
+    try {
+      // Process the audio data
+      const processedData = await processAudioData(message as Buffer);
+
+      if (SHOULD_DEBUG_TRANSCRIPTION === false) {
+        const pcmData = new Int16Array(processedData.buffer);
+
+        // Route the audio to the SttTtsPlugin
+        sttTtsPlugin.onAudioData({
+          userId: 'user-1', // Use a consistent user ID
+          samples: pcmData,
+          sampleRate: 48000,
+          bitsPerSample: 16,
+          channelCount: 1,
+          numberOfFrames: pcmData.length,
+        });
       } else {
-        console.error('socket: unsupported message type', typeof message);
-        return;
-      }
+        if (
+          !deepgramLive ||
+          deepgramLive.getReadyState() !== SOCKET_STATES.open
+        ) {
+          console.log(
+            'socket: Deepgram connection is not open, reconnecting...',
+          );
+          deepgramLive = setupDeepgramForEncoding(); // Always use linear16
+          return;
+        }
 
-      // Use type assertion to bypass TypeScript's type checking
-      deepgram.send(socketData as any);
-    } else if (deepgram.getReadyState() >= 2 /* 2 = CLOSING, 3 = CLOSED */) {
-      console.log("socket: data couldn't be sent to deepgram");
-      console.log('socket: retrying connection to deepgram');
-      /* Attempt to reopen the Deepgram connection */
-      deepgram.finish();
-      deepgram.removeAllListeners();
-      deepgram = setupDeepgram(ws);
-    } else {
-      console.log("socket: data couldn't be sent to deepgram");
+        // Ensure processed data is valid before sending
+        if (processedData && processedData.length > 0) {
+          console.log(
+            `Sending ${processedData.length} bytes to Deepgram with encoding: linear16`,
+          );
+          deepgramLive.send(processedData);
+        } else {
+          console.log(
+            `Processed data is empty or invalid, not sending to Deepgram.`,
+          );
+        }
+      }
+    } catch (error) {
+      console.error('Error handling message:', error);
     }
   });
 
-  // Handle WebSocket close
+  // Handle client disconnection
   ws.on('close', () => {
     console.log('socket: client disconnected');
-    if (deepgram) {
-      deepgram.finish();
-      deepgram.removeAllListeners();
+
+    // Close the Deepgram connection when the client disconnects
+    if (deepgramLive) {
+      try {
+        deepgramLive.finish();
+      } catch (error) {
+        console.error('Error closing Deepgram connection:', error);
+      }
     }
-    if (keepAlive) clearInterval(keepAlive);
   });
 });
-
-// Serve static files from the public directory
-app.use(express.static(join(__dirname, 'public')));
 
 // Start the server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   const address = server.address() as AddressInfo;
-  console.log(`Server listening on port ${address.port}`);
+  console.log(`http://localhost:${address.port}`);
 });

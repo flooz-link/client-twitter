@@ -100,13 +100,10 @@ export const twitterSpaceTemplate = (
 ) =>
   `# Task: Generate conversational voice dialog for {{agentName}}.
 
-You are in a twitter space, so keeps short and concise, try to add filler words to sound more human and natural, add exclamation marks and things that make the voice sound human.
-Ahere to this guide to add emotion.
-
-Emotion
-Convey emotions through narrative context or explicit dialogue tags. This approach helps the AI understand the tone and emotion to emulate.
+You are in a twitter space, so keeps short and concise, try to add filler words to sound more human and natural, add exclamation marks and things that make the voice sound human, add speech disfluency if it matches the context.
 
 Do not create lenghty and repeatitive answers.
+
 **Important!**
 As you are in a twitter space, your answers will be streamed, hence try to avoid really long answers or really long pauses in your responses.
 
@@ -135,7 +132,8 @@ ${spaceMessages.map((message, index) => `${index + 1}. ${message.message}`).join
 If you decide that {{agentName}} should take an action other than "NONE", the text should be appropriate for the action and act as a filler, remeber you are in a twitter space hence you have to sound like you are naturally buying time.
 You should always respond with a short and concise message.
 **Important** 
-If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`.`;
+If you decide that there is some action, please end your stream with \`\`\`actionIs:{actionName}\`\`\`
+and tune your response to indicate that you have to think about it need some time to check.`;
 
 export const twitterSpaceTemplate_v2 = `# Task: Generate conversational voice dialog for {{agentName}}.
 

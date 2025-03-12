@@ -3011,14 +3011,19 @@ import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import {
   createClient,
-  LiveTranscriptionEvents
+  LiveTranscriptionEvents,
+  SOCKET_STATES
 } from "@deepgram/sdk";
 
 // src/plugins/activeStreamManager.ts
 var ActiveStreamManager = class {
-  activeStreams = /* @__PURE__ */ new Map();
+  activeStreams;
+  cleanupTimeout;
   constructor() {
-    setTimeout(this.cleanup, 10 * 1e3);
+    this.activeStreams = /* @__PURE__ */ new Map();
+    this.cleanupTimeout = setInterval(() => {
+      this.cleanup();
+    }, 10 * 1e3);
   }
   has(streamId) {
     return this.activeStreams.has(streamId);
@@ -3037,37 +3042,35 @@ var ActiveStreamManager = class {
     }
   }
   findAllByUserId(userId) {
+    var _a;
     if (this.activeStreams.size === 0) {
       return [];
     }
-    return Array.from(this.activeStreams.values()).filter(
+    return Array.from(((_a = this.activeStreams) == null ? void 0 : _a.values()) ?? []).filter(
       (stream) => stream.userId === userId
     );
   }
   abortOthers(streamId) {
-    var _a;
-    (_a = this.activeStreams) == null ? void 0 : _a.forEach((stream) => {
+    for (const stream of this.activeStreams.values() ?? []) {
       if ((stream == null ? void 0 : stream.id) !== streamId) {
         stream.active = false;
       }
-    });
+    }
   }
   isActive(streamId) {
     var _a;
     const stream = (_a = this.activeStreams) == null ? void 0 : _a.get(streamId);
     return (stream == null ? void 0 : stream.active) ?? false;
   }
-  cleanup() {
-    var _a;
+  cleanup = () => {
+    var _a, _b;
     const now = Date.now();
-    (_a = this.activeStreams) == null ? void 0 : _a.forEach((stream) => {
-      var _a2;
+    for (const stream of ((_a = this.activeStreams) == null ? void 0 : _a.values()) ?? []) {
       if (!(stream == null ? void 0 : stream.active) && now - (stream == null ? void 0 : stream.startedAt) > 30 * 1e3) {
-        (_a2 = this.activeStreams) == null ? void 0 : _a2.delete(stream.id);
+        (_b = this.activeStreams) == null ? void 0 : _b.delete(stream.id);
       }
-    });
-    setTimeout(this.cleanup, 10 * 1e3);
-  }
+    }
+  };
 };
 
 // src/plugins/DeepgramStreamingClient.ts
@@ -3233,9 +3236,27 @@ var SttTtsPlugin = class {
       this.deepgramSocket.addListener(
         LiveTranscriptionEvents.Transcript,
         (data) => {
-          var _a, _b, _c;
+          var _a, _b, _c, _d, _e;
           const transcript = (_c = (_b = (_a = data.channel) == null ? void 0 : _a.alternatives) == null ? void 0 : _b[0]) == null ? void 0 : _c.transcript;
+          console.log(
+            "[DEBUG] Deepgram transcript event received:",
+            JSON.stringify({
+              transcript,
+              is_final: data.is_final,
+              channel_alternatives: (_e = (_d = data.channel) == null ? void 0 : _d.alternatives) == null ? void 0 : _e.map((alt) => {
+                var _a2;
+                return {
+                  transcript_length: ((_a2 = alt.transcript) == null ? void 0 : _a2.length) || 0
+                };
+              })
+            })
+          );
           if (isEmpty(transcript)) {
+            console.log("[DEBUG] Empty transcript detected");
+            console.log(
+              "[DEBUG] Full channel data:",
+              JSON.stringify(data.channel)
+            );
             return;
           }
           if (data && this.lastSpeaker) {
@@ -3292,6 +3313,14 @@ var SttTtsPlugin = class {
           console.log(
             "deepgram: sent initial silent buffer to test connection"
           );
+          if (!this.keepAlive) {
+            this.keepAlive = setInterval(() => {
+              var _a;
+              if (this.deepgramSocket) {
+                (_a = this.deepgramSocket) == null ? void 0 : _a.keepAlive();
+              }
+            }, 10 * 5e3);
+          }
         }
       );
     } catch (error) {
@@ -3313,6 +3342,7 @@ var SttTtsPlugin = class {
    * Called whenever we receive PCM from a speaker
    */
   onAudioData(data) {
+    var _a;
     if (this.isSpeaking) {
       const energy = this.calculateEnergy(data.samples);
       if (energy > this.interruptionThreshold) {
@@ -3325,7 +3355,7 @@ var SttTtsPlugin = class {
         this.interruptionCounter = 0;
       }
     }
-    if (data.userId === this.botProfile.id) {
+    if (data.userId === ((_a = this.botProfile) == null ? void 0 : _a.id)) {
       console.log("[SttTtsPlugin] Received audio data from bot, skipping");
       return;
     }
@@ -3337,12 +3367,46 @@ var SttTtsPlugin = class {
         }
         const energy = this.calculateEnergy(data.samples);
         const audioSamples = new Int16Array(data.samples);
+        console.log(
+          `[DEBUG] Audio data received: ${audioSamples.length} samples, sampleRate: ${data.sampleRate}, bitsPerSample: ${data.bitsPerSample}`
+        );
+        console.log(`[DEBUG] First 5 samples: ${audioSamples.slice(0, 5)}`);
+        console.log(`[DEBUG] Audio format details:`);
+        console.log(`  - Sample rate: ${data.sampleRate} Hz`);
+        console.log(`  - Bits per sample: ${data.bitsPerSample}`);
+        console.log(`  - Channel count: ${data.channelCount}`);
+        console.log(`  - Number of frames: ${data.numberOfFrames}`);
+        console.log(`  - Buffer type: ${data.samples.constructor.name}`);
+        console.log(`  - Buffer byteLength: ${data.samples.buffer.byteLength}`);
+        console.log(`  - Average energy: ${energy}`);
+        const isAligned = data.samples.buffer.byteLength % 2 === 0;
+        console.log(`  - Buffer aligned (multiple of 2 bytes): ${isAligned}`);
+        const firstSample = audioSamples[0];
+        const buffer = new ArrayBuffer(2);
+        const view = new DataView(buffer);
+        view.setInt16(0, firstSample, true);
+        const bytes = new Uint8Array(buffer);
+        console.log(
+          `  - First sample bytes (little-endian): [${bytes[0]}, ${bytes[1]}]`
+        );
+        const maxAbsValue = Math.max(...Array.from(audioSamples, Math.abs));
+        const isClipping = maxAbsValue >= 32767;
+        console.log(
+          `  - Max absolute value: ${maxAbsValue} (clipping: ${isClipping})`
+        );
         const normalizedSamples = this.normalizeAudioLevels(audioSamples);
         const audioBuffer = normalizedSamples.buffer;
+        console.log(`[DEBUG] Sending audio buffer to Deepgram:`);
+        console.log(`  - Buffer byteLength: ${audioBuffer.byteLength}`);
+        console.log(`  - Sample count: ${normalizedSamples.length}`);
+        console.log(
+          `  - First 5 normalized samples: ${normalizedSamples.slice(0, 5)}`
+        );
         elizaLogger6.debug(
           `[SttTtsPlugin] Streaming audio data to Deepgram: ${normalizedSamples.length} samples, energy: ${energy}`
         );
-        this.deepgramSocket.send(audioBuffer);
+        const bufferCopy = normalizedSamples.slice().buffer;
+        this.deepgramSocket.send(bufferCopy);
       } catch (error) {
         console.error("Error sending audio to Deepgram:", error);
       }
@@ -4158,6 +4222,18 @@ var SttTtsPlugin = class {
    */
   cleanup() {
     console.warn(`Close was called`);
+    if (this.deepgramSocket && this.deepgramSocket.getReadyState() === SOCKET_STATES.OPEN) {
+      this.deepgramSocket.disconnect();
+      console.log("[SttTtsPlugin] Deepgram WebSocket closed");
+    }
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
+    }
+    this.activeStreamManager.cleanup();
+    this.latestActiveStreamId = null;
+    this.eventEmitter.removeAllListeners();
+    elizaLogger6.log("[SttTtsPlugin] Cleanup complete");
   }
 };
 

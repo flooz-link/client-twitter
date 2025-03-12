@@ -7,10 +7,14 @@ export interface ResponseStream {
 }
 
 export class ActiveStreamManager {
-  private activeStreams: Map<string, ResponseStream> = new Map();
+  private activeStreams: Map<string, ResponseStream>;
+  private cleanupTimeout: NodeJS.Timeout;
 
   constructor() {
-    setTimeout(this.cleanup, 10 * 1000);
+    this.activeStreams = new Map();
+    this.cleanupTimeout = setInterval(() => {
+      this.cleanup();
+    }, 10 * 1000);
   }
 
   has(streamId: string): boolean {
@@ -36,17 +40,17 @@ export class ActiveStreamManager {
     if (this.activeStreams.size === 0) {
       return [];
     }
-    return Array.from(this.activeStreams.values()).filter(
+    return Array.from(this.activeStreams?.values() ?? []).filter(
       (stream) => stream.userId === userId,
     );
   }
 
   abortOthers(streamId: string): void {
-    this.activeStreams?.forEach((stream) => {
+    for (const stream of this.activeStreams.values() ?? []) {
       if (stream?.id !== streamId) {
         stream.active = false;
       }
-    });
+    }
   }
 
   isActive(streamId: string): boolean {
@@ -54,13 +58,12 @@ export class ActiveStreamManager {
     return stream?.active ?? false;
   }
 
-  cleanup() {
+  cleanup = () => {
     const now = Date.now();
-    this.activeStreams?.forEach((stream) => {
+    for (const stream of this.activeStreams?.values() ?? []) {
       if (!stream?.active && now - stream?.startedAt > 30 * 1000) {
         this.activeStreams?.delete(stream.id);
       }
-    });
-    setTimeout(this.cleanup, 10 * 1000);
-  }
+    }
+  };
 }
