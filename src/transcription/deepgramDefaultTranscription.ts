@@ -126,8 +126,4 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
       this.deepgramSocket.send(audioBuffer);
     }
   }
-
-  public setLastSpeaker(speaker: string): void {
-    this.lastSpeaker = speaker;
-  }
 }
