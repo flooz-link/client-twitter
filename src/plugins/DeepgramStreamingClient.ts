@@ -726,7 +726,6 @@ export class SttTtsPlugin implements Plugin {
 
     this.transcriptionMonitor.cleanup();
     this.activeStreamManager.cleanup();
-    this.latestActiveStreamId = null;
     this.eventEmitter.removeAllListeners();
     elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
