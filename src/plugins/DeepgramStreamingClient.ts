@@ -4,7 +4,6 @@ import {
   composeContext,
   getEmbeddingZeroVector,
   type IAgentRuntime,
-  type Memory,
   type Plugin,
   State,
 } from '@elizaos/core';
@@ -19,7 +18,7 @@ import { isEmpty, isNotEmpty } from '../utils';
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { ActiveStreamManager } from './activeStreamManager';
-import { ChatInteraction, ShortTermMemory } from './sortTermMemory';
+import { ShortTermMemory } from './sortTermMemory';
 import {
   BaseTranscriptionService,
   TranscriptData,
@@ -32,8 +31,9 @@ import {
   BaseLLMService,
   LLMEvents,
   LLMChatMessage,
+  BaseLLMConfig,
 } from '../llm/baseLLMService';
-import { GrokLLMService, GrokLLMConfig } from '../llm/grokLLMService';
+import { GrokLLMService } from '../llm/grokLLMService';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -67,7 +67,6 @@ export class SttTtsPlugin implements Plugin {
   private janus?: JanusClient;
 
   private isProcessingAudio = false;
-  private latestActiveStreamId: string | null = null;
   private activeStreamManager = new ActiveStreamManager();
   private shortTermMemory = new ShortTermMemory();
   private eventEmitter = new EventEmitter();
@@ -287,7 +286,7 @@ export class SttTtsPlugin implements Plugin {
       }
 
       // Create the Grok LLM service with the shared stream manager
-      const llmConfig: GrokLLMConfig = {
+      const llmConfig: BaseLLMConfig = {
         apiKey: grokApiKey,
         baseUrl: grokBaseUrl,
         model: 'grok-2-latest',
