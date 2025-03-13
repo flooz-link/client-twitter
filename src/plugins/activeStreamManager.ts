@@ -1,13 +1,14 @@
-export interface ResponseStream {
+export interface StreamData {
   id: string;
   active: boolean;
+  startedAt: number;
   userId: string;
   message: string;
-  startedAt: number;
+  responseText?: string;
 }
 
 export class ActiveStreamManager {
-  private activeStreams: Map<string, ResponseStream>;
+  private activeStreams: Map<string, StreamData>;
   private cleanupTimeout: NodeJS.Timeout;
 
   constructor() {
@@ -21,11 +22,11 @@ export class ActiveStreamManager {
     return this.activeStreams.has(streamId);
   }
 
-  get(streamId: string): ResponseStream | undefined {
+  get(streamId: string): StreamData | undefined {
     return this.activeStreams.get(streamId);
   }
 
-  register(stream: ResponseStream): void {
+  register(stream: StreamData): void {
     this.activeStreams.set(stream.id, stream);
   }
 
@@ -36,7 +37,7 @@ export class ActiveStreamManager {
     }
   }
 
-  findAllByUserId(userId: string): ResponseStream[] {
+  findAllByUserId(userId: string): StreamData[] {
     if (this.activeStreams.size === 0) {
       return [];
     }
@@ -44,15 +45,31 @@ export class ActiveStreamManager {
       (stream) => stream.userId === userId,
     );
   }
-
-  abortOthers(streamId: string): void {
-    for (const stream of this.activeStreams.values() ?? []) {
-      if (stream?.id !== streamId) {
+  /**
+   * Abort all streams except the specified one
+   * @param exceptId Stream ID to keep active
+   */
+  public abortOthers(exceptId: string): void {
+    for (const [id, stream] of this.activeStreams.entries()) {
+      if (id !== exceptId && stream.active) {
         stream.active = false;
+        this.activeStreams.set(id, stream);
       }
     }
   }
 
+  /**
+   * Update the response text for a stream
+   * @param id Stream ID
+   * @param text Text to append to the stream's response
+   */
+  public updateResponseText(id: string, text: string): void {
+    const stream = this.activeStreams.get(id);
+    if (stream) {
+      stream.message = (this.activeStreams.get(id)?.message || '') + text;
+      this.activeStreams.set(id, stream);
+    }
+  }
   isActive(streamId: string): boolean {
     const stream = this.activeStreams?.get(streamId);
     return stream?.active ?? false;

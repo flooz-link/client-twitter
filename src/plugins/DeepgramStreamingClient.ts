@@ -17,7 +17,6 @@ import type { ClientBase, TwitterProfile } from '../base';
 import { twitterSpaceTemplate } from './templates';
 import { isEmpty, isNotEmpty } from '../utils';
 import { EventEmitter } from 'events';
-import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import { ActiveStreamManager } from './activeStreamManager';
 import { ChatInteraction, ShortTermMemory } from './sortTermMemory';
@@ -29,6 +28,12 @@ import {
 import { TranscriptionMonitor } from '../transcription/transcriptionDeltaMonitor';
 import { BaseTTSService, TTSEvents } from '../tts/baseTts';
 import { ElevenLabsConfig, ElevenLabsTTSService } from '../tts/elevelabsTts';
+import {
+  BaseLLMService,
+  LLMEvents,
+  LLMChatMessage,
+} from '../llm/baseLLMService';
+import { GrokLLMService, GrokLLMConfig } from '../llm/grokLLMService';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -43,6 +48,7 @@ interface PluginConfig {
   }>;
   transcriptionService?: BaseTranscriptionService;
   ttsService?: BaseTTSService;
+  llmService?: BaseLLMService;
   grokApiKey?: string;
   grokBaseUrl?: string;
   deepgramApiKey: string; // Required for Deepgram
@@ -59,23 +65,21 @@ export class SttTtsPlugin implements Plugin {
   private spaceId: string;
   private space?: Space;
   private janus?: JanusClient;
-  private grokApiKey?: string;
-  private grokBaseUrl = 'https://api.x.ai/v1';
 
   private isProcessingAudio = false;
   private latestActiveStreamId: string | null = null;
   private activeStreamManager = new ActiveStreamManager();
   private shortTermMemory = new ShortTermMemory();
   private eventEmitter = new EventEmitter();
-  private openai: OpenAI;
   private lastSpeaker: string | null = null;
 
   private interruptionThreshold = 3000; // Energy threshold for detecting speech (configurable)
-  private consecutiveFramesForInterruption = 5; // Number of consecutive frames to confirm interruption (e.g., 5 frames of 10ms each)
+  private consecutiveFramesForInterruption = 5; // Number of consecutive frames to confirm interruption
   private interruptionCounter = 0; // Counter for consecutive high-energy frames
 
   private transcriptionService: BaseTranscriptionService;
   private ttsService: BaseTTSService;
+  private llmService: BaseLLMService;
 
   private botProfile: TwitterProfile;
 
@@ -94,17 +98,31 @@ export class SttTtsPlugin implements Plugin {
 
     const config = params.pluginConfig as PluginConfig;
 
-    if (config?.transcriptionService) {
-      this.transcriptionService = config?.transcriptionService;
-    }
-
     this.runtime = config?.runtime;
     this.client = config?.client;
     this.spaceId = config?.spaceId;
 
+    // Initialize services
+    this.initializeTranscription(config);
+    this.initializeTts(config);
+    this.initializeLLM(config);
+
+    // Connect the LLM service to the TTS service
+    this.llmService.setTTSService(this.ttsService);
+  }
+
+  private initializeTts(config: PluginConfig): void {
     // Initialize the TTS service
     if (config?.ttsService) {
       this.ttsService = config.ttsService;
+
+      // Set the shared stream manager if the TTS service supports it
+      if (
+        this.ttsService &&
+        typeof (this.ttsService as any).setStreamManager === 'function'
+      ) {
+        (this.ttsService as any).setStreamManager(this.activeStreamManager);
+      }
     } else {
       // If no TTS service is provided, create an ElevenLabs TTS service
       if (isEmpty(config?.elevenLabsApiKey)) {
@@ -124,33 +142,16 @@ export class SttTtsPlugin implements Plugin {
       };
 
       this.ttsService = new ElevenLabsTTSService(ttsConfig);
+
+      // Set the shared stream manager if the TTS service supports it
+      if (
+        this.ttsService &&
+        typeof (this.ttsService as any).setStreamManager === 'function'
+      ) {
+        (this.ttsService as any).setStreamManager(this.activeStreamManager);
+      }
     }
 
-    this.grokApiKey =
-      config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
-    this.grokBaseUrl =
-      config?.grokBaseUrl ??
-      this.runtime.getSetting('GROK_BASE_URL') ??
-      'https://api.x.ai/v1';
-
-    if (isEmpty(this.grokApiKey)) {
-      throw new Error('Grok API key is required');
-    }
-    if (isEmpty(this.grokBaseUrl)) {
-      throw new Error('Grok base URL is required');
-    }
-
-    this.openai = new OpenAI({
-      apiKey: this.grokApiKey,
-      baseURL: this.grokBaseUrl,
-    });
-
-    // Initialize services
-    this.initializeTranscription();
-    this.initializeTts();
-  }
-
-  private initializeTts(): void {
     // Initialize the TTS service
     this.ttsService.init().catch((err) => {
       elizaLogger.error(
@@ -193,7 +194,11 @@ export class SttTtsPlugin implements Plugin {
     );
   }
 
-  private initializeTranscription(): void {
+  private initializeTranscription(config: PluginConfig): void {
+    if (config?.transcriptionService) {
+      this.transcriptionService = config?.transcriptionService;
+    }
+
     this.transcriptionMonitor = new TranscriptionMonitor(
       (userId: string, transcript: string) => {
         this.processBufferedTranscription(userId, transcript);
@@ -257,6 +262,140 @@ export class SttTtsPlugin implements Plugin {
       console.error('Error initializing Deepgram:', error);
       throw error;
     }
+  }
+
+  private initializeLLM(config: PluginConfig): void {
+    // Use provided LLM service or create a new Grok service
+    if (config?.llmService) {
+      this.llmService = config.llmService;
+
+      // Set the shared stream manager
+      if (typeof this.llmService.setStreamManager === 'function') {
+        this.llmService.setStreamManager(this.activeStreamManager);
+      }
+    } else {
+      // Check for required Grok API key
+      const grokApiKey =
+        config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
+      const grokBaseUrl =
+        config?.grokBaseUrl ??
+        this.runtime.getSetting('GROK_BASE_URL') ??
+        'https://api.x.ai/v1';
+
+      if (isEmpty(grokApiKey)) {
+        throw new Error('Grok API key is required');
+      }
+
+      // Create the Grok LLM service with the shared stream manager
+      const llmConfig: GrokLLMConfig = {
+        apiKey: grokApiKey,
+        baseUrl: grokBaseUrl,
+        model: 'grok-2-latest',
+      };
+
+      this.llmService = new GrokLLMService(llmConfig, this.activeStreamManager);
+    }
+
+    // Initialize the LLM service
+    this.llmService.initialize().catch((err) => {
+      elizaLogger.error(
+        '[SttTtsPlugin] Failed to initialize LLM service:',
+        err,
+      );
+    });
+
+    // Set up LLM service event listeners
+    this.llmService.on(LLMEvents.PROCESSING_START, (streamId, userId) => {
+      elizaLogger.log(
+        `[SttTtsPlugin] LLM processing started for stream ${streamId}, user ${userId}`,
+      );
+    });
+
+    this.llmService.on(LLMEvents.PROCESSING_END, (streamId) => {
+      elizaLogger.log(
+        `[SttTtsPlugin] LLM processing ended for stream ${streamId}`,
+      );
+    });
+
+    this.llmService.on(LLMEvents.PROCESSING_ERROR, (error, streamId) => {
+      elizaLogger.error(
+        `[SttTtsPlugin] LLM processing error for stream ${streamId}:`,
+        error,
+      );
+    });
+
+    this.llmService.on(LLMEvents.ACTION_DETECTED, (actionName, streamId) => {
+      elizaLogger.log(
+        `[SttTtsPlugin] LLM action detected in stream ${streamId}: ${actionName}`,
+      );
+      // Handle the action if needed
+      this.handleLLMAction(actionName, streamId);
+    });
+
+    this.llmService.on(LLMEvents.CONTENT_COMPLETE, (fullContent, streamId) => {
+      // Store the complete response in short-term memory
+      const stream = this.activeStreamManager.get(streamId);
+      if (stream) {
+        this.shortTermMemory.addMessage(
+          'assistant',
+          fullContent,
+          this.runtime.agentId ?? this.botProfile?.id,
+        );
+      }
+    });
+  }
+
+  /**
+   * Handle actions detected in the LLM output
+   */
+  private async handleLLMAction(
+    actionName: string,
+    streamId: string,
+  ): Promise<void> {
+    // Get the stream data
+    const stream = this.activeStreamManager.get(streamId);
+    if (!stream) return;
+
+    // This would be expanded based on your specific action handling requirements
+    const numericId = stream.userId.replace('tw-', '');
+    const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
+    const userUuid = stringToUuid(`twitter-user-${numericId}`);
+
+    const memory = {
+      id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
+      agentId: this.runtime.agentId,
+      content: { text: stream.message, source: 'twitter' },
+      userId: userUuid,
+      roomId,
+      embedding: getEmbeddingZeroVector(),
+      createdAt: Date.now(),
+    };
+
+    // Example of processing an action
+    await this.runtime.processActions(
+      memory,
+      [memory],
+      await this.runtime.composeState(
+        {
+          agentId: this.runtime.agentId,
+          content: { text: stream.message, source: 'twitter' },
+          userId: userUuid,
+          roomId,
+        },
+        {
+          twitterUserName: this.client.profile.username,
+          agentName: this.runtime.character.name,
+        },
+      ),
+      async (newMessages) => {
+        if (newMessages) {
+          elizaLogger.log(
+            `[SttTtsPlugin] Action produced new messages: ${newMessages}`,
+          );
+        }
+        return [memory];
+      },
+    );
   }
 
   /**
@@ -356,7 +495,6 @@ export class SttTtsPlugin implements Plugin {
         console.log(
           '[SttTtsPlugin] Already processing audio, queueing this request',
         );
-
         return;
       }
 
@@ -375,6 +513,8 @@ export class SttTtsPlugin implements Plugin {
       // Generate a unique stream ID for this response
       const streamId = uuidv4();
       this.latestActiveStreamId = streamId;
+
+      // Register with the active stream manager
       this.activeStreamManager.register({
         id: streamId,
         active: true,
@@ -389,117 +529,26 @@ export class SttTtsPlugin implements Plugin {
       // Abort any previous streams
       this.abortPreviousStreams(streamId);
 
-      // Create named handler functions for this specific stream
-      const handleChunkForStream = (text: string, chunkStreamId: string) => {
-        // Only process chunks for the current stream
-        if (this.activeStreamManager.isActive(streamId)) {
-          this.bufferTextForTTS(text, streamId, userId);
-        } else {
-          console.log(
-            `[SttTtsPlugin] Ignoring chunk from different stream. Expected: ${streamId}, Got: ${chunkStreamId}`,
-          );
-        }
-      };
-
-      const handleStreamEnd = (endStreamId?: string) => {
-        // Only clean up if this is our stream
-        if (!endStreamId || !this.activeStreamManager.isActive(endStreamId)) {
-          console.log(
-            `[SttTtsPlugin] Ignoring stream-end from outdated stream`,
-          );
-          return;
-        }
-
-        console.log(`[SttTtsPlugin] Stream ended for user: ${userId}`);
-
-        // Only remove listeners specific to this stream
-        this.eventEmitter.removeListener('stream-chunk', handleChunkForStream);
-        this.eventEmitter.removeListener('stream-end', handleStreamEnd);
-      };
-
-      // Attach event listeners for this stream
-      this.eventEmitter.on('stream-chunk', handleChunkForStream);
-      this.eventEmitter.once('stream-end', handleStreamEnd);
-
-      // Start the streaming response from Grok
-      await this.handleUserMessageStreaming(transcript, userId, streamId);
-    } catch (error) {
-      // Handle both transcription errors and general errors
-      if (
-        error.name === 'TranscriptionError' ||
-        error.message?.includes('transcription')
-      ) {
-        elizaLogger.error(`[SttTtsPlugin] Transcription error: ${error}`, {
-          userId,
-          audioBufferSize: 0,
-          sampleRate: 0,
-          error,
-        });
-      } else {
-        elizaLogger.error(
-          '[SttTtsPlugin] processTranscription error =>',
-          error,
-        );
+      // Check if we should ignore this message
+      const shouldIgnore = await this.shouldIgnore(transcript);
+      if (shouldIgnore) {
+        this.isProcessingAudio = false;
+        return;
       }
-    } finally {
-      // Reset the processing flag
-      this.isProcessingAudio = false;
-    }
-  }
 
-  /**
-   * Handle User Message with streaming support
-   */
-  private async handleUserMessageStreaming(
-    userText: string,
-    userId: string,
-    streamId: string,
-  ): Promise<void> {
-    // Create a new stream ID if one doesn't exist
-    if (!this.latestActiveStreamId) {
-      elizaLogger.log(
-        `[SttTtsPlugin] Creating new stream ID: ${streamId} as none exists`,
-      );
-      this.latestActiveStreamId = streamId;
-      const foundStream = this.activeStreamManager.get(streamId);
+      // Prepare the chat context
+      const previousMessages =
+        this.activeStreamManager?.findAllByUserId(userId);
 
-      if (!foundStream) {
-        this.activeStreamManager.register({
-          id: streamId,
-          active: true,
-          startedAt: Date.now(),
-          userId: userId,
-          message: userText,
-        });
-      }
-    }
+      // Get the Twitter space context
+      const numericId = userId.replace('tw-', '');
+      const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
+      const userUuid = stringToUuid(`twitter-user-${numericId}`);
 
-    // Check again here as we add the new stream above
-    const foundStream = this.activeStreamManager.get(streamId);
-
-    elizaLogger.log(
-      `[SttTtsPlugin] Handling user message with stream ID: ${streamId}`,
-    );
-
-    const numericId = userId.replace('tw-', '');
-    const roomId = stringToUuid(`twitter_generate_room-${this.spaceId}`);
-    const userUuid = stringToUuid(`twitter-user-${numericId}`);
-
-    const memory = {
-      id: stringToUuid(`${roomId}-voice-message-${Date.now()}`),
-      agentId: this.runtime.agentId,
-      content: { text: userText, source: 'twitter' },
-      userId: userUuid,
-      roomId,
-      embedding: getEmbeddingZeroVector(),
-      createdAt: Date.now(),
-    };
-
-    const [state] = await Promise.all([
-      this.runtime.composeState(
+      const state = await this.runtime.composeState(
         {
           agentId: this.runtime.agentId,
-          content: { text: userText, source: 'twitter' },
+          content: { text: transcript, source: 'twitter' },
           userId: userUuid,
           roomId,
         },
@@ -507,231 +556,46 @@ export class SttTtsPlugin implements Plugin {
           twitterUserName: this.client.profile.username,
           agentName: this.runtime.character.name,
         },
-      ),
-      this.runtime
-        .ensureUserExists(
-          userUuid,
-          userId,
-          `Twitter User ${numericId}`,
-          'twitter',
-        )
-        .catch((error) => {
-          console.warn(`Error when ensureUserExists, error: ${error} ignoring`);
-          return;
-        }),
-      this.runtime.ensureRoomExists(roomId).catch((error) => {
-        console.warn(`Error when ensureRoomExists, error: ${error} ignoring`);
-        return;
-      }),
-      this.runtime.ensureParticipantInRoom(userUuid, roomId).catch((error) => {
-        console.warn(
-          `Error when ensureParticipantInRoom, error: ${error} ignoring`,
-        );
-        return;
-      }),
-    ]);
-
-    const shouldIgnore = await this._shouldIgnore(memory);
-    if (shouldIgnore) {
-      return;
-    }
-    const previousMessages = this.activeStreamManager?.findAllByUserId(userId);
-
-    const context = composeContext({
-      state,
-      template: (options: { state: State }): string => {
-        const template = twitterSpaceTemplate(options.state, previousMessages);
-        return template;
-      },
-    });
-
-    const systemMessage: ChatInteraction = {
-      role: 'system' as const,
-      content: context,
-      startedAt: Date.now(),
-      userId: this.runtime.agentId ?? this.botProfile?.id,
-    };
-    const userMessage: ChatInteraction = {
-      role: 'user' as const,
-      content: userText,
-      startedAt: Date.now(),
-      userId: userId,
-    };
-    const messages = [
-      ...this.shortTermMemory?.getChatContext(),
-      systemMessage,
-      userMessage,
-    ];
-
-    if (
-      !(foundStream?.active ?? false) ||
-      !this.ttsService.isStreamActive(streamId)
-    ) {
-      elizaLogger.log(
-        '[SttTtsPlugin] Stream was aborted before API call, cancelling',
       );
-      this.eventEmitter.emit('stream-end', streamId);
-      return;
-    }
 
-    try {
-      const stream = await this.openai.chat.completions.create({
-        model: 'grok-2-latest',
-        messages,
-        stream: true,
+      const context = composeContext({
+        state,
+        template: (options: { state: State }): string => {
+          const template = twitterSpaceTemplate(
+            options.state,
+            previousMessages,
+          );
+          return template;
+        },
       });
 
-      let fullResponse = '';
-      let bufferedText = '';
-      let potentialActionMarker = false;
-      let detectedAction = '';
+      // Add the user message to short-term memory
+      this.shortTermMemory.addMessage('user', transcript, userId);
 
-      // Set up a timer to ensure we emit text at regular intervals for a more natural speech pattern
-      let lastEmitTime = Date.now();
-      const minTimeBetweenEmits = 150; // ms - adjust for desired natural pacing
-      const maxBufferTime = 500; // ms - maximum time to hold text before emitting
+      // Prepare the chat history for the LLM
+      const chatHistory: LLMChatMessage[] = [
+        {
+          role: 'system',
+          content: context,
+        },
+        ...this.shortTermMemory.getChatContext().map((msg) => ({
+          role: msg.role as 'system' | 'user' | 'assistant',
+          content: msg.content,
+        })),
+      ];
 
-      for await (const chunk of stream) {
-        const foundStream = this.activeStreamManager.get(streamId);
-
-        if (
-          foundStream?.active === false ||
-          !this.ttsService.isStreamActive(streamId)
-        ) {
-          console.log(
-            '[SttTtsPlugin] Stream was aborted during processing, cancelling',
-          );
-          break;
-        }
-
-        const content = chunk.choices[0]?.delta?.content || '';
-
-        if (!content) {
-          continue;
-        }
-
-        fullResponse += content;
-
-        // Check if this chunk contains or starts an action marker
-        if (content.includes('actionIs:') || content.includes('```actionIs:')) {
-          // If we find the action marker, extract only the text before it
-          const parts = content.split(/(\`\`\`actionIs:|actionIs:)/);
-          if (parts.length > 1) {
-            // Send only the text before the marker to TTS
-            const textBeforeAction = parts[0].trim();
-            if (textBeforeAction) {
-              console.log(
-                '[SttTtsPlugin] Emitting chunk with text before action:',
-                textBeforeAction,
-              );
-              this.eventEmitter.emit(
-                'stream-chunk',
-                textBeforeAction,
-                streamId,
-              );
-            }
-
-            // Extract the action name
-            const actionMatch = /actionIs:([A-Z_]+)/.exec(content);
-            if (actionMatch) {
-              detectedAction = actionMatch[1];
-              console.log(`[SttTtsPlugin] Detected action: ${detectedAction}`);
-              await this.runtime.processActions(
-                memory,
-                [memory],
-                state,
-                async (newMessages) => {
-                  if (newMessages) {
-                    console.log(
-                      `[SttTtsPlugin] Emitting chunk with action response: ${newMessages}`,
-                    );
-                  }
-                  return [memory];
-                },
-              );
-            }
-
-            potentialActionMarker = true;
-            continue;
-          }
-        }
-
-        // Handle potential action continuation
-        if (potentialActionMarker) {
-          // Check if we're still in an action block
-          if (content.includes('```')) {
-            potentialActionMarker = false;
-
-            // Extract any text after the action block
-            const parts = content.split(/\`\`\`/);
-            if (parts.length > 1 && parts[1].trim()) {
-              console.log(
-                '[SttTtsPlugin] Emitting chunk with text after action:',
-                parts[1].trim(),
-              );
-              this.eventEmitter.emit('stream-chunk', parts[1].trim(), streamId);
-              lastEmitTime = Date.now();
-            }
-          }
-          // Skip content that's part of an action block
-          continue;
-        }
-
-        // Normal text content - buffer it and emit when appropriate
-        bufferedText += content;
-
-        // Determine if we should emit based on natural breaks or timing
-        const hasNaturalBreak =
-          /[.!?]\s*$/.test(bufferedText) || // Ends with punctuation
-          /\n\s*$/.test(bufferedText) || // Ends with newline
-          /[:;]\s*$/.test(bufferedText); // Ends with colon or semicolon
-
-        const currentTime = Date.now();
-        const timeSinceLastEmit = currentTime - lastEmitTime;
-        const shouldEmitBasedOnTime = timeSinceLastEmit >= maxBufferTime;
-        const hasEnoughText = bufferedText.length >= 15; // Minimum characters to emit
-
-        // Emit text if we have a natural break point or if enough time has passed
-        if ((hasNaturalBreak && hasEnoughText) || shouldEmitBasedOnTime) {
-          // If we're emitting too quickly, add a small delay for more natural pacing
-          if (timeSinceLastEmit < minTimeBetweenEmits) {
-            await new Promise((resolve) =>
-              setTimeout(resolve, minTimeBetweenEmits - timeSinceLastEmit),
-            );
-          }
-
-          this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
-          bufferedText = '';
-          lastEmitTime = Date.now();
-        }
-      }
-
-      // Emit any remaining buffered text
-      if (bufferedText.trim()) {
-        console.log(
-          '[SttTtsPlugin] Emitting final buffered text:',
-          bufferedText,
-        );
-        this.eventEmitter.emit('stream-chunk', bufferedText, streamId);
-      }
-
-      // Add the complete message to our conversation history
-      this.shortTermMemory.addMessage('user', userText, userId);
-      this.shortTermMemory.addMessage(
-        'assistant',
-        fullResponse,
-        this.runtime.agentId ?? this.botProfile?.id,
+      // Process the message through the LLM service
+      await this.llmService.processMessage(
+        transcript,
+        userId,
+        chatHistory,
+        streamId,
       );
-
-      // Signal that the stream has ended
-      this.eventEmitter.emit('stream-end', streamId);
     } catch (error) {
-      elizaLogger.error(
-        `[SttTtsPlugin] Error processing stream: ${error.message}`,
-        error,
-      );
-      // Ensure we clean up even if there's an error
-      this.eventEmitter.emit('stream-end', streamId);
+      elizaLogger.error('[SttTtsPlugin] processTranscription error =>', error);
+    } finally {
+      // Reset the processing flag
+      this.isProcessingAudio = false;
     }
   }
 
@@ -744,85 +608,64 @@ export class SttTtsPlugin implements Plugin {
       this.ttsService.abortAllExcept(streamId);
     }
 
+    // Let the LLM service handle aborting its streams
+    if (this.llmService) {
+      this.llmService.abortAllExcept(streamId);
+    }
+
     this.activeStreamManager.abortOthers(streamId);
     this.latestActiveStreamId = streamId;
 
-    // Don't remove all listeners as it could affect other parts of the system
-    // Instead, we'll manage listeners for specific streams in their respective handlers
     elizaLogger.log('[SttTtsPlugin] Previous streams aborted');
   }
 
   /**
-   * Buffer text for TTS and delegate to the TTS service
+   * Should Ignore - Determines if a message should be ignored
    */
-  private bufferTextForTTS(
-    text: string,
-    streamId: string,
-    userId: string,
-  ): void {
-    if (isEmpty(text)) {
-      return;
+  private async shouldIgnore(messageText: string): Promise<boolean> {
+    const messageLen = messageText?.length ?? 0;
+    if (messageLen < 3) {
+      return true;
     }
 
-    const foundStream = this.activeStreamManager.get(streamId);
-    // Enhanced stream ID handling
-    if (foundStream?.active === false) {
-      return;
+    const loseInterestWords = [
+      'shut up',
+      'stop',
+      'dont talk',
+      'silence',
+      'stop talking',
+      'be quiet',
+      'hush',
+      'stfu',
+      'stupid bot',
+      'dumb bot',
+      'fuck',
+      'shit',
+      'damn',
+      'suck',
+      'dick',
+      'cock',
+      'sex',
+      'sexy',
+    ];
+    if (
+      messageLen < 50 &&
+      loseInterestWords.some((word) =>
+        messageText?.toLowerCase()?.includes(word),
+      )
+    ) {
+      return true;
     }
 
-    // Try to recover by creating a new stream ID if needed
-    if (!this.latestActiveStreamId) {
-      elizaLogger.warn(
-        '[SttTtsPlugin] No current stream ID found, creating a new one',
-      );
-      const newStreamId = uuidv4();
-      this.latestActiveStreamId = newStreamId;
-      this.activeStreamManager.register({
-        id: newStreamId,
-        active: true,
-        startedAt: Date.now(),
-        userId: userId,
-        message: text,
-      });
-
-      // Register with the TTS service
-      this.ttsService.registerStream(newStreamId);
-
-      // Continue with the new stream ID
-      streamId = newStreamId;
-    } else if (!this.activeStreamManager.has(streamId)) {
-      elizaLogger.warn(
-        `[SttTtsPlugin] Stream ID ${streamId} is no longer active, attempting to re-use current stream ID`,
-      );
-      // Use the current stream ID instead if it exists
-      if (this.activeStreamManager.has(this.latestActiveStreamId)) {
-        streamId = this.latestActiveStreamId;
-      } else {
-        // If current stream ID is also inactive, create a new one
-        elizaLogger.warn(
-          `[SttTtsPlugin] Current stream ID ${this.latestActiveStreamId} is also inactive, creating a new one`,
-        );
-        const newStreamId = uuidv4();
-        this.latestActiveStreamId = newStreamId;
-        this.activeStreamManager.register({
-          id: newStreamId,
-          active: true,
-          startedAt: Date.now(),
-          userId: userId,
-          message: text,
-        });
-
-        // Register with the TTS service
-        this.ttsService.registerStream(newStreamId);
-
-        streamId = newStreamId;
-      }
+    const ignoreWords = ['k', 'ok', 'bye', 'lol', 'nm', 'uh'];
+    if (
+      messageText?.length < 8 &&
+      ignoreWords.some((word) => messageText?.toLowerCase()?.includes(word))
+    ) {
+      return true;
     }
 
-    // Delegate text buffering to the TTS service
-    if (this.ttsService) {
-      this.ttsService.bufferTextForTTS(text, streamId);
-    }
+    return false;
   }
 
   /**
@@ -860,56 +703,6 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Should Ignore
-   */
-  private async _shouldIgnore(message: Memory): Promise<boolean> {
-    const messageStr = message?.content?.text;
-    const messageLen = messageStr?.length ?? 0;
-    if (messageLen < 3) {
-      return true;
-    }
-
-    const loseInterestWords = [
-      'shut up',
-      'stop',
-      'dont talk',
-      'silence',
-      'stop talking',
-      'be quiet',
-      'hush',
-      'stfu',
-      'stupid bot',
-      'dumb bot',
-      'fuck',
-      'shit',
-      'damn',
-      'suck',
-      'dick',
-      'cock',
-      'sex',
-      'sexy',
-    ];
-    if (
-      messageLen < 50 &&
-      loseInterestWords.some((word) =>
-        messageStr?.toLowerCase()?.includes(word),
-      )
-    ) {
-      return true;
-    }
-
-    const ignoreWords = ['k', 'ok', 'bye', 'lol', 'nm', 'uh'];
-    if (
-      messageStr?.length < 8 &&
-      ignoreWords.some((word) => messageStr?.toLowerCase()?.includes(word))
-    ) {
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
    * Clear the chat context
    */
   public clearChatContext() {
@@ -927,6 +720,11 @@ export class SttTtsPlugin implements Plugin {
     // Stop any ongoing speech and clean up TTS resources
     if (this.ttsService) {
       this.ttsService.cleanup();
+    }
+
+    // Clean up LLM resources
+    if (this.llmService) {
+      this.llmService.cleanup();
     }
 
     this.transcriptionMonitor.cleanup();

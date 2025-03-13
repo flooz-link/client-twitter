@@ -23,6 +23,7 @@ import { MockSpace } from './mock-space.js';
 import { MockJanusClient } from './mock-janus-client.js';
 import { DeepgramStreamingTranscriptionService } from '../src/transcription/deepgramDefaultTranscription.js';
 import { ElevenLabsTTSService } from '../src/tts/elevelabsTts.js';
+import { GrokLLMService } from '../src/llm/grokLLMService.js';
 
 // Get the directory name of the current module (ES modules don't have __dirname)
 const __filename = fileURLToPath(import.meta.url);
@@ -96,6 +97,13 @@ const transcriptionService = new DeepgramStreamingTranscriptionService({
 const ttsService = new ElevenLabsTTSService({
   apiKey: process.env.ELEVEN_LABS_API_KEY || '',
 });
+
+const llmService = new GrokLLMService({
+  apiKey: process.env.GROK_API_KEY || '',
+  baseUrl: process.env.GROK_BASE_URL || 'https://api.x.ai/v1',
+  model: 'grok-2-latest',
+});
+
 // Register the plugin with the mock Space
 mockSpace.use(sttTtsPlugin as any);
 
@@ -106,9 +114,9 @@ sttTtsPlugin.init({
     runtime: mockedRuntime,
     transcriptionService: transcriptionService,
     ttsService: ttsService,
+    llmService: llmService,
     client: { profile: { username: 'user', id: 'mock-user-id' } },
     spaceId: 'mock-space-id',
-    deepgramApiKey,
     user: { id: 'bot-id', username: 'bot' },
   },
 });
