@@ -3,7 +3,7 @@ import {
   shouldRespondFooter,
   State,
 } from '@elizaos/core';
-import { ResponseStream } from './activeStreamManager';
+import { StreamData } from './activeStreamManager';
 
 export const twitterShouldRespondTemplate =
   `# Task: Decide if {{agentName}} should respond.
@@ -96,7 +96,7 @@ export const twitterVoiceHandlerTemplate =
 
 export const twitterSpaceTemplate = (
   state: State,
-  spaceMessages: ResponseStream[],
+  spaceMessages: StreamData[],
 ) =>
   `# Task: Generate conversational voice dialog for {{agentName}}.
 

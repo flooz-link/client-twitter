@@ -511,7 +511,6 @@ export class SttTtsPlugin implements Plugin {
 
       // Generate a unique stream ID for this response
       const streamId = uuidv4();
-      this.latestActiveStreamId = streamId;
 
       // Register with the active stream manager
       this.activeStreamManager.register({
@@ -613,7 +612,6 @@ export class SttTtsPlugin implements Plugin {
     }
 
     this.activeStreamManager.abortOthers(streamId);
-    this.latestActiveStreamId = streamId;
 
     elizaLogger.log('[SttTtsPlugin] Previous streams aborted');
   }
