@@ -22,7 +22,7 @@ export interface TranscriptionService {
   initialize(): void;
   start(): Promise<void>;
   stop(): Promise<void>;
-  sendAudio(audioBuffer: ArrayBuffer): void;
+  sendAudio(audioBuffer: Int16Array): void;
   on(event: string, listener: (...args: any[]) => void): void;
   off(event: string, listener: (...args: any[]) => void): void;
 }
@@ -43,7 +43,7 @@ export abstract class BaseTranscriptionService
   public abstract initialize(): void;
   public abstract start(): Promise<void>;
   public abstract stop(): Promise<void>;
-  public abstract sendAudio(audioBuffer: ArrayBuffer): void;
+  public abstract sendAudio(audioBuffer: Int16Array): void;
 
   protected startKeepAlive(callback: () => void): void {
     if (this.keepAliveInterval) {

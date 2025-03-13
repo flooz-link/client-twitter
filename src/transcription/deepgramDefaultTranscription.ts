@@ -130,7 +130,7 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
     this.isInitialized = false;
   }
 
-  public sendAudio(audioBuffer: ArrayBuffer): void {
+  public sendAudio(audioBuffer: Int16Array): void {
     if (this.deepgramSocket && this.isInitialized) {
       this.deepgramSocket.send(audioBuffer);
     } else {

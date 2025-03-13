@@ -4616,7 +4616,6 @@ var SttTtsPlugin = class {
     }
     this.transcriptionMonitor.cleanup();
     this.activeStreamManager.cleanup();
-    this.latestActiveStreamId = null;
     this.eventEmitter.removeAllListeners();
     elizaLogger8.log("[SttTtsPlugin] Cleanup complete");
   }
