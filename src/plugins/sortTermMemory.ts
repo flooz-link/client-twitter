@@ -1,3 +1,5 @@
+import { isEmpty } from '../utils';
+
 export interface ChatInteraction {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -27,6 +29,9 @@ export class ShortTermMemory {
     content: string,
     userId: string,
   ) {
+    if (isEmpty(content)) {
+      return;
+    }
     const existingMessages = this.chatContext.get(userId) ?? [];
     existingMessages.push({ role, content, startedAt: Date.now(), userId });
     this.chatContext.set(userId, existingMessages);

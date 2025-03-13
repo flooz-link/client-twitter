@@ -1,5 +1,6 @@
 import {
   createClient,
+  DeepgramClient,
   ListenLiveClient,
   LiveTranscriptionEvents,
   SOCKET_STATES,
@@ -11,14 +12,14 @@ import {
 } from './baseTranscription';
 
 export class DeepgramStreamingTranscriptionService extends BaseTranscriptionService {
-  private deepgram: any;
+  private deepgram: DeepgramClient;
   private deepgramSocket: ListenLiveClient;
 
   constructor(config: DeepgramConfig) {
     super(config);
   }
 
-  public async initialize(): Promise<void> {
+  initialize() {
     try {
       // Initialize Deepgram
       this.deepgram = createClient(this.config.apiKey);
@@ -44,17 +45,24 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
         LiveTranscriptionEvents.Transcript,
         (data: any) => {
           const transcript = data.channel?.alternatives?.[0]?.transcript;
-          this.emitTranscript(transcript, data.speech_final, data);
+          console.log(
+            `transcription: received transcript ${transcript} isFinal: ${data.is_final} speech_final: ${data.speech_final}`,
+          );
+          this.emitTranscript(
+            transcript,
+            data.speech_final ?? data.is_final,
+            data,
+          );
         },
       );
 
       this.deepgramSocket.addListener(
         LiveTranscriptionEvents.Close,
         async (data: any) => {
-          console.warn(`Deepgram: Close event received: ${data?.reason()}`);
+          console.warn(`Deepgram: Close event received: ${data?.reason}`);
           this.isInitialized = false;
           this.stopKeepAlive();
-          this.deepgramSocket.finish();
+          this.deepgramSocket.requestClose();
           this.emit(TranscriptionEvents.DISCONNECTED);
 
           // Attempt to reconnect after a delay
@@ -68,6 +76,7 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
         LiveTranscriptionEvents.Error,
         (error: any) => {
           this.isInitialized = false;
+          console.error(`Deepgram: Error event received: ${error?.message}`);
 
           this.emit(TranscriptionEvents.ERROR, error);
         },
@@ -108,14 +117,14 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
 
   public async start(): Promise<void> {
     if (!this.isInitialized) {
-      await this.initialize();
+      this.initialize();
     }
   }
 
   public async stop(): Promise<void> {
     this.stopKeepAlive();
     if (this.deepgramSocket) {
-      this.deepgramSocket.finish();
+      this.deepgramSocket.requestClose();
       this.deepgramSocket = null;
     }
     this.isInitialized = false;
@@ -124,6 +133,10 @@ export class DeepgramStreamingTranscriptionService extends BaseTranscriptionServ
   public sendAudio(audioBuffer: ArrayBuffer): void {
     if (this.deepgramSocket && this.isInitialized) {
       this.deepgramSocket.send(audioBuffer);
+    } else {
+      console.error(
+        `Tried to send audio to Deepgram, but it is not initialized`,
+      );
     }
   }
 }

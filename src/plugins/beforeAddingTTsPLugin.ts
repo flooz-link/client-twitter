@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import {
   elizaLogger,
   stringToUuid,
@@ -13,22 +14,21 @@ import type {
   JanusClient,
   AudioDataWithUser,
 } from '@flooz-link/agent-twitter-client';
-import type { ClientBase, TwitterProfile } from '../base';
-import { twitterSpaceTemplate } from './templates';
-import { isEmpty, isNotEmpty } from '../utils';
+import type { ClientBase, TwitterProfile } from '../base.ts';
+import { twitterSpaceTemplate } from './templates.ts';
+import { isEmpty, isNotEmpty } from '../utils.ts';
+import { PassThrough } from 'stream';
 import { EventEmitter } from 'events';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
-import { ActiveStreamManager } from './activeStreamManager';
-import { ChatInteraction, ShortTermMemory } from './sortTermMemory';
+import { ActiveStreamManager } from './activeStreamManager.ts';
+import { ChatInteraction, ShortTermMemory } from './sortTermMemory.ts';
 import {
   BaseTranscriptionService,
   TranscriptData,
   TranscriptionEvents,
-} from '../transcription/baseTranscription';
-import { TranscriptionMonitor } from '../transcription/transcriptionDeltaMonitor';
-import { BaseTTSService, TTSEvents } from '../tts/baseTts';
-import { ElevenLabsConfig, ElevenLabsTTSService } from '../tts/elevelabsTts';
+} from '../transcription/baseTranscription.ts';
+import { TranscriptionMonitor } from '../transcription/transcriptionDeltaMonitor.ts';
 
 interface PluginConfig {
   runtime: IAgentRuntime;
@@ -42,7 +42,6 @@ interface PluginConfig {
     content: string;
   }>;
   transcriptionService?: BaseTranscriptionService;
-  ttsService?: BaseTTSService;
   grokApiKey?: string;
   grokBaseUrl?: string;
   deepgramApiKey: string; // Required for Deepgram
@@ -59,10 +58,16 @@ export class SttTtsPlugin implements Plugin {
   private spaceId: string;
   private space?: Space;
   private janus?: JanusClient;
+  private elevenLabsApiKey?: string;
   private grokApiKey?: string;
   private grokBaseUrl = 'https://api.x.ai/v1';
+  private voiceId = '21m00Tcm4TlvDq8ikWAM';
+  private elevenLabsModel = 'eleven_monolingual_v1';
 
+  private ttsQueue: string[] = [];
+  private isSpeaking = false;
   private isProcessingAudio = false;
+  private ttsAbortController: AbortController | null = null;
   private latestActiveStreamId: string | null = null;
   private activeStreamManager = new ActiveStreamManager();
   private shortTermMemory = new ShortTermMemory();
@@ -75,11 +80,17 @@ export class SttTtsPlugin implements Plugin {
   private interruptionCounter = 0; // Counter for consecutive high-energy frames
 
   private transcriptionService: BaseTranscriptionService;
-  private ttsService: BaseTTSService;
 
   private botProfile: TwitterProfile;
 
   private transcriptionaBufferDuration = 500; // ms to buffer transcribed text before processing
+
+  // Smart text buffering for TTS
+  private ttsTextBuffer = '';
+  private ttstextBufferTimeout: NodeJS.Timeout | null = null;
+  private readonly MIN_TTS_BUFFER_SIZE = 20; // Minimum characters before sending to TTS
+  private readonly MAX_TTS_BUFFER_SIZE = 150; // Maximum buffer size to prevent too long chunks
+  private readonly TTS_BUFFER_TIMEOUT = 200; // ms to wait before flushing buffer if no natural breaks
 
   private transcriptionMonitor: TranscriptionMonitor;
 
@@ -101,31 +112,16 @@ export class SttTtsPlugin implements Plugin {
     this.runtime = config?.runtime;
     this.client = config?.client;
     this.spaceId = config?.spaceId;
-
-    // Initialize the TTS service
-    if (config?.ttsService) {
-      this.ttsService = config.ttsService;
-    } else {
-      // If no TTS service is provided, create an ElevenLabs TTS service
-      if (isEmpty(config?.elevenLabsApiKey)) {
-        throw new Error('ElevenLabs API key is required');
-      }
-
-      // Create the ElevenLabs TTS service with appropriate configuration
-      const ttsConfig: ElevenLabsConfig = {
-        apiKey: config.elevenLabsApiKey,
-        voiceId: config?.voiceId || '21m00Tcm4TlvDq8ikWAM',
-        model: config?.elevenLabsModel || 'eleven_monolingual_v1',
-        stability: 0.5,
-        similarityBoost: 0.75,
-        optimizeStreamingLatency: 3,
-        sampleRate: 48000,
-        channels: 1,
-      };
-
-      this.ttsService = new ElevenLabsTTSService(ttsConfig);
+    if (isEmpty(config?.elevenLabsApiKey)) {
+      throw new Error('ElevenLabs API key is required');
     }
-
+    this.elevenLabsApiKey = config?.elevenLabsApiKey;
+    if (config?.voiceId) {
+      this.voiceId = config.voiceId;
+    }
+    if (config?.elevenLabsModel) {
+      this.elevenLabsModel = config.elevenLabsModel;
+    }
     this.grokApiKey =
       config?.grokApiKey ?? this.runtime.getSetting('GROK_API_KEY');
     this.grokBaseUrl =
@@ -145,52 +141,8 @@ export class SttTtsPlugin implements Plugin {
       baseURL: this.grokBaseUrl,
     });
 
-    // Initialize services
+    // Initialize Deepgram
     this.initializeTranscription();
-    this.initializeTts();
-  }
-
-  private initializeTts(): void {
-    // Initialize the TTS service
-    this.ttsService.init().catch((err) => {
-      elizaLogger.error(
-        '[SttTtsPlugin] Failed to initialize TTS service:',
-        err,
-      );
-    });
-
-    // Setup TTS service event listeners
-    this.ttsService.on(TTSEvents.SPEAKING_START, (streamId) => {
-      elizaLogger.log(
-        `[SttTtsPlugin] TTS speech started for stream ${streamId}`,
-      );
-    });
-
-    this.ttsService.on(TTSEvents.SPEAKING_END, (streamId) => {
-      elizaLogger.log(`[SttTtsPlugin] TTS speech ended for stream ${streamId}`);
-    });
-
-    this.ttsService.on(TTSEvents.SPEAKING_ERROR, (error, streamId) => {
-      elizaLogger.error(
-        `[SttTtsPlugin] TTS speech error for stream ${streamId}:`,
-        error,
-      );
-    });
-
-    this.ttsService.on(TTSEvents.SPEAKING_INTERRUPTED, (streamId) => {
-      elizaLogger.log(
-        `[SttTtsPlugin] TTS speech interrupted for stream ${streamId}`,
-      );
-    });
-
-    this.ttsService.on(
-      TTSEvents.AUDIO_DATA,
-      (frame: Int16Array, sampleRate: number, _streamId: string) => {
-        if (this.janus) {
-          this.janus.pushLocalAudio(frame, sampleRate);
-        }
-      },
-    );
   }
 
   private initializeTranscription(): void {
@@ -206,8 +158,6 @@ export class SttTtsPlugin implements Plugin {
       },
     );
 
-    this.transcriptionService.initialize();
-
     try {
       // Setup event listeners outside of the Open event to ensure they're registered
       // before any messages arrive
@@ -222,6 +172,7 @@ export class SttTtsPlugin implements Plugin {
             return;
           }
 
+          // this.bufferTextForTranscript(transcript, data.is_final);
           if (data && this.lastSpeaker) {
             this.transcriptionMonitor.addTranscription(
               this.lastSpeaker,
@@ -274,16 +225,17 @@ export class SttTtsPlugin implements Plugin {
    * Called whenever we receive PCM from a speaker
    */
   public onAudioData(data: AudioDataWithUser): void {
-    // Check if the bot is speaking and detect potential interruptions
-    const energy = this.calculateEnergy(data.samples);
-    if (energy > this.interruptionThreshold) {
-      this.interruptionCounter++;
-      if (this.interruptionCounter >= this.consecutiveFramesForInterruption) {
-        this.stopSpeaking();
+    if (this.isSpeaking) {
+      const energy = this.calculateEnergy(data.samples);
+      if (energy > this.interruptionThreshold) {
+        this.interruptionCounter++;
+        if (this.interruptionCounter >= this.consecutiveFramesForInterruption) {
+          this.stopSpeaking();
+          this.interruptionCounter = 0;
+        }
+      } else {
         this.interruptionCounter = 0;
       }
-    } else {
-      this.interruptionCounter = 0;
     }
 
     if (data.userId === this.botProfile?.id) {
@@ -303,9 +255,7 @@ export class SttTtsPlugin implements Plugin {
       // Create a copy of the audio samples to avoid modifying the original data
       const audioSamples = new Int16Array(data.samples);
 
-      if (energy > this.interruptionThreshold) {
-        this.transcriptionMonitor.trackUserAudioActivity(data.userId);
-      }
+      this.transcriptionMonitor.trackUserAudioActivity(data.userId);
 
       this.transcriptionService.sendAudio(audioSamples);
     } catch (error) {
@@ -320,7 +270,7 @@ export class SttTtsPlugin implements Plugin {
     userId: string,
     transcript: string,
   ): void {
-    const bufferedTranscript = transcript;
+    const bufferedTranscript = transcript; //this.transcriptBuffer.get(userId);
 
     // Process if there's content in the buffer
     if (isNotEmpty(bufferedTranscript?.trim())) {
@@ -337,9 +287,12 @@ export class SttTtsPlugin implements Plugin {
    * Stop the bot's speech when interrupted
    */
   private stopSpeaking(): void {
-    if (this.ttsService) {
-      this.ttsService.stopSpeaking();
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
     }
+    this.isSpeaking = false;
+    this.ttsQueue = []; // Clear the queue
     elizaLogger.log('[SttTtsPlugin] Bot speech interrupted by user');
   }
 
@@ -383,11 +336,11 @@ export class SttTtsPlugin implements Plugin {
         message: transcript,
       });
 
-      // Register the stream with the TTS service
-      this.ttsService.registerStream(streamId);
-
       // Abort any previous streams
       this.abortPreviousStreams(streamId);
+
+      // Reset the text buffer
+      this.ttsTextBuffer = '';
 
       // Create named handler functions for this specific stream
       const handleChunkForStream = (text: string, chunkStreamId: string) => {
@@ -410,7 +363,9 @@ export class SttTtsPlugin implements Plugin {
           return;
         }
 
-        console.log(`[SttTtsPlugin] Stream ended for user: ${userId}`);
+        console.log(
+          `[SttTtsPlugin] Stream ended for user: ${userId} with text: ${this.ttsTextBuffer}`,
+        );
 
         // Only remove listeners specific to this stream
         this.eventEmitter.removeListener('stream-chunk', handleChunkForStream);
@@ -456,6 +411,7 @@ export class SttTtsPlugin implements Plugin {
     streamId: string,
   ): Promise<void> {
     // Create a new stream ID if one doesn't exist
+
     if (!this.latestActiveStreamId) {
       elizaLogger.log(
         `[SttTtsPlugin] Creating new stream ID: ${streamId} as none exists`,
@@ -474,7 +430,7 @@ export class SttTtsPlugin implements Plugin {
       }
     }
 
-    // Check again here as we add the new stream above
+    // check again here as we add the new stream above
     const foundStream = this.activeStreamManager.get(streamId);
 
     elizaLogger.log(
@@ -565,7 +521,7 @@ export class SttTtsPlugin implements Plugin {
 
     if (
       !(foundStream?.active ?? false) ||
-      !this.ttsService.isStreamActive(streamId)
+      (this.ttsAbortController?.signal?.aborted ?? false)
     ) {
       elizaLogger.log(
         '[SttTtsPlugin] Stream was aborted before API call, cancelling',
@@ -594,19 +550,19 @@ export class SttTtsPlugin implements Plugin {
       for await (const chunk of stream) {
         const foundStream = this.activeStreamManager.get(streamId);
 
-        if (
-          foundStream?.active === false ||
-          !this.ttsService.isStreamActive(streamId)
-        ) {
+        if (foundStream?.active === false) {
           console.log(
             '[SttTtsPlugin] Stream was aborted during processing, cancelling',
           );
           break;
         }
 
+        // console.log('[SttTtsPlugin] Received chunk:', JSON.stringify(chunk));
+
         const content = chunk.choices[0]?.delta?.content || '';
 
         if (!content) {
+          // console.log('[SttTtsPlugin] Empty content, skipping chunk');
           continue;
         }
 
@@ -739,21 +695,23 @@ export class SttTtsPlugin implements Plugin {
    * Abort any ongoing TTS and streaming processes
    */
   private abortPreviousStreams(streamId: string): void {
-    // Let the TTS service handle aborting all other streams
-    if (this.ttsService) {
-      this.ttsService.abortAllExcept(streamId);
+    if (this.ttsAbortController) {
+      elizaLogger.log('[SttTtsPlugin] Aborting previous TTS stream');
+      this.ttsAbortController.abort();
     }
+    this.ttsAbortController = new AbortController();
 
     this.activeStreamManager.abortOthers(streamId);
-    this.latestActiveStreamId = streamId;
+    this.latestActiveStreamId = null;
 
     // Don't remove all listeners as it could affect other parts of the system
     // Instead, we'll manage listeners for specific streams in their respective handlers
-    elizaLogger.log('[SttTtsPlugin] Previous streams aborted');
+    elizaLogger.log('[SttTtsPlugin] Cleanup complete');
   }
 
   /**
-   * Buffer text for TTS and delegate to the TTS service
+   * Smart text buffering for TTS
+   * This buffers text until we have a natural break point or enough characters
    */
   private bufferTextForTTS(
     text: string,
@@ -770,24 +728,14 @@ export class SttTtsPlugin implements Plugin {
       return;
     }
 
-    // Try to recover by creating a new stream ID if needed
+    // // Try to recover by creating a new stream ID if needed
     if (!this.latestActiveStreamId) {
       elizaLogger.warn(
         '[SttTtsPlugin] No current stream ID found, creating a new one',
       );
       const newStreamId = uuidv4();
       this.latestActiveStreamId = newStreamId;
-      this.activeStreamManager.register({
-        id: newStreamId,
-        active: true,
-        startedAt: Date.now(),
-        userId: userId,
-        message: text,
-      });
-
-      // Register with the TTS service
-      this.ttsService.registerStream(newStreamId);
-
+      this.activeStreamManager.has(newStreamId);
       // Continue with the new stream ID
       streamId = newStreamId;
     } else if (!this.activeStreamManager.has(streamId)) {
@@ -811,52 +759,414 @@ export class SttTtsPlugin implements Plugin {
           userId: userId,
           message: text,
         });
-
-        // Register with the TTS service
-        this.ttsService.registerStream(newStreamId);
-
         streamId = newStreamId;
       }
     }
 
-    // Delegate text buffering to the TTS service
-    if (this.ttsService) {
-      this.ttsService.bufferTextForTTS(text, streamId);
+    // Append the new text to our buffer
+    this.ttsTextBuffer += text;
+
+    // Clear any existing timeout
+    if (this.ttstextBufferTimeout) {
+      clearTimeout(this.ttstextBufferTimeout);
+    }
+
+    // Check if there's a natural break or if we've reached the max buffer size
+    const hasNaturalBreak =
+      /[.!?]\s*$/.test(this.ttsTextBuffer) || // Ends with punctuation
+      /\n\s*$/.test(this.ttsTextBuffer) || // Ends with newline
+      /[:;]\s*$/.test(this.ttsTextBuffer); // Ends with colon or semicolon
+
+    if (
+      hasNaturalBreak ||
+      this.ttsTextBuffer.length >= this.MAX_TTS_BUFFER_SIZE
+    ) {
+      // Flush immediately if we have a natural break or reached max size
+      this.flushBuffer(userId);
+    } else if (this.ttsTextBuffer.length >= this.MIN_TTS_BUFFER_SIZE) {
+      // If we have enough characters but no natural break,
+      // set a timeout to flush soon if no more text arrives
+      this.ttstextBufferTimeout = setTimeout(() => {
+        this.flushBuffer(userId);
+      }, this.TTS_BUFFER_TIMEOUT);
     }
   }
 
   /**
-   * Public method to queue a TTS request for on-demand speaking
-   * This is useful for sending audio messages programmatically
-   * instead of in response to transcription
+   * Flush the text buffer to TTS
    */
-  public async speakText(text: string): Promise<void> {
-    if (isEmpty(text)) {
+  private flushBuffer(userId: string): void {
+    if (!this.ttsTextBuffer) {
       return;
     }
 
-    // Create a unique stream ID for this on-demand message
-    const streamId = uuidv4();
+    // Check if we have a valid current stream ID
+    if (!this.latestActiveStreamId) {
+      elizaLogger.warn(
+        '[SttTtsPlugin] No current stream ID for TTS, creating a new one',
+      );
+      this.latestActiveStreamId = uuidv4();
+      this.activeStreamManager.register({
+        id: this.latestActiveStreamId,
+        active: true,
+        startedAt: Date.now(),
+        userId: userId,
+        message: this.ttsTextBuffer,
+      });
+    }
 
-    // Register the stream with both managers
-    this.activeStreamManager.register({
-      id: streamId,
-      active: true,
-      startedAt: Date.now(),
-      userId: 'on-demand',
-      message: text,
+    // Ensure the current stream ID is in active streams
+    if (!this.activeStreamManager.has(this.latestActiveStreamId)) {
+      elizaLogger.warn(
+        `[SttTtsPlugin] Current stream ID ${this.latestActiveStreamId} is not active, adding it`,
+      );
+      this.activeStreamManager.register({
+        id: this.latestActiveStreamId,
+        active: true,
+        startedAt: Date.now(),
+        userId: userId,
+        message: this.ttsTextBuffer,
+      });
+    }
+
+    // Send the buffered text to TTS queue
+    const textToSpeak = this.ttsTextBuffer;
+    this.ttsTextBuffer = ''; // Clear the buffer
+
+    elizaLogger.log(`[SttTtsPlugin] Flushing buffer to TTS: "${textToSpeak}"`);
+
+    this.speakText(textToSpeak).catch((err) => {
+      elizaLogger.error('[SttTtsPlugin] Error speaking text:', err);
+    });
+  }
+
+  /**
+   * Public method to queue a TTS request
+   */
+  public async speakText(text: string): Promise<void> {
+    this.ttsQueue.push(text);
+    if (!this.isSpeaking) {
+      this.isSpeaking = true;
+      try {
+        await this.processTtsQueue();
+      } catch (err) {
+        console.error('[SttTtsPlugin] processTtsQueue error =>', err);
+        elizaLogger.error('[SttTtsPlugin] processTtsQueue error =>', err);
+        // Reset the speaking state to allow future processing attempts
+        this.isSpeaking = false;
+      }
+    }
+  }
+
+  /**
+   * Process the TTS queue
+   */
+  private async processTtsQueue(): Promise<void> {
+    try {
+      while (this.ttsQueue.length > 0) {
+        const text = this.ttsQueue.shift();
+        if (!text) continue;
+
+        this.ttsAbortController = new AbortController();
+        const { signal } = this.ttsAbortController;
+
+        await this.streamTtsToJanus(text, signal);
+
+        if (signal.aborted) {
+          elizaLogger.log('[SttTtsPlugin] TTS streaming was interrupted');
+          return;
+        }
+      }
+    } catch (error) {
+      elizaLogger.error('[SttTtsPlugin] Queue processing error =>', error);
+    } finally {
+      this.isSpeaking = false;
+    }
+  }
+
+  /**
+   * Stream TTS to Janus
+   */
+  private async streamTtsToJanus(
+    text: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    // Add natural pauses at punctuation to make speech sound more natural
+    const textWithPauses = text
+      .replace(/\.\s+/g, '. <break time="5ms"/> ')
+      .replace(/,\s+/g, ', <break time="2ms"/> ')
+      .replace(/\?\s+/g, '? <break time="5ms"/> ')
+      .replace(/!\s+/g, '! <break time="5ms"/> ')
+      .replace(/;\s+/g, '; <break time="5ms"/> ')
+      .replace(/:\s+/g, ': <break time="5ms"/> ');
+
+    if (!this.janus) {
+      elizaLogger.error(
+        '[SttTtsPlugin] No Janus client available for streaming TTS',
+      );
+      return;
+    }
+
+    const mp3Stream = new PassThrough();
+    let processingComplete = false;
+    let isInterrupted = false;
+
+    if (signal.aborted) {
+      mp3Stream.end();
+      return;
+    }
+
+    signal.addEventListener('abort', () => {
+      isInterrupted = true;
+      mp3Stream.end();
     });
 
-    this.ttsService.registerStream(streamId);
+    const ffmpeg = spawn('ffmpeg', [
+      '-i',
+      'pipe:0',
+      '-f',
+      's16le',
+      '-acodec',
+      'pcm_s16le',
+      '-ar',
+      '48000',
+      '-ac',
+      '1',
+      'pipe:1',
+    ]);
 
-    // Abort previous streams to ensure this one takes priority
-    this.abortPreviousStreams(streamId);
+    ffmpeg.on('error', (err) => {
+      console.error('[SttTtsPlugin] FFMPEG process error:', err);
+      elizaLogger.error('[SttTtsPlugin] FFMPEG process error:', err);
+      isInterrupted = true;
+    });
 
-    // Send the text to the TTS service
-    elizaLogger.log(
-      `[SttTtsPlugin] Speaking on-demand text with stream ${streamId}: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}"`,
+    const audioBuffer: Int16Array[] = [];
+    const processingPromise = new Promise<void>((resolve, reject) => {
+      let pcmBuffer = Buffer.alloc(0);
+      const bufferStats = {
+        totalChunks: 0,
+        totalBytes: 0,
+        emptyChunks: 0,
+      };
+
+      ffmpeg.stdout.on('data', (chunk: Buffer) => {
+        if (isInterrupted || signal.aborted) return;
+
+        bufferStats.totalChunks++;
+        bufferStats.totalBytes += chunk.length;
+
+        if (chunk.length === 0) {
+          bufferStats.emptyChunks++;
+          console.warn('[SttTtsPlugin] Received empty chunk from FFmpeg');
+          return;
+        }
+
+        pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+        const FRAME_SIZE = 480;
+        const frameCount = Math.floor(pcmBuffer.length / (FRAME_SIZE * 2));
+
+        if (frameCount > 0) {
+          try {
+            for (let i = 0; i < frameCount; i++) {
+              // Check for valid slice parameters
+              const startOffset = i * FRAME_SIZE * 2 + pcmBuffer.byteOffset;
+              const endOffset = (i + 1) * FRAME_SIZE * 2 + pcmBuffer.byteOffset;
+
+              if (
+                startOffset >= pcmBuffer.buffer.byteLength ||
+                endOffset > pcmBuffer.buffer.byteLength
+              ) {
+                console.error(
+                  `[SttTtsPlugin] Invalid buffer slice: start=${startOffset}, end=${endOffset}, bufferLength=${pcmBuffer.buffer.byteLength}`,
+                );
+                continue;
+              }
+
+              const frame = new Int16Array(
+                pcmBuffer.buffer.slice(startOffset, endOffset),
+              );
+
+              // Check for invalid audio data
+              let invalidData = false;
+              for (let j = 0; j < 5 && j < frame.length; j++) {
+                if (isNaN(frame[j]) || !isFinite(frame[j])) {
+                  invalidData = true;
+                  break;
+                }
+              }
+
+              if (invalidData) {
+                console.error(
+                  '[SttTtsPlugin] Invalid audio data detected in frame',
+                );
+                continue;
+              }
+
+              const frameCopy = new Int16Array(FRAME_SIZE);
+              frameCopy.set(frame);
+              audioBuffer.push(frameCopy);
+            }
+
+            pcmBuffer = pcmBuffer.slice(frameCount * FRAME_SIZE * 2);
+          } catch (err) {
+            console.error('[SttTtsPlugin] Error processing audio frames:', err);
+          }
+        }
+      });
+
+      ffmpeg.stdout.on('end', () => {
+        processingComplete = true;
+        if (pcmBuffer.length > 0) {
+          const remainingFrames = Math.floor(pcmBuffer.length / 2);
+          if (remainingFrames > 0) {
+            const frame = new Int16Array(remainingFrames);
+            for (let i = 0; i < remainingFrames; i++) {
+              frame[i] = pcmBuffer.readInt16LE(i * 2);
+            }
+            audioBuffer.push(frame);
+          }
+        }
+        resolve();
+      });
+
+      ffmpeg.stdout.on('error', (err) => {
+        elizaLogger.error('[SttTtsPlugin] FFMPEG stdout error:', err);
+        reject(err);
+      });
+    });
+
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream?optimize_streaming_latency=3`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'xi-api-key': this.elevenLabsApiKey || '',
+        },
+        body: JSON.stringify({
+          text: textWithPauses,
+          model_id: this.elevenLabsModel,
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      },
     );
-    await this.ttsService.speakText(text, streamId);
+
+    if (!response.ok || !response.body) {
+      throw new Error(
+        `ElevenLabs API error: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    const reader = response.body.getReader();
+    const readStream = async () => {
+      try {
+        while (true) {
+          if (isInterrupted || signal.aborted) {
+            break;
+          }
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (value) {
+            ffmpeg.stdin.write(value);
+          }
+        }
+      } catch (err) {
+        elizaLogger.error(
+          '[SttTtsPlugin] Error reading from ElevenLabs stream:',
+          err,
+        );
+      } finally {
+        ffmpeg.stdin.end();
+      }
+    };
+
+    readStream();
+
+    await Promise.race([
+      processingPromise.catch((err) => {
+        console.error('[SttTtsPlugin] Processing error:', err);
+      }),
+      new Promise<void>((resolve) => {
+        const checkBuffer = () => {
+          if (audioBuffer.length > 3 || signal.aborted || isInterrupted) {
+            resolve();
+          } else {
+            setTimeout(checkBuffer, 10);
+          }
+        };
+        checkBuffer();
+      }),
+    ]);
+
+    let frameIndex = 0;
+    const startTime = Date.now();
+
+    while (
+      (frameIndex < audioBuffer.length || !processingComplete) &&
+      !isInterrupted &&
+      !signal.aborted
+    ) {
+      if (frameIndex >= audioBuffer.length && !processingComplete) {
+        await new Promise<void>((resolve) => {
+          const waitForMoreFrames = () => {
+            if (
+              frameIndex < audioBuffer.length ||
+              processingComplete ||
+              isInterrupted ||
+              signal.aborted
+            ) {
+              resolve();
+            } else {
+              setTimeout(waitForMoreFrames, 10);
+            }
+          };
+          waitForMoreFrames();
+        });
+      }
+
+      const idealPlaybackTime = startTime + frameIndex * 10;
+      const currentTime = Date.now();
+
+      if (currentTime < idealPlaybackTime) {
+        await new Promise((r) =>
+          setTimeout(r, idealPlaybackTime - currentTime),
+        );
+      } else if (currentTime > idealPlaybackTime + 100) {
+        const framesToSkip = Math.floor((currentTime - idealPlaybackTime) / 10);
+        if (framesToSkip > 0) {
+          elizaLogger.log(
+            `[SttTtsPlugin] Skipping ${framesToSkip} frames to catch up`,
+          );
+          frameIndex += framesToSkip;
+          continue;
+        }
+      }
+
+      if (frameIndex < audioBuffer.length) {
+        const frame = audioBuffer[frameIndex];
+        const EXPECTED_SAMPLES = 480;
+        if (frame.length !== EXPECTED_SAMPLES) {
+          const properSizedFrame = new Int16Array(EXPECTED_SAMPLES);
+          const copyLength = Math.min(frame.length, EXPECTED_SAMPLES);
+          properSizedFrame.set(frame.subarray(0, copyLength));
+          this.janus.pushLocalAudio(properSizedFrame, 48000);
+        } else {
+          this.janus.pushLocalAudio(frame, 48000);
+        }
+      }
+      frameIndex++;
+    }
+
+    if (signal.aborted || isInterrupted) {
+      elizaLogger.log(
+        '[SttTtsPlugin] Audio streaming was interrupted before completion',
+      );
+    } else {
+      elizaLogger.log('[SttTtsPlugin] Audio streaming completed successfully');
+    }
   }
 
   /**
@@ -921,14 +1231,12 @@ export class SttTtsPlugin implements Plugin {
    * Cleanup resources
    */
   cleanup(): void {
+    console.warn(`Close was called`);
     this.transcriptionService.stop();
-    this.clearChatContext();
-
-    // Stop any ongoing speech and clean up TTS resources
-    if (this.ttsService) {
-      this.ttsService.cleanup();
+    if (this.ttsAbortController) {
+      this.ttsAbortController.abort();
+      this.ttsAbortController = null;
     }
-
     this.transcriptionMonitor.cleanup();
     this.activeStreamManager.cleanup();
     this.latestActiveStreamId = null;

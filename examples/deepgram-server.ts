@@ -22,6 +22,7 @@ import { SttTtsPlugin } from '../src/plugins/DeepgramStreamingClient.js';
 import { MockSpace } from './mock-space.js';
 import { MockJanusClient } from './mock-janus-client.js';
 import { DeepgramStreamingTranscriptionService } from '../src/transcription/deepgramDefaultTranscription.js';
+import { ElevenLabsTTSService } from '../src/tts/elevelabsTts.js';
 
 // Get the directory name of the current module (ES modules don't have __dirname)
 const __filename = fileURLToPath(import.meta.url);
@@ -87,9 +88,14 @@ const transcriptionService = new DeepgramStreamingTranscriptionService({
   language: 'en',
   channels: 1,
   encoding: 'linear16',
+  vadEvents: true,
+  interimResults: true,
+  endpointing: 200,
 });
-await transcriptionService.initialize();
 
+const ttsService = new ElevenLabsTTSService({
+  apiKey: process.env.ELEVEN_LABS_API_KEY || '',
+});
 // Register the plugin with the mock Space
 mockSpace.use(sttTtsPlugin as any);
 
@@ -99,9 +105,9 @@ sttTtsPlugin.init({
   pluginConfig: {
     runtime: mockedRuntime,
     transcriptionService: transcriptionService,
+    ttsService: ttsService,
     client: { profile: { username: 'user', id: 'mock-user-id' } },
     spaceId: 'mock-space-id',
-    elevenLabsApiKey: process.env.ELEVEN_LABS_API_KEY || '',
     deepgramApiKey,
     user: { id: 'bot-id', username: 'bot' },
   },

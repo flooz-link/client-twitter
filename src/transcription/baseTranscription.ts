@@ -19,7 +19,7 @@ export interface TranscriptData {
 
 // Base transcription service interface
 export interface TranscriptionService {
-  initialize(): Promise<void>;
+  initialize(): void;
   start(): Promise<void>;
   stop(): Promise<void>;
   sendAudio(audioBuffer: ArrayBuffer): void;
@@ -40,7 +40,7 @@ export abstract class BaseTranscriptionService
     super();
   }
 
-  public abstract initialize(): Promise<void>;
+  public abstract initialize(): void;
   public abstract start(): Promise<void>;
   public abstract stop(): Promise<void>;
   public abstract sendAudio(audioBuffer: ArrayBuffer): void;
