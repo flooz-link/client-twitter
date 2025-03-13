@@ -5248,7 +5248,6 @@ var TwitterClientInterface = {
   }
 };
 export {
-  SttTtsPlugin,
   TwitterClientInterface,
   TwitterClientInterface as default
 };
