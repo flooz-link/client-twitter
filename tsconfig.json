@@ -20,10 +20,10 @@
         "noEmitOnError": false,
         "moduleDetection": "force",
         "allowArbitraryExtensions": true,
+        "downlevelIteration": true,
         "paths": {
             "@elizaos/core": ["./node_modules/@elizaos/core"]
           }
     },
     "include": ["src/**/*.ts"]
 }
-

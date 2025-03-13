@@ -158,3 +158,19 @@ For issues or questions:
    - Error messages
    - Configuration details
    - Steps to reproduce
+
+
+
+Creating local files for testing
+
+Recording your voice with the required encoding and sample rate
+
+```bash
+arecord -f S16_LE -c 1 -r 48000 -d 10 test_pcm.raw
+```
+
+Listening to the recorded voice
+
+```bash
+ffplay -f s16le -ar 48000 -ac 1 test_pcm.raw
+```

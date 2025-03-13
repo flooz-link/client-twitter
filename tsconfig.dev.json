@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-dev",
+    "noEmit": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "NodeNext",
+    "module": "NodeNext",
+    "allowSyntheticDefaultImports": true,
+    "downlevelIteration": true,
+    "paths": {
+      "*": ["./src/*", "./examples/*"],
+      "./templates": ["./src/plugins/templates"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/test-server.ts",
+    "src/spaces.ts",
+    "examples/**/*.ts"
+  ],
+  "exclude": []
+}
